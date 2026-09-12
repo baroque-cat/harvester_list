@@ -139,3 +139,5 @@ cmd/*.json
 config.yaml*
 plan*
 truffle*
+.opencode*
+.agent*

@@ -1,0 +1,466 @@
+name: tdd-flow
+version: 1
+description: Spec-driven workflow with a TDD gate - proposal -> specs -> tests
+  (RED) -> design -> tasks -> apply (GREEN). Tests are derived mechanically from
+  spec scenarios before any implementation exists.
+artifacts:
+  - id: proposal
+    generates: proposal.md
+    description: Initial proposal document outlining the change
+    template: proposal.md
+    instruction: >
+      Create the proposal document that establishes WHY this change is needed.
+
+
+      Sections:
+
+      - **Why**: 1-2 sentences on the problem or opportunity. What problem does
+      this solve? Why now?
+
+      - **What Changes**: Bullet list of changes. Be specific about new
+      capabilities, modifications, or removals. Mark breaking changes with
+      **BREAKING**.
+
+      - **Capabilities**: Identify which specs will be created or modified:
+        - **New Capabilities**: List capabilities being introduced. Each becomes a new `specs/<capability-path>/spec.md`. Use kebab-case for path segments you introduce (e.g., `user-auth` or `identity/user-auth`) and follow the project's existing spec organization.
+        - **Modified Capabilities**: List existing capabilities whose REQUIREMENTS are changing. Only include if spec-level behavior changes (not just implementation details). Each needs a delta spec file. Use the exact existing path under `openspec/specs/`. Leave empty if no requirement changes.
+      - **Impact**: Affected code, APIs, dependencies, or systems.
+
+
+      IMPORTANT: The Capabilities section is critical. It creates the contract
+      between
+
+      proposal and specs phases. Research existing specs before filling this in.
+
+      Each capability listed here will need a corresponding spec file.
+
+
+      Every change must either declare at least one capability (new or
+
+      modified) or explicitly opt out of specs: `openspec validate` rejects a
+
+      change with zero deltas unless the change's `.openspec.yaml` sets
+
+      `skip_specs: true`. Use `skip_specs: true` only when no spec-level
+
+      behavior changes (pure refactor, tooling, docs) - specs describe
+
+      behavior, so if behavior does not change, no spec should change either.
+
+      Do not invent a requirement just to satisfy validation.
+
+
+      Keep it concise (1-2 pages). Focus on the "why" not the "how" -
+
+      implementation details belong in design.md.
+
+
+      This is the foundation - specs, tests, design, and tasks all build on it.
+    requires: []
+  - id: specs
+    generates: specs/**/*.md
+    description: Detailed specifications for the change
+    template: spec.md
+    instruction: >
+      Create specification files that define WHAT the system should do.
+
+
+      A spec is a behavior contract, not an implementation plan.
+
+
+      Good spec content:
+
+      - Observable behavior users or downstream systems rely on
+
+      - Inputs, outputs, and error conditions
+
+      - External constraints (security, privacy, reliability, compatibility)
+
+      - Scenarios that can be tested or explicitly validated
+
+
+      Avoid in specs:
+
+      - Internal class/function names
+
+      - Library or framework choices
+
+      - Step-by-step implementation details
+
+      - Detailed execution plans (those belong in design.md or tasks.md)
+
+
+      Quick test: if the implementation can change without changing externally
+
+      visible behavior, it likely does not belong in the spec.
+
+
+      Create one spec file per capability listed in the proposal's Capabilities
+      section.
+
+      `<capability-path>` is the spec directory relative to `specs/` (for
+      example,
+
+      `user-auth` or `identity/user-auth`). Preserve the full path:
+
+      - New capabilities: use the exact path from the proposal at
+      `specs/<capability-path>/spec.md`. Any path segment newly introduced in
+      the proposal must be kebab-case. Follow the project's existing
+      organization; do not add a new domain level when the project uses a flat
+      layout.
+
+      - Modified capabilities: use the exact existing path from
+      `openspec/specs/<capability-path>/` when creating the delta at
+      `specs/<capability-path>/spec.md`. Do not move or rename the capability.
+
+
+      There must be at least one spec file unless the change's `.openspec.yaml`
+
+      sets `skip_specs: true` (no spec-level behavior change) - `openspec
+      validate`
+
+      rejects a zero-delta change without that marker. If the proposal lists no
+
+      capabilities and `skip_specs` is not set, revisit the proposal first.
+
+
+      Delta operations (use ## headers):
+
+      - **ADDED Requirements**: New capabilities
+
+      - **MODIFIED Requirements**: Changed behavior - MUST include full updated
+      content
+
+      - **REMOVED Requirements**: Deprecated features - MUST include **Reason**
+      and **Migration**
+
+      - **RENAMED Requirements**: Name changes only - use FROM:/TO: format
+
+
+      Format requirements:
+
+      - Each requirement: `### Requirement: <name>` followed by description
+
+      - Use SHALL/MUST for normative requirements (avoid should/may)
+
+      - Each scenario: `#### Scenario: <name>` with WHEN/THEN format
+
+      - **CRITICAL**: Scenarios MUST use exactly 4 hashtags (`####`). Using 3
+      hashtags or bullets will fail silently.
+
+      - Every requirement MUST have at least one scenario.
+
+
+      TDD note: every scenario written here becomes a test case later - the
+
+      `tests` artifact maps each `#### Scenario:` to exactly one automated test
+
+      (or an explicit Manual entry). Write scenarios concretely enough to be
+
+      assertable: name the trigger in WHEN and the observable outcome in THEN.
+
+
+      New capabilities only: start the delta spec with a `## Purpose` section -
+
+      one or two sentences (50+ characters, or `openspec validate --strict`
+
+      reports it as too brief) describing what the capability is for. Archive
+
+      copies it into the main spec it creates; without it the new main spec is
+
+      left with a `TBD ... Update Purpose after archive` placeholder to fill in
+
+      by hand. Do NOT add `## Purpose` to a delta for an existing capability -
+
+      that spec already has one and the delta's is ignored. To change an
+
+      existing capability's Purpose - including a leftover `TBD` placeholder -
+
+      edit `openspec/specs/<capability-path>/spec.md` directly.
+
+
+      MODIFIED requirements workflow:
+
+      1. Locate the existing requirement in
+      openspec/specs/<capability-path>/spec.md
+
+      2. Copy the ENTIRE requirement block (from `### Requirement:` through all
+      scenarios)
+
+      3. Paste under `## MODIFIED Requirements` and edit to reflect new behavior
+
+      4. Ensure header text matches exactly (whitespace-insensitive)
+
+
+      Common pitfall: Using MODIFIED with partial content loses detail at
+      archive time.
+
+      If adding new concerns without changing existing behavior, use ADDED
+      instead.
+
+
+      Example (a new capability, so it opens with `## Purpose`):
+
+      ```
+
+      ## Purpose
+
+
+      Lets users take their data out of the product in a portable format.
+
+
+      ## ADDED Requirements
+
+
+      ### Requirement: User can export data
+
+      The system SHALL allow users to export their data in CSV format.
+
+
+      #### Scenario: Successful export
+
+      - **WHEN** user clicks "Export" button
+
+      - **THEN** system downloads a CSV file with all user data
+
+
+      ## REMOVED Requirements
+
+
+      ### Requirement: Legacy export
+
+      **Reason**: Replaced by new export system
+
+      **Migration**: Point users to /api/v2/export
+
+      ```
+
+
+      Specs should be testable - each scenario is a future test case.
+    requires:
+      - proposal
+  - id: tests
+    generates: tests.md
+    description: Test plan and failing tests derived from spec scenarios (RED phase)
+    template: tests.md
+    instruction: >
+      Create the test plan and the first failing tests. Tests derive
+
+      mechanically from the delta specs - every `#### Scenario:` under ADDED
+
+      and MODIFIED requirements becomes exactly one automated test case, or an
+
+      explicit Manual entry naming why it cannot be automated. No input from
+
+      the user is needed; if a decision is genuinely blocked, ask instead of
+
+      guessing.
+
+
+      Steps:
+
+
+      1. Read every delta spec under `specs/`. Number scenarios per capability
+         in document order: `<capability>-S1`, `-S2`, ... These IDs are the
+         traceability chain spec -> test -> task and MUST stay stable once
+         assigned (never renumber; append new IDs at the end).
+
+      2. Decide the target test file for each group. Precedence:
+         a. Testing conventions from project context/rules (openspec/config.yaml).
+         b. File locations already named in design.md, if it exists.
+         c. Default heuristic: mirror the source path with the project's test
+            suffix inserted before the extension
+            (lib/queries/players.ts -> lib/queries/players.test.ts); UI page
+            components get a co-located page test file. For greenfield work
+            where the source file does not exist yet, pick the path the
+            implementation is expected to use and say so in the group header.
+
+      3. Write `tests.md` using the template:
+         - `## Automated`: one group per test file declaring `File:` and
+           `Describe:` fields plus its scenario list. Each scenario maps to
+           exactly one `it()`/`test()` block named after the scenario.
+         - `## Manual`: scenarios needing human or end-to-end verification,
+           each with its scenario ID and the reason it is manual.
+         - Zero automatable scenarios: keep only `## Manual` plus an HTML
+           comment explaining why nothing is automatable.
+
+      4. Write the actual test files. Assertions MUST encode the THEN clauses
+         of the scenarios as real expectations. Do NOT write placeholder
+         assertions such as `expect(true).toBe(false)` - a test must fail
+         because the behavior does not exist yet, not because the test is
+         fake. If the module under test does not exist yet, the import
+         failure IS the expected RED state; note it in the group header.
+         If a describe block with the exact same name already exists in the
+         target file, append the new it() blocks inside it - never duplicate
+         describe blocks.
+
+      5. Run the project's own test runner against the new test files when one
+         is available (discover it from the project; NEVER hardcode a runner)
+         and record the observed per-scenario status in tests.md. RED is the
+         expected outcome at this stage.
+
+      6. Report: scenarios mapped, automated tests written, manual entries,
+         and any unexpected pass. An unexpectedly passing new test means the
+         scenario is already covered or the test is wrong - investigate before
+         continuing.
+
+      When design.md is written or revised later, re-check the `File:` paths
+
+      in tests.md against it and update them if the design chose a different
+
+      layout. Dependencies are enablers, not gates: this artifact may be
+
+      revisited at any time.
+    requires:
+      - specs
+  - id: design
+    generates: design.md
+    description: Technical design document with implementation details
+    template: design.md
+    instruction: >
+      Create the design document that explains HOW to implement the change.
+
+
+      When to include design.md (create only if any apply):
+
+      - Cross-cutting change (multiple services/modules) or new architectural
+      pattern
+
+      - New external dependency or significant data model changes
+
+      - Security, performance, or migration complexity
+
+      - Ambiguity that benefits from technical decisions before coding
+
+
+      Sections:
+
+      - **Context**: Only the current state and constraints needed to explain
+      the approach. Reference the proposal for motivation instead of restating
+      it (e.g., "See proposal.md - Why").
+
+      - **Goals / Non-Goals**: What this design achieves and explicitly
+      excludes. Don't restate the proposal's scope - add only design-level
+      boundaries.
+
+      - **Decisions**: Key technical choices with rationale (why X over Y?).
+      Include alternatives considered for each decision.
+
+      - **Risks / Trade-offs**: Known limitations, things that could go wrong.
+      Format: [Risk] → Mitigation
+
+      - **Migration Plan**: Steps to deploy, rollback strategy (if applicable)
+
+      - **Open Questions**: Unknowns that can safely be answered later without
+        changing the specs, the approach, or the task breakdown. Omit if none.
+
+      Open questions are for genuinely deferrable unknowns, not decisions you
+
+      skipped. If a question would change the specs, the chosen approach, or
+
+      the task breakdown, resolve it now - ask the user instead of guessing.
+
+
+      TDD note: tests.md already exists. If this design places modules or
+
+      layers differently from the test file paths chosen there, list the
+
+      affected groups so tests.md can be updated in the same pass.
+
+
+      Focus on architecture and approach, not line-by-line implementation.
+
+      The proposal covers why and what; design covers how. Reference the
+
+      proposal for motivation and, once written, the specs for requirements -
+
+      if a section would only restate them, point to them instead.
+
+
+      Good design docs explain the "why" behind technical decisions.
+    requires:
+      - proposal
+  - id: tasks
+    generates: tasks.md
+    description: Implementation checklist driving every failing test to green
+    template: tasks.md
+    instruction: >
+      Create the task list that breaks down the implementation work.
+
+
+      Before writing tasks, check design.md for Open Questions. If any of them
+
+      would change what gets built, resolve them with the user first - do not
+
+      bake an unstated assumption into the task list.
+
+
+      **IMPORTANT: Follow the template below exactly.** The apply phase parses
+
+      checkbox format to track progress. Tasks not using `- [ ]` won't be
+      tracked.
+
+
+      Guidelines:
+
+      - Group related tasks under ## numbered headings
+
+      - Each task MUST be a checkbox: `- [ ] X.Y Task description`
+
+      - Tasks should be small enough to complete in one session
+
+      - Order tasks by dependency (what must be done first?)
+
+
+      TDD ordering:
+
+      - The first group MUST start with running the tests from tests.md and
+        confirming they fail for the expected reason (RED baseline).
+      - Remaining groups MUST drive every automated scenario to green. Where
+        useful, reference scenario IDs in task descriptions (e.g. "implement
+        CSV formatting (data-export-S2, data-export-S3)").
+      - Every automated scenario in tests.md must be green before the change
+        can be archived.
+
+      Example:
+
+      ```
+
+      ## 1. RED baseline
+
+
+      - [ ] 1.1 Run new test files and confirm all fail for the expected reason
+
+
+      ## 2. Core Implementation
+
+
+      - [ ] 2.1 Implement data export function (data-export-S1)
+
+      - [ ] 2.2 Add CSV formatting utilities (data-export-S2, data-export-S3)
+
+      ```
+
+
+      Reference specs for what needs to be built, design for how to build it,
+
+      tests.md for the acceptance bar. Each task should be verifiable - you
+
+      know when it's done.
+    requires:
+      - specs
+      - design
+      - tests
+apply:
+  requires:
+    - tasks
+    - tests
+  tracks: tasks.md
+  instruction: |
+    Read context files, work through pending tasks, mark complete as you go.
+    This is the GREEN phase of the TDD cycle: run the tests listed in
+    tests.md first, confirm the new tests fail for the expected reason, then
+    implement until they pass. Never weaken, skip, or delete a test to make it
+    pass - fix the implementation, or if the spec itself changed, update the
+    specs and tests.md together in the same pass. As tests turn green, update
+    their Status in tests.md. Pause if you hit blockers or need clarification.
