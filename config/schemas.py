@@ -282,6 +282,36 @@ class PersistenceConfig:
 
 
 @dataclass
+class RegistryConfig:
+    """Persistent link registry configuration.
+
+    The registry is write-only in this change: it records links, coverage and
+    runs but never influences pipeline decisions.
+    """
+
+    enabled: bool = False
+    path: str = ""  # empty => <workspace>/registry.sqlite
+    batch_size: int = 50
+    flush_interval: int = 5
+    queue_size: int = 100000
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_registry_config on purpose: this
+        # guards direct (non-loader) construction in tests and embedding, while
+        # the validator reports all config errors together for YAML loading.
+        if not isinstance(self.enabled, bool):
+            raise ValueError("registry.enabled must be a boolean")
+        if not isinstance(self.path, str):
+            raise ValueError("registry.path must be a string")
+        if self.batch_size <= 0:
+            raise ValueError("registry.batch_size must be positive")
+        if self.flush_interval <= 0:
+            raise ValueError("registry.flush_interval must be positive")
+        if self.queue_size <= 0:
+            raise ValueError("registry.queue_size must be positive")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
 
@@ -404,6 +434,7 @@ class Config:
     display: DisplayConfig = field(default_factory=DisplayConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     worker: WorkerManagerConfig = field(default_factory=WorkerManagerConfig)
+    registry: RegistryConfig = field(default_factory=RegistryConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -429,6 +460,7 @@ class Config:
             "display": self._dataclass_to_dict(self.display),
             "persistence": self._dataclass_to_dict(self.persistence),
             "worker": self._dataclass_to_dict(self.worker),
+            "registry": self._dataclass_to_dict(self.registry),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

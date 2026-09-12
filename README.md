@@ -839,6 +839,68 @@ harvester/
    - Configurable monitoring system
    - Flexible recovery strategies
 
+## Persistent Link Registry
+
+The registry is a durable, cross-provider SQLite ledger of every GitHub link
+the harvester has discovered, which provider/pattern set gathered it, and a
+journal of each run. It gives the pipeline memory across restarts and provider
+changes. **In this release it is write-only:** nothing reads it to influence
+task creation, skipping, stopping or checking, so enabling it does not change
+the produced shards.
+
+- **Location:** `<workspace>/registry.sqlite` (plus WAL `-wal`/`-shm` sidecars),
+  outside `providers/<folder>/`, so it survives provider-set changes.
+- **Journal mode:** WAL. The workspace must live on a **local filesystem**;
+  SQLite WAL is not safe over network filesystems (NFS/SMB).
+- **Disk estimate:** roughly 200 bytes per link row — about 200 MB for 1M links.
+
+### Configuration
+
+```yaml
+registry:
+  enabled: false      # default; true turns recording on (no behavior change)
+  path: ""            # empty => <workspace>/registry.sqlite
+  batch_size: 50      # rows per batched upsert
+  flush_interval: 5   # seconds between periodic flushes
+  queue_size: 100000  # bounded queue; overflow drops writes and degrades the run
+```
+
+When `enabled: false` (the default) no registry file is created or opened and
+all write hooks are no-ops.
+
+### Migration from existing workspaces
+
+The one-time migration imports historical shards into the registry. It is
+idempotent and never overwrites fresher in-place state. Links are imported
+conservatively (`visit_status='discovered'`, `gathered_ts=NULL`) because legacy
+shards cannot distinguish "seen" from "gathered"; the worst case is one extra
+re-gather wave once skip features land.
+
+```bash
+# Report what would be imported, write nothing
+python -m tools.registry_migrate --workspace ./data --dry-run
+
+# Perform the migration
+python -m tools.registry_migrate --workspace ./data
+
+# Explicit registry path
+python -m tools.registry_migrate --workspace ./data --registry /path/registry.sqlite
+```
+
+### Operations
+
+- **Rollback:** set `registry.enabled: false`. Deleting `registry.sqlite*` is
+  harmless while the registry is write-only.
+- **Space reclamation:** after large migrations, run `VACUUM` manually:
+  `sqlite3 <workspace>/registry.sqlite "VACUUM;"`. Not automated.
+- **Integrity check:** `sqlite3 <workspace>/registry.sqlite "PRAGMA integrity_check;"`
+  passes after abrupt termination because committed batches are WAL-recovered.
+- **Degraded runs:** any registry error logs a warning, marks the run degraded
+  in `runs.degraded`, and continues harvesting unchanged.
+
+See `docs/specs/url_canonicalization.md` (identity canon) and
+`docs/specs/registry_flags_metrics.md` (flag matrix and metrics dictionary).
+
 ## Troubleshooting
 
 ### **Common Issues**

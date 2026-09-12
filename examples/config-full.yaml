@@ -184,6 +184,19 @@ worker:
   # Enable worker adjustment recommendation logging
   log_recommendations: true
 
+# Persistent link registry configuration (write-only in this change)
+registry:
+  # Enable recording of links, gather coverage and run journaling
+  enabled: false
+  # Database path; empty means <workspace>/registry.sqlite
+  path: ""
+  # Rows buffered before a batch upsert
+  batch_size: 50
+  # Seconds between periodic flushes
+  flush_interval: 5
+  # Maximum queued operations before writes are dropped (and the run degraded)
+  queue_size: 100000
+
 # Global rate limiting configuration
 ratelimits:
   # GitHub API rate limits

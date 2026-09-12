@@ -19,6 +19,7 @@ from stage.base import BasePipelineStage, StageOutput, StageResources, StageUtil
 from stage.registry import StageRegistryMixin
 from stage.resolver import DependencyResolver
 from storage.persistence import MultiResultManager
+from storage.registry import Registry, config_digest as build_config_digest, init_registry
 from tools.coordinator import get_session, get_token, get_user_agent
 from tools.logger import get_logger
 from tools.ratelimit import RateLimiter
@@ -58,6 +59,14 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         )
 
         self.rate_limiter = RateLimiter(config.ratelimits)
+
+        # Write-only link registry (no-op singleton when disabled).
+        # NOTE: named `link_registry` to avoid clashing with the inherited
+        # `registry` property that exposes the stage registry.
+        self.link_registry: Registry = init_registry(
+            config.global_config.workspace,
+            config=config.registry,
+        )
 
         # Configure the shared HTTP opener before any stage starts making network requests
         client.set_proxy(config.global_config.proxy)
@@ -140,6 +149,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             config=self.config,
             task_configs=self.task_configs,
             auth=get_auth_provider(),
+            registry=self.link_registry,
         )
 
         # Create stages in dependency order
@@ -170,6 +180,9 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
 
     def _on_start(self) -> None:
         """Start all pipeline stages"""
+        # Open the write-only registry before stages begin producing
+        self.link_registry.start()
+
         if not self.stages:
             logger.warning("No stages to start")
             return
@@ -198,11 +211,30 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             if stage:
                 stage.stop(stage_timeout)
 
+        # Drain and close the registry before result managers flush
+        self.link_registry.stop()
+
         # Stop managers
         self.queue_manager.stop()
         self.result_manager.stop_all()
 
         logger.info("Stopped all pipeline stages")
+
+    def start_registry_run(self) -> None:
+        """Journal the start of a run (write-only, fail-open)."""
+        try:
+            if self.link_registry.available:
+                self.link_registry.start_run(config_digest=build_config_digest(self.config))
+        except Exception as e:
+            logger.warning(f"Failed to journal registry run start: {e}")
+            self.link_registry.mark_degraded()
+
+    def finish_registry_run(self) -> None:
+        """Journal the graceful finish of a run (write-only, fail-open)."""
+        try:
+            self.link_registry.finish_run()
+        except Exception as e:
+            logger.warning(f"Failed to journal registry run finish: {e}")
 
     def is_finished(self) -> bool:
         """Check if pipeline is finished and manage stage states"""

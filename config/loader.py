@@ -32,6 +32,7 @@ from .schemas import (
     MonitoringConfig,
     PersistenceConfig,
     PipelineConfig,
+    RegistryConfig,
     StageConfig,
     StorageConfig,
     TaskConfig,
@@ -106,6 +107,10 @@ class ConfigLoader:
         # Parse worker configuration
         if "worker" in data:
             config.worker = self._parse_worker_manager_config(data["worker"])
+
+        # Parse registry configuration
+        if "registry" in data:
+            config.registry = self._parse_registry_config(data["registry"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -265,6 +270,23 @@ class ConfigLoader:
             scale_up_threshold=data.get("scale_up_threshold", 0.8),
             scale_down_threshold=data.get("scale_down_threshold", 0.2),
             log_recommendations=data.get("log_recommendations", True),
+        )
+
+    def _parse_registry_config(self, data: Dict[str, Any]) -> RegistryConfig:
+        """Parse registry configuration section
+
+        Args:
+            data: Registry configuration data
+
+        Returns:
+            RegistryConfig: Parsed registry configuration
+        """
+        return RegistryConfig(
+            enabled=data.get("enabled", False),
+            path=data.get("path", ""),
+            batch_size=data.get("batch_size", 50),
+            flush_interval=data.get("flush_interval", 5),
+            queue_size=data.get("queue_size", 100000),
         )
 
     def _parse_rate_limits(self, data: Dict[str, Any]) -> Dict[str, RateLimitConfig]:

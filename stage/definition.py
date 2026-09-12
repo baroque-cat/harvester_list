@@ -7,7 +7,7 @@ Registers all standard pipeline stages with their dependencies.
 
 import math
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from constant.search import (
     API_LIMIT,
@@ -31,6 +31,7 @@ from core.models import (
 from core.types import IProvider
 from search import client
 from search.github.refine.engine import RefineEngine
+from storage.registry import patterns_hash
 from tools.logger import get_logger
 from tools.state import GithubCredentialLimited
 from tools.utils import get_service_name, handle_exceptions
@@ -126,6 +127,9 @@ class SearchStage(BasePipelineStage):
                 # Add links to be saved
                 output.add_links(task.provider, results)
 
+                # Write-only hook: record discovered links
+                self._record_discovered(task, results)
+
             # Handle first page results for pagination/refinement
             if task.page == 1 and total > 0:
                 self._handle_first_page_results(task, total, output)
@@ -139,6 +143,24 @@ class SearchStage(BasePipelineStage):
         except Exception as e:
             logger.error(f"[{self.name}] error, provider: {task.provider}, task: {task}, message: {e}")
             return None
+
+    def _record_discovered(self, task: SearchTask, links: List[str]) -> None:
+        """Write-only hook: record discovered links in the registry."""
+        registry = getattr(self.resources, "registry", None)
+        if registry is None:
+            return
+        try:
+            transport = "api" if getattr(task, "use_api", False) else "web"
+            query_origin = getattr(task, "query", "") or ""
+            for link in links:
+                registry.record_link(
+                    link,
+                    transport=transport,
+                    query_origin=query_origin,
+                    provider=task.provider,
+                )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"[{self.name}] registry discovery hook failed: {e}")
 
     def _execute_first_page_search(self, task: SearchTask) -> Tuple[List[str], str, int]:
         """Execute first page search and get total count in single request"""
@@ -320,6 +342,8 @@ class AcquisitionStage(BasePipelineStage):
 
     def __init__(self, resources: StageResources, handler: OutputHandler, **kwargs):
         super().__init__(PipelineStage.GATHER.value, resources, handler, **kwargs)
+        # Coverage identity is computed once per distinct pattern set (design D5).
+        self._patterns_hashes: Dict[Tuple[str, str, str, str], str] = {}
 
     def _generate_id(self, task: ProviderTask) -> str:
         """Generate unique task identifier for deduplication"""
@@ -362,11 +386,44 @@ class AcquisitionStage(BasePipelineStage):
             # Add the processed link to be saved
             output.add_links(task.provider, [task.url])
 
+            # Write-only hook: record successful gather + coverage
+            self._record_gathered(task, success=True)
+
             return output
 
         except Exception as e:
+            # Write-only hook: record failed gather
+            self._record_gathered(task, success=False)
             logger.error(f"[{self.name}] error for provider: {task.provider}, task: {task}, message: {e}")
             return None
+
+    def _record_gathered(self, task: AcquisitionTask, success: bool) -> None:
+        """Write-only hook: record a gather outcome (and coverage on success)."""
+        registry = getattr(self.resources, "registry", None)
+        if registry is None:
+            return
+        try:
+            key = (task.key_pattern, task.address_pattern, task.endpoint_pattern, task.model_pattern)
+            digest = self._patterns_hashes.get(key)
+            if digest is None:
+                digest = patterns_hash(
+                    key_pattern=task.key_pattern,
+                    address_pattern=task.address_pattern,
+                    endpoint_pattern=task.endpoint_pattern,
+                    model_pattern=task.model_pattern,
+                )
+                self._patterns_hashes[key] = digest
+            config = self.resources.task_configs.get(task.provider)
+            transport = "api" if getattr(config, "use_api", False) else "web"
+            registry.record_gather(
+                task.url,
+                provider=task.provider,
+                patterns_hash=digest,
+                success=success,
+                transport=transport,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"[{self.name}] registry gather hook failed: {e}")
 
 
 @register_stage(

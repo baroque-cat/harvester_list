@@ -259,6 +259,9 @@ class TaskManager(LifecycleManager, TaskDataProvider):
         # 1. Start pipeline (creates ResultManager without backup)
         self.pipeline.start()
 
+        # 1b. Journal the start of this run in the write-only registry
+        self.pipeline.start_registry_run()
+
         # 2. Recover queue tasks
         recoverd_tasks = self.pipeline.queue_manager.load_all_queues()
 
@@ -296,6 +299,8 @@ class TaskManager(LifecycleManager, TaskDataProvider):
     def _on_stop(self) -> None:
         """Stop the task manager gracefully"""
         if self.pipeline:
+            # Journal the run finish before the registry is drained and closed
+            self.pipeline.finish_registry_run()
             self.pipeline.stop()
 
         logger.info("Stopped task manager")

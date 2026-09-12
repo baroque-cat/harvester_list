@@ -45,6 +45,7 @@ class StageResources:
     config: Config
     task_configs: Dict[str, TaskConfig]
     auth: IAuthProvider
+    registry: Any = None  # write-only link registry (never read for decisions)
 
     def is_enabled(self, provider: str, stage: str) -> bool:
         """Check if stage is enabled for provider"""

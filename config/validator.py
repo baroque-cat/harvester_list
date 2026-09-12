@@ -51,6 +51,9 @@ class ConfigValidator:
         # Validate worker manager configuration
         self._validate_worker_manager_config(config)
 
+        # Validate registry configuration
+        self._validate_registry_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -222,6 +225,29 @@ class ConfigValidator:
 
         if worker_manager.scale_down_threshold >= worker_manager.scale_up_threshold:
             self.errors.append("Worker manager scale_down_threshold must be < scale_up_threshold")
+
+    def _validate_registry_config(self, config: Config) -> None:
+        """Validate registry configuration section
+
+        Args:
+            config: Configuration object
+        """
+        registry = config.registry
+
+        if not isinstance(registry.enabled, bool):
+            self.errors.append("Registry enabled must be a boolean")
+
+        if registry.batch_size <= 0:
+            self.errors.append("Registry batch_size must be positive")
+
+        if registry.flush_interval <= 0:
+            self.errors.append("Registry flush_interval must be positive")
+
+        if registry.queue_size <= 0:
+            self.errors.append("Registry queue_size must be positive")
+
+        if not isinstance(registry.path, str):
+            self.errors.append("Registry path must be a string")
 
     def _validate_rate_limits(self, config: Config) -> None:
         """Validate rate limits configuration
