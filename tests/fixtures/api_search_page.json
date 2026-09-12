@@ -1,0 +1,28 @@
+{
+  "_provenance": {
+    "kind": "synthetic-unit-vector",
+    "note": "Hand-built extraction-path unit vector, NOT a live capture. Authoritative external-contract fixtures are live_2026_09_* (design D6).",
+    "covers": "well-formed item (pushed_at+size), item without repository, updated_at fallback"
+  },
+  "total_count": 3,
+  "items": [
+    {
+      "html_url": "https://github.com/acme/alpha/blob/main/app.py",
+      "repository": {
+        "pushed_at": "2026-01-02T03:04:05Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "size": 1234
+      }
+    },
+    {
+      "html_url": "https://github.com/acme/beta/blob/main/main.go"
+    },
+    {
+      "html_url": "https://github.com/acme/gamma/blob/main/conf.env",
+      "repository": {
+        "updated_at": "2026-02-03T04:05:06Z",
+        "size": 42
+      }
+    }
+  ]
+}

@@ -7,7 +7,7 @@ Registers all standard pipeline stages with their dependencies.
 
 import math
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from constant.search import (
     API_LIMIT,
@@ -23,6 +23,7 @@ from core.models import (
     AcquisitionTask,
     CheckTask,
     InspectTask,
+    LinkMetadata,
     Patterns,
     ProviderTask,
     SearchTask,
@@ -89,11 +90,14 @@ class SearchStage(BasePipelineStage):
     def _search_worker(self, task: SearchTask) -> Optional[StageOutput]:
         """Pure functional search worker"""
         try:
+            # API transport enriches this mapping in place; web leaves it empty.
+            link_metadata: Dict[str, LinkMetadata] = {}
+
             # Execute search based on page number
             if task.page == 1:
-                results, content, total = self._execute_first_page_search(task)
+                results, content, total = self._execute_first_page_search(task, link_metadata)
             else:
-                results, content = self._execute_page_search(task)
+                results, content = self._execute_page_search(task, link_metadata)
                 total = 0
 
             # Create output object
@@ -126,6 +130,18 @@ class SearchStage(BasePipelineStage):
 
                 # Add links to be saved
                 output.add_links(task.provider, results)
+
+                # Carry API-extracted freshness metadata to the registry writer.
+                if link_metadata:
+                    output.add_link_metadata(task.provider, link_metadata)
+
+                # Fill-rate observability: only the API transport yields dates
+                # at search stage (web dates arrive at gather stage).
+                date_metrics = getattr(self.resources, "date_metrics", None)
+                if date_metrics is not None and task.use_api:
+                    for link in results:
+                        item = link_metadata.get(link)
+                        date_metrics.record_api(bool(item and item.has_repo_date))
 
                 # Write-only hook: record discovered links
                 self._record_discovered(task, results)
@@ -162,7 +178,9 @@ class SearchStage(BasePipelineStage):
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(f"[{self.name}] registry discovery hook failed: {e}")
 
-    def _execute_first_page_search(self, task: SearchTask) -> Tuple[List[str], str, int]:
+    def _execute_first_page_search(
+        self, task: SearchTask, metadata: Optional[Dict[str, LinkMetadata]] = None
+    ) -> Tuple[List[str], str, int]:
         """Execute first page search and get total count in single request"""
         while True:
             # Get auth via injected provider
@@ -182,6 +200,7 @@ class SearchStage(BasePipelineStage):
                     page=task.page,
                     with_api=task.use_api,
                     peer_page=API_RESULTS_PER_PAGE if task.use_api else WEB_RESULTS_PER_PAGE,
+                    metadata=metadata,
                 )
                 return results, content, total
             except GithubCredentialLimited as e:
@@ -199,7 +218,9 @@ class SearchStage(BasePipelineStage):
 
         return query
 
-    def _execute_page_search(self, task: SearchTask) -> Tuple[List[str], str]:
+    def _execute_page_search(
+        self, task: SearchTask, metadata: Optional[Dict[str, LinkMetadata]] = None
+    ) -> Tuple[List[str], str]:
         """Execute subsequent page search in single request"""
         while True:
             # Get auth via injected provider
@@ -219,6 +240,7 @@ class SearchStage(BasePipelineStage):
                     page=task.page,
                     with_api=task.use_api,
                     peer_page=API_RESULTS_PER_PAGE if task.use_api else WEB_RESULTS_PER_PAGE,
+                    metadata=metadata,
                 )
                 return results, content
             except GithubCredentialLimited as e:
@@ -362,6 +384,7 @@ class AcquisitionStage(BasePipelineStage):
         """Pure functional acquisition worker implementation"""
         try:
             # Execute acquisition using global collect function
+            metadata: Dict[str, Any] = {}
             services = client.collect(
                 key_pattern=task.key_pattern,
                 url=task.url,
@@ -369,10 +392,22 @@ class AcquisitionStage(BasePipelineStage):
                 address_pattern=task.address_pattern,
                 endpoint_pattern=task.endpoint_pattern,
                 model_pattern=task.model_pattern,
+                metadata=metadata,
             )
 
             # Create output object
             output = StageOutput(task=task)
+
+            # Carry the gathered page's file-commit date to the registry writer
+            # and feed the web fill-rate drift monitor.
+            file_commit_date = metadata.get("file_commit_date")
+            output.add_link_metadata(
+                task.provider,
+                {task.url: LinkMetadata(file_commit_date=file_commit_date, transport=self._transport(task))},
+            )
+            date_metrics = getattr(self.resources, "date_metrics", None)
+            if date_metrics is not None:
+                date_metrics.record_web(file_commit_date is not None)
 
             # Create check tasks for found services
             if services:
@@ -397,6 +432,11 @@ class AcquisitionStage(BasePipelineStage):
             logger.error(f"[{self.name}] error for provider: {task.provider}, task: {task}, message: {e}")
             return None
 
+    def _transport(self, task: ProviderTask) -> str:
+        """Resolve the configured transport ("api"/"web") for a provider task."""
+        config = self.resources.task_configs.get(task.provider)
+        return "api" if getattr(config, "use_api", False) else "web"
+
     def _record_gathered(self, task: AcquisitionTask, success: bool) -> None:
         """Write-only hook: record a gather outcome (and coverage on success)."""
         registry = getattr(self.resources, "registry", None)
@@ -413,8 +453,7 @@ class AcquisitionStage(BasePipelineStage):
                     model_pattern=task.model_pattern,
                 )
                 self._patterns_hashes[key] = digest
-            config = self.resources.task_configs.get(task.provider)
-            transport = "api" if getattr(config, "use_api", False) else "web"
+            transport = self._transport(task)
             registry.record_gather(
                 task.url,
                 provider=task.provider,

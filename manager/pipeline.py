@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 from config.schemas import Config
 from core.auth import configure_auth, get_auth_provider
 from core.enums import PipelineStage, SystemState
-from core.metrics import PipelineStatus
+from core.metrics import DateFillMetrics, PipelineStatus
 from core.models import ProviderTask
 from core.types import IPipelineStats, IProvider
 from search import client
@@ -67,6 +67,9 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             config.global_config.workspace,
             config=config.registry,
         )
+
+        # Date-extraction fill-rate observability (per run, fail-open).
+        self.date_metrics = DateFillMetrics()
 
         # Configure the shared HTTP opener before any stage starts making network requests
         client.set_proxy(config.global_config.proxy)
@@ -150,6 +153,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             task_configs=self.task_configs,
             auth=get_auth_provider(),
             registry=self.link_registry,
+            date_metrics=self.date_metrics,
         )
 
         # Create stages in dependency order
@@ -283,6 +287,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             total=len(self.stages),
             stages=stage_status,
             runtime=time.time() - self.start_time,
+            date_metrics=self.date_metrics.to_stats(),
         )
 
         return pipeline_status
@@ -330,6 +335,13 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         # Save models
         for provider, key, models in output.models:
             self.result_manager.add_models(provider, key, models)
+
+        # Forward date metadata to the registry writer (non-regressing merge).
+        for provider, mapping in output.link_metadata:
+            try:
+                self.link_registry.record_metadata(mapping)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(f"Registry metadata hook failed for {provider}: {e}")
 
         # Route new tasks
         for task, target_stage in output.new_tasks:

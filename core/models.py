@@ -346,6 +346,29 @@ class TaskRecoveryInfo:
 
 
 @dataclass
+class LinkMetadata:
+    """Freshness/size metadata harvested for a GitHub link (free side data).
+
+    Every field is optional: a missing or malformed payload degrades to
+    ``None`` and never raises. ``transport`` records where the observation
+    came from (``api`` / ``web``) for diagnostics only.
+    """
+
+    repo_pushed_at: Optional[float] = None
+    repo_size_kb: Optional[int] = None
+    file_commit_date: Optional[float] = None
+    transport: str = ""
+
+    @property
+    def has_repo_date(self) -> bool:
+        return self.repo_pushed_at is not None
+
+    @property
+    def has_file_date(self) -> bool:
+        return self.file_commit_date is not None
+
+
+@dataclass
 class Service:
     """Core service data model representing an API service endpoint
 

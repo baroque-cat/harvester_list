@@ -27,7 +27,7 @@ from config.schemas import Config, StageConfig, TaskConfig
 from constant.system import DEFAULT_SHUTDOWN_TIMEOUT
 from core.enums import PipelineStage
 from core.metrics import StageMetrics
-from core.models import ProviderTask
+from core.models import LinkMetadata, ProviderTask
 from core.types import IAuthProvider, IProvider
 from tools.logger import get_logger
 from tools.ratelimit import RateLimiter
@@ -46,6 +46,7 @@ class StageResources:
     task_configs: Dict[str, TaskConfig]
     auth: IAuthProvider
     registry: Any = None  # write-only link registry (never read for decisions)
+    date_metrics: Any = None  # DateFillMetrics accumulator (fail-open observability)
 
     def is_enabled(self, provider: str, stage: str) -> bool:
         """Check if stage is enabled for provider"""
@@ -64,6 +65,9 @@ class StageOutput:
     results: List[Tuple[str, str, Any]] = field(default_factory=list)  # (provider, type, data)
     links: List[Tuple[str, List[str]]] = field(default_factory=list)  # (provider, links)
     models: List[Tuple[str, str, List[str]]] = field(default_factory=list)  # (provider, key, models)
+    link_metadata: List[Tuple[str, Dict[str, LinkMetadata]]] = field(
+        default_factory=list
+    )  # (provider, url -> metadata)
 
     def add_task(self, task: ProviderTask, target: str) -> None:
         """Add new task to be routed"""
@@ -80,6 +84,11 @@ class StageOutput:
     def add_models(self, provider: str, key: str, models: List[str]) -> None:
         """Add models to be saved"""
         self.models.append((provider, key, models))
+
+    def add_link_metadata(self, provider: str, metadata: Dict[str, LinkMetadata]) -> None:
+        """Attach per-link extracted freshness/size metadata for the registry."""
+        if metadata:
+            self.link_metadata.append((provider, metadata))
 
 
 # Type alias for output handler function

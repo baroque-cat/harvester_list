@@ -4,6 +4,7 @@
 HTTP client utilities and GitHub-specific search functions for the search engine.
 """
 
+import datetime
 import gzip
 import itertools
 import json
@@ -17,11 +18,129 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
-from core.models import Service
+from core.models import LinkMetadata, Service
 from tools.logger import get_logger
 from tools.utils import encoding_url, isblank, trim
 
 logger = get_logger("search")
+
+# ---------------------------------------------------------------------------
+# Date extraction (fail-open side data)
+#
+# Dates are captured from payloads the harvester already downloads: the API
+# search JSON carries repository freshness/size, and blob HTML embeds the
+# file's last-commit date in ``<relative-time datetime="…">`` elements.
+# Every fault degrades to NULL and is counted; nothing here may raise into a
+# stage worker loop.
+# ---------------------------------------------------------------------------
+
+_RELATIVE_TIME_RE = re.compile(r'<relative-time[^>]*\bdatetime\s*=\s*"([^"]+)"', flags=re.I)
+
+_DATE_WARNING_COUNTS: Dict[str, int] = {}
+_DATE_WARNING_KINDS: set = set()
+
+
+def _date_warning(kind: str, message: str = "") -> None:
+    """Count a fail-open date-parsing issue and warn once per kind."""
+    _DATE_WARNING_COUNTS[kind] = _DATE_WARNING_COUNTS.get(kind, 0) + 1
+    if kind not in _DATE_WARNING_KINDS:
+        _DATE_WARNING_KINDS.add(kind)
+        logger.warning(f"[date-extraction] {kind}: {message or 'degraded to NULL'}")
+
+
+def get_date_parse_stats() -> Dict[str, int]:
+    """Expose fail-open date-parsing counters keyed by kind."""
+    return dict(_DATE_WARNING_COUNTS)
+
+
+def reset_date_parse_stats() -> None:
+    """Reset fail-open date-parsing counters (tests / fresh runs)."""
+    _DATE_WARNING_COUNTS.clear()
+    _DATE_WARNING_KINDS.clear()
+
+
+def parse_iso_epoch(value: Any) -> Optional[float]:
+    """Parse an ISO-8601 timestamp (incl. trailing ``Z``) to epoch seconds.
+
+    Returns ``None`` (and counts a warning) for anything unparseable.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text[-1] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        _date_warning("bad_datetime", f"could not parse {value!r}")
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
+def extract_link_metadata(item: Any, transport: str = "api") -> LinkMetadata:
+    """Map one API search item's ``repository`` block to :class:`LinkMetadata`.
+
+    Preference chain: ``repository.pushed_at`` → ``repository.updated_at`` →
+    NULL.  Missing/malformed shapes yield NULL fields plus a counted warning.
+    """
+    metadata = LinkMetadata(transport=transport)
+    if not isinstance(item, dict):
+        _date_warning("bad_item", f"unexpected item type {type(item).__name__}")
+        return metadata
+
+    repository = item.get("repository")
+    if not isinstance(repository, dict):
+        _date_warning("missing_repository", "item has no repository object")
+        return metadata
+
+    pushed = parse_iso_epoch(repository.get("pushed_at"))
+    if pushed is None:
+        pushed = parse_iso_epoch(repository.get("updated_at"))
+    if pushed is None:
+        # Spec: absent date fields yield NULL *plus a counted warning*.  This
+        # is the prevailing case for `/search/code` (trimmed repository, D7),
+        # so the counter is the drift signal if GitHub ever restores them.
+        _date_warning("missing_date", "repository exposes no usable pushed_at/updated_at")
+    metadata.repo_pushed_at = pushed
+
+    size = repository.get("size")
+    if size is not None:
+        try:
+            metadata.repo_size_kb = int(size)
+        except (TypeError, ValueError):
+            _date_warning("bad_size", f"repository.size={size!r}")
+    return metadata
+
+
+def _extract_file_commit_date(html: Any) -> Optional[float]:
+    """Return the MAX ``<relative-time datetime=…>`` epoch from blob HTML.
+
+    Biasing upward is deliberate: an overestimated date can only cause a
+    cheap extra re-gather downstream, while underestimating could cause a
+    false skip.  Zero usable matches yield ``None`` (counted).
+    """
+    if not isinstance(html, str) or not html:
+        _date_warning("bad_html", f"unexpected page type {type(html).__name__}")
+        return None
+    try:
+        values = _RELATIVE_TIME_RE.findall(html)
+    except Exception as exc:  # pragma: no cover - defensive
+        _date_warning("bad_regex", str(exc))
+        return None
+
+    epochs: List[float] = []
+    for value in values:
+        epoch = parse_iso_epoch(value)
+        if epoch is not None:
+            epochs.append(epoch)
+    if not epochs:
+        _date_warning("no_relative_time", "no usable relative-time datetime found")
+        return None
+    return max(epochs)
 
 _HTTP_SESSION = requests.Session()
 _HTTP_SESSION.trust_env = False
@@ -715,8 +834,18 @@ def search_github_web(query: str, session: str, page: int) -> str:
     return content
 
 
-def search_github_api(query: str, token: str, page: int = 1, peer_page: int = API_RESULTS_PER_PAGE) -> List[str]:
-    """Rate limit: 10RPM."""
+def search_github_api(
+    query: str,
+    token: str,
+    page: int = 1,
+    peer_page: int = API_RESULTS_PER_PAGE,
+    metadata: Optional[Dict[str, LinkMetadata]] = None,
+) -> List[str]:
+    """Rate limit: 10RPM.
+
+    Returns the same URL list as before; when ``metadata`` is provided it is
+    enriched in place with ``url -> LinkMetadata`` for every returned item.
+    """
     if isblank(token) or isblank(query):
         return []
 
@@ -744,12 +873,15 @@ def search_github_api(query: str, token: str, page: int = 1, peer_page: int = AP
 
         for item in items:
             if not item or type(item) != dict:
+                _date_warning("bad_item", f"unexpected item type {type(item).__name__}")
                 continue
 
             link = item.get("html_url", "")
             if isblank(link):
                 continue
             links.add(link)
+            if metadata is not None:
+                metadata[link] = extract_link_metadata(item, transport="api")
 
         return list(links)
     except Exception:
@@ -806,7 +938,11 @@ def search_web_with_count(
 
 
 def search_api_with_count(
-    query: str, token: str, page: int = 1, peer_page: int = API_RESULTS_PER_PAGE
+    query: str,
+    token: str,
+    page: int = 1,
+    peer_page: int = API_RESULTS_PER_PAGE,
+    metadata: Optional[Dict[str, LinkMetadata]] = None,
 ) -> Tuple[List[str], int, str]:
     """
     Search GitHub API and return results, total count, and raw content.
@@ -816,6 +952,8 @@ def search_api_with_count(
         token: GitHub API token for authentication
         page: Page number to retrieve (default: 1)
         peer_page: Results per page (default: API_RESULTS_PER_PAGE)
+        metadata: Optional out-mapping, enriched in place with per-URL
+            :class:`LinkMetadata` (missing/malformed data degrades to NULL).
 
     Returns:
         Tuple containing:
@@ -853,12 +991,15 @@ def search_api_with_count(
         links = set()
         for item in items:
             if not item or type(item) != dict:
+                _date_warning("bad_item", f"unexpected item type {type(item).__name__}")
                 continue
 
             link = item.get("html_url", "")
             if isblank(link):
                 continue
             links.add(link)
+            if metadata is not None:
+                metadata[link] = extract_link_metadata(item, transport="api")
 
         return list(links), total, content
     except Exception:
@@ -872,14 +1013,18 @@ def search_with_count(
     with_api: bool,
     peer_page: int,
     callback: Optional[Callable[[List[str], str], None]] = None,
+    metadata: Optional[Dict[str, LinkMetadata]] = None,
 ) -> Tuple[List[str], int, str]:
     """
     Unified search interface that returns results, total count, and content.
     Returns: (results_list, total_count, content)
+
+    ``metadata`` is populated for the API transport only; web search-results
+    HTML is deliberately not parsed for dates (transport asymmetry).
     """
     keywords = urllib.parse.quote_plus(query)
     if with_api:
-        return search_api_with_count(keywords, session, page, peer_page)
+        return search_api_with_count(keywords, session, page, peer_page, metadata=metadata)
     else:
         return search_web_with_count(keywords, session, page, callback)
 
@@ -1010,17 +1155,21 @@ def search_code(
     with_api: bool,
     peer_page: int,
     callback: Optional[Callable[[List[str], str], None]] = None,
+    metadata: Optional[Dict[str, LinkMetadata]] = None,
 ) -> Tuple[List[str], str]:
     """
     Search code with unified interface.
     Returns: (results_list, content)
+
+    ``metadata`` is populated for the API transport only; web search-results
+    HTML is deliberately not parsed for dates (transport asymmetry).
     """
     keyword = urllib.parse.quote_plus(trim(query))
     if not keyword:
         return [], ""
 
     if with_api:
-        results = search_github_api(query=keyword, token=session, page=page, peer_page=peer_page)
+        results = search_github_api(query=keyword, token=session, page=page, peer_page=peer_page, metadata=metadata)
         return results, ""  # API doesn't provide page content
 
     content = search_github_web(query=keyword, session=session, page=page)
@@ -1059,6 +1208,7 @@ def collect(
     endpoint_pattern: str = "",
     model_pattern: str = "",
     text: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> List[Service]:
     """Extract API keys and related information from URLs or text content
 
@@ -1070,6 +1220,8 @@ def collect(
         endpoint_pattern: Regex pattern to match endpoints
         model_pattern: Regex pattern to match model names
         text: Text content to search (if provided, url is ignored)
+        metadata: Optional out-mapping; receives ``file_commit_date`` (epoch
+            float or ``None``) extracted from the already-downloaded page.
 
     Returns:
         List[Service]: List of Service objects with extracted information
@@ -1084,6 +1236,14 @@ def collect(
 
     if not content:
         return []
+
+    # Capture the file's last-commit date from the payload we already hold.
+    if metadata is not None:
+        try:
+            metadata["file_commit_date"] = _extract_file_commit_date(content)
+        except Exception as exc:  # pragma: no cover - defensive
+            _date_warning("file_date_fault", str(exc))
+            metadata["file_commit_date"] = None
 
     # extract keys from content
     key_pattern = trim(key_pattern)

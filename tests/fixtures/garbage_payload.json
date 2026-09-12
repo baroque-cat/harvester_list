@@ -1,0 +1,16 @@
+{
+  "_provenance": {
+    "kind": "synthetic-unit-vector",
+    "note": "Hand-built fail-open unit vector, NOT a live capture (design D6).",
+    "covers": "non-dict items and a repository that is not an object"
+  },
+  "total_count": 3,
+  "items": [
+    "not-a-dict",
+    42,
+    {
+      "html_url": "https://github.com/acme/bad/blob/main/a.py",
+      "repository": "not-an-object"
+    }
+  ]
+}

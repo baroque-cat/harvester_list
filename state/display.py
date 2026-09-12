@@ -313,9 +313,12 @@ class StatusDisplayEngine:
     def _format_pipeline_section(self, status: SystemStatus, config: DisplayContextConfig) -> List[str]:
         """Format pipeline section with table-like layout"""
         lines: List[str] = []
+        date_line = self._format_date_metrics_line(status)
 
         if not status.pipeline.stages:
             lines.append("No pipeline data available")
+            if date_line:
+                lines.append(date_line)
             return lines
 
         # Table header
@@ -339,7 +342,25 @@ class StatusDisplayEngine:
             else:
                 lines.append(f"{name:>10}: queue={queue_size:<4}, processed={processed:<6}, errors={errors}")
 
+        if date_line:
+            lines.append(date_line)
+
         return lines
+
+    @staticmethod
+    def _format_date_metrics_line(status: SystemStatus) -> str:
+        """Render the date-extraction fill-rate line when observations exist."""
+        metrics = getattr(status.pipeline, "date_metrics", None)
+        if not metrics:
+            return ""
+        api_rate = metrics.get("date_fill_rate_api", 0.0)
+        web_rate = metrics.get("date_fill_rate_web", 0.0)
+        return (
+            f"Dates: api={api_rate:.3f} "
+            f"({metrics.get('api_dated', 0)}/{metrics.get('api_items', 0)}), "
+            f"web={web_rate:.3f} "
+            f"({metrics.get('web_dated', 0)}/{metrics.get('web_pages', 0)})"
+        )
 
     def _format_provider_section(self, status: SystemStatus) -> List[str]:
         """Format provider section with table-like layout"""

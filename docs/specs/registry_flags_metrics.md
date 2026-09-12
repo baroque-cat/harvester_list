@@ -37,8 +37,9 @@ per run unless noted.
 | `early_stop_pages_saved` | Search pages not fetched because of an early stop. | `add-search-early-stop` |
 | `early_stop_triggered` | Searches where an early stop fired. | `add-search-early-stop` |
 | `check_skipped_by_status` | Checks skipped, labelled by the conclusive status that justified the skip (`valid`, `invalid`, `no_quota`, `wait_check`). | `add-key-ledger` |
-| `date_fill_rate_repo` | Fraction of links with a populated `repo_pushed_at`. | `add-date-extraction` |
-| `date_fill_rate_file` | Fraction of links with a populated `file_commit_date`. | `add-date-extraction` |
+| `date_fill_rate_api` | Share of API search items that yielded a usable `repo_pushed_at` (documented **0.0 baseline**: the September 2026 live probe found trimmed `repository` objects without date/size fields — design D7; a sustained rise signals GitHub restored the fields or `add-repo-meta-enrichment` began feeding). Exposed per run in `PipelineStatus.date_metrics`. | `add-date-extraction` |
+| `date_fill_rate_web` | Share of gathered blob pages that yielded a `file_commit_date` (documented **0.0 baseline**: served blob HTML renders `<relative-time>` timestamps client-side — design D7; a sustained rise signals restored server-side markers). Exposed per run in `PipelineStatus.date_metrics`. | `add-date-extraction` |
+| `metadata_noops` | Date-metadata updates that matched no known link (the UPDATE-only merge never inserts phantom rows); logged once at debug level. Exposed by `Registry.get_stats()`. | `add-date-extraction` |
 
 ## Storage mapping
 

@@ -898,6 +898,30 @@ python -m tools.registry_migrate --workspace ./data --registry /path/registry.sq
 - **Degraded runs:** any registry error logs a warning, marks the run degraded
   in `runs.degraded`, and continues harvesting unchanged.
 
+### Date extraction (free freshness metadata)
+
+While the registry is enabled, the harvester also fills the reserved
+freshness columns from payloads it already downloaded — no extra requests:
+
+- **API search** records `repository.pushed_at` (fallback `updated_at`) and
+  `repository.size` (`repo_pushed_at`, `repo_size_kb`).
+- **Gather** records the latest `<relative-time datetime="…">` on the blob
+  page (`file_commit_date`).
+
+Transport asymmetry is deliberate: web **search-results** HTML is not parsed
+for dates, so web-discovered links stay NULL until gathered. The file date uses
+the **maximum** of all matches: overestimating can only cause a cheap re-gather,
+whereas underestimating could cause a dangerous false skip. Merge is
+non-regressing — NULL never overwrites a known value.
+
+Per-run fill rates `date_fill_rate_api` and `date_fill_rate_web` are exposed in
+`PipelineStatus.date_metrics`. Both carry a documented **0.0 baseline** (live
+probe, September 2026 — design D7): GitHub serves trimmed `repository` objects
+in `/search/code` and renders blob timestamps client-side, so a sustained
+*rise* is the signal that GitHub restored the fields or that
+`add-repo-meta-enrichment` began feeding the columns.
+See `docs/specs/date_extraction.md`.
+
 See `docs/specs/url_canonicalization.md` (identity canon) and
 `docs/specs/registry_flags_metrics.md` (flag matrix and metrics dictionary).
 

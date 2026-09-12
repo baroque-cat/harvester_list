@@ -36,6 +36,7 @@ REGISTRY_FILENAME = "registry.sqlite"
 _OP_DISCOVER = "discover"
 _OP_GATHER = "gather"
 _OP_COVERAGE = "coverage"
+_OP_METADATA = "metadata"
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS links(
@@ -125,6 +126,19 @@ INSERT INTO link_coverage (url_hash, provider, patterns_hash, gathered_ts)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(url_hash, provider, patterns_hash) DO UPDATE SET
   gathered_ts = excluded.gathered_ts
+"""
+
+# Non-regressing metadata merge: a NULL observation never erases a known value;
+# a non-NULL observation replaces the stored one (dates grow monotonically).
+# UPDATE-only on purpose: metadata must never fabricate a link row for an
+# unknown url_hash (verification finding S2 -- an INSERT would invent
+# first_seen_ts phantom links). Unknown hashes simply affect zero rows.
+_METADATA_SQL = """
+UPDATE links SET
+  repo_pushed_at = COALESCE(?, repo_pushed_at),
+  repo_size_kb = COALESCE(?, repo_size_kb),
+  file_commit_date = COALESCE(?, file_commit_date)
+WHERE url_hash = ?
 """
 
 _RUN_UPSERT_SQL = """
@@ -278,6 +292,8 @@ class Registry:
         self._degraded = False
         self._degraded_kinds: set = set()
         self.dropped = 0
+        self._metadata_noops = 0
+        self._metadata_noop_logged = False
 
         self.run_id = run_id
 
@@ -306,6 +322,8 @@ class Registry:
                 os.makedirs(directory, exist_ok=True)
 
             self.dropped = 0
+            self._metadata_noops = 0
+            self._metadata_noop_logged = False
             conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30.0)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
@@ -374,6 +392,7 @@ class Registry:
             "available": self._available,
             "degraded": self._degraded,
             "dropped": self.dropped,
+            "metadata_noops": self._metadata_noops,
             "queued": self._queue.qsize(),
         }
 
@@ -440,6 +459,32 @@ class Registry:
                 "ts": time.time() if ts is None else float(ts),
             },
         )
+
+    def record_metadata(self, metadata: Dict[str, Any]) -> None:
+        """Record non-regressing freshness/size metadata for links.
+
+        ``metadata`` maps URL -> object carrying ``repo_pushed_at``,
+        ``repo_size_kb`` and/or ``file_commit_date`` (for example a
+        :class:`core.models.LinkMetadata`).  Missing attributes are treated as
+        NULL.  Merge policy: NULL never overwrites a known value; a non-NULL
+        value replaces the stored one.
+        """
+        if not metadata:
+            return
+        items = []
+        for url, meta in metadata.items():
+            if not url:
+                continue
+            items.append(
+                (
+                    url,
+                    getattr(meta, "repo_pushed_at", None),
+                    getattr(meta, "repo_size_kb", None),
+                    getattr(meta, "file_commit_date", None),
+                )
+            )
+        if items:
+            self._enqueue(_OP_METADATA, {"items": items})
 
     # ------------------------------------------------------------------
     # Run journaling (low frequency, written synchronously)
@@ -542,6 +587,7 @@ class Registry:
         discovers = [payload for op, payload in batch if op == _OP_DISCOVER]
         gathers = [payload for op, payload in batch if op == _OP_GATHER]
         coverages = [payload for op, payload in batch if op == _OP_COVERAGE]
+        metadatas = [payload["items"] for op, payload in batch if op == _OP_METADATA]
 
         with self._write_lock:
             conn = self._conn
@@ -557,6 +603,18 @@ class Registry:
                     conn.executemany(_COVERAGE_SQL, [self._coverage_row(payload) for payload in successes])
             if coverages:
                 conn.executemany(_COVERAGE_SQL, [self._coverage_row(payload) for payload in coverages])
+            if metadatas:
+                rows = [self._metadata_row(item) for items in metadatas for item in items]
+                before = conn.total_changes
+                conn.executemany(_METADATA_SQL, rows)
+                if conn.total_changes == before:
+                    self._metadata_noops += len(rows)
+                    if not self._metadata_noop_logged:
+                        self._metadata_noop_logged = True
+                        logger.debug(
+                            "[registry] metadata update matched no existing link rows "
+                            f"({len(rows)} observations ignored)"
+                        )
 
             conn.commit()
 
@@ -606,6 +664,14 @@ class Registry:
         canon = canonical_url(payload["url"])
         digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()
         return (digest, payload["provider"], payload["patterns_hash"], payload["ts"])
+
+    @staticmethod
+    def _metadata_row(item: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        url, repo_pushed_at, repo_size_kb, file_commit_date = item
+        canon = canonical_url(url)
+        digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+        # Keyed by url_hash: metadata only updates rows already discovered.
+        return (repo_pushed_at, repo_size_kb, file_commit_date, digest)
 
     def _enqueue(self, op: str, payload: Dict[str, Any]) -> None:
         if not self.enabled or not self._available or self._suppress_writes:
