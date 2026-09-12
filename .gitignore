@@ -137,3 +137,5 @@ local.json
 cmd/*.txt
 cmd/*.json
 config.yaml*
+plan*
+truffle*
