@@ -513,11 +513,12 @@ Examples:
         else:
             logger.error("Application failed to run")
 
-        # Print final status
+        # Print final status (refresh=True: bypass the collector cache so the
+        # summary shows final pipeline metrics, e.g. gather-skip counters)
         logger.info("Final Status:")
         try:
             if app.status_manager:
-                app.status_manager.show_status(StatusContext.APPLICATION, DisplayMode.DETAILED)
+                app.status_manager.show_status(StatusContext.APPLICATION, DisplayMode.DETAILED, refresh=True)
         except Exception as e:
             logger.debug(f"Error showing final status: {e}")
 

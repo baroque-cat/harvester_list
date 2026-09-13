@@ -80,16 +80,30 @@ class StatusManager(PeriodicTaskManager):
     def _execute_periodic_task(self) -> None:
         """Execute periodic status display - main scheduling entry point"""
         try:
-            # Ingest fresh task data into monitoring if available
-            if self.task_provider and self.collector.monitoring:
-                status = self.task_provider.stats()
-                self.collector.monitoring.ingest(status)
+            # Ingest fresh task data into monitoring, then display it
+            status = self._ingest_fresh_task_data()
 
             # Display status with forced refresh
             self.show_status(refresh=True, status=status)
 
         except Exception as e:
             logger.error(f"Error in periodic status display: {e}")
+
+    def _ingest_fresh_task_data(self) -> Optional[SystemStatus]:
+        """Pull fresh task stats into monitoring (best-effort).
+
+        Returns the freshly built SystemStatus, or None when no task provider
+        is available. Keeps monitoring's pipeline snapshot (skip/date metrics
+        included) current for any subsequent cached read.
+        """
+        try:
+            if self.task_provider and self.collector.monitoring:
+                status = self.task_provider.stats()
+                self.collector.monitoring.ingest(status)
+                return status
+        except Exception as e:
+            logger.debug(f"Fresh task stats ingest failed: {e}")
+        return None
 
     def show_status(
         self,
@@ -112,6 +126,11 @@ class StatusManager(PeriodicTaskManager):
             # 1. Collect system status
             try:
                 if not status or not isinstance(status, SystemStatus):
+                    if refresh:
+                        # Pull fresh task stats into monitoring first so the
+                        # refreshed snapshot carries current pipeline metrics
+                        # (skip/date counters included).
+                        self._ingest_fresh_task_data()
                     status = self.collector.status(refresh=refresh)
             except Exception as e:
                 logger.error(f"Error collecting status: {e}")

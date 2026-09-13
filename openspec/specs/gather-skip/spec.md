@@ -1,11 +1,10 @@
-# Delta Spec: gather-skip
+# gather-skip Specification
 
 ## Purpose
 
 Suppresses creation of acquisition tasks for GitHub files that the harvester has already successfully gathered under the current provider and pattern set and that have not changed since, turning repeated runs from full re-fetches into delta collection — without ever skipping on incomplete or erroneous evidence. Amended (September 2026) after live probes established that `repo_pushed_at` is NULL in the prevailing production state (date-extraction design D7): absence of push evidence degrades precision to TTL-bounded staleness instead of vetoing skips outright; evidence quality is made visible via `push_signal_coverage`.
 
-## ADDED Requirements
-
+## Requirements
 ### Requirement: Conjunctive skip rule
 
 The system SHALL skip creating an acquisition task for a discovered link only when ALL of the following hold: (1) registry `visit_status = 'gathered_ok'`; (2) `gathered_ts` is within the configured gather TTL; (3) no positive evidence of change — IF `repo_pushed_at` is non-NULL THEN it is NOT the case that `repo_pushed_at > gathered_ts` (plus grace); a NULL `repo_pushed_at` satisfies this condition vacuously (freshness unknown; staleness is bounded by condition 2 — the documented TTL-only degradation mode, which is the prevailing production state until `add-repo-meta-enrichment` supplies dates); (4) a `link_coverage` row exists for the current `(provider, patterns_hash)`. If condition (1), (2) or (4) fails, if the registry row or `gathered_ts` is missing, or if the lookup errored, the task SHALL be created.
@@ -42,7 +41,7 @@ The system SHALL skip creating an acquisition task for a discovered link only wh
 
 ### Requirement: Three-mode rollout flag
 
-Skip behavior SHALL be controlled by `skip_known` with values `off` (default), `shadow`, and `on`. In `off` mode the registry SHALL NOT be read at all during search. In `shadow` mode every decision SHALL be computed and logged to a structured decision log while all tasks are still created. In `on` mode skips are enforced.
+Skip behavior SHALL be controlled by `skip_known` with values `off` (default), `shadow`, and `on`. In `off` mode the registry SHALL NOT be read at all during search. In `shadow` mode every decision SHALL be computed, every would-skip decision SHALL be logged to a structured decision log (one line per candidate), and all acquisition tasks SHALL still be created. In `on` mode skips are enforced.
 
 #### Scenario: Off mode is indistinguishable from pre-change behavior
 

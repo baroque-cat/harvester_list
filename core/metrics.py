@@ -187,6 +187,9 @@ class PipelineStatus:
     # Date-extraction fill rates (empty when no observations were made).
     date_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Gather-skip decision counters/reasons (empty until wired).
+    skip_metrics: Dict[str, Any] = field(default_factory=dict)
+
     def queue_size(self) -> int:
         """Get total queue size across all stages"""
         return sum(stage.queue_size for stage in self.stages.values())

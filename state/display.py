@@ -314,11 +314,14 @@ class StatusDisplayEngine:
         """Format pipeline section with table-like layout"""
         lines: List[str] = []
         date_line = self._format_date_metrics_line(status)
+        skip_line = self._format_skip_metrics_line(status)
 
         if not status.pipeline.stages:
             lines.append("No pipeline data available")
             if date_line:
                 lines.append(date_line)
+            if skip_line:
+                lines.append(skip_line)
             return lines
 
         # Table header
@@ -345,6 +348,9 @@ class StatusDisplayEngine:
         if date_line:
             lines.append(date_line)
 
+        if skip_line:
+            lines.append(skip_line)
+
         return lines
 
     @staticmethod
@@ -360,6 +366,22 @@ class StatusDisplayEngine:
             f"({metrics.get('api_dated', 0)}/{metrics.get('api_items', 0)}), "
             f"web={web_rate:.3f} "
             f"({metrics.get('web_dated', 0)}/{metrics.get('web_pages', 0)})"
+        )
+
+    @staticmethod
+    def _format_skip_metrics_line(status: SystemStatus) -> str:
+        """Render the gather-skip decision counter line (shadow/on only)."""
+        metrics = getattr(status.pipeline, "skip_metrics", None)
+        if not metrics or metrics.get("mode", "off") == "off":
+            return ""
+        return (
+            f"Skip: mode={metrics.get('mode', 'off')} "
+            f"skipped={metrics.get('skipped_known', 0)} "
+            f"regathered[c={metrics.get('regathered_changed', 0)},"
+            f"g={metrics.get('regathered_coverage_gap', 0)},"
+            f"t={metrics.get('regathered_ttl_expired', 0)},"
+            f"f={metrics.get('regathered_failed_retry', 0)}] "
+            f"push={metrics.get('push_signal_coverage', 0.0):.3f}"
         )
 
     def _format_provider_section(self, status: SystemStatus) -> List[str]:

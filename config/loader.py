@@ -33,6 +33,7 @@ from .schemas import (
     PersistenceConfig,
     PipelineConfig,
     RegistryConfig,
+    SkipConfig,
     StageConfig,
     StorageConfig,
     TaskConfig,
@@ -111,6 +112,10 @@ class ConfigLoader:
         # Parse registry configuration
         if "registry" in data:
             config.registry = self._parse_registry_config(data["registry"])
+
+        # Parse gather-skip configuration
+        if "skip" in data:
+            config.skip = self._parse_skip_config(data["skip"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -287,6 +292,20 @@ class ConfigLoader:
             batch_size=data.get("batch_size", 50),
             flush_interval=data.get("flush_interval", 5),
             queue_size=data.get("queue_size", 100000),
+        )
+
+    def _parse_skip_config(self, data: Dict[str, Any]) -> SkipConfig:
+        """Parse gather-skip configuration section
+
+        Args:
+            data: Gather-skip configuration data
+
+        Returns:
+            SkipConfig: Parsed gather-skip configuration
+        """
+        return SkipConfig(
+            skip_known=data.get("skip_known", "off"),
+            gather_ttl_hours=data.get("gather_ttl_hours", 168.0),
         )
 
     def _parse_rate_limits(self, data: Dict[str, Any]) -> Dict[str, RateLimitConfig]:

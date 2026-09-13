@@ -312,6 +312,31 @@ class RegistryConfig:
 
 
 @dataclass
+class SkipConfig:
+    """Registry-driven gather-skip configuration (add-gather-skip).
+
+    ``skip_known`` is a three-position rollout flag: ``off`` performs no
+    registry reads, ``shadow`` computes and logs decisions while still
+    creating every task, and ``on`` enforces skips.
+    """
+
+    skip_known: str = "off"
+    gather_ttl_hours: float = 168.0
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_skip_config on purpose: this
+        # guards direct (non-loader) construction in tests and embedding.
+        mode = str(self.skip_known).strip().lower()
+        if mode not in ("off", "shadow", "on"):
+            raise ValueError("skip.skip_known must be one of: off, shadow, on")
+        self.skip_known = mode
+
+        self.gather_ttl_hours = float(self.gather_ttl_hours)
+        if self.gather_ttl_hours <= 0:
+            raise ValueError("skip.gather_ttl_hours must be positive")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
 
@@ -435,6 +460,7 @@ class Config:
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     worker: WorkerManagerConfig = field(default_factory=WorkerManagerConfig)
     registry: RegistryConfig = field(default_factory=RegistryConfig)
+    skip: SkipConfig = field(default_factory=SkipConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -461,6 +487,7 @@ class Config:
             "persistence": self._dataclass_to_dict(self.persistence),
             "worker": self._dataclass_to_dict(self.worker),
             "registry": self._dataclass_to_dict(self.registry),
+            "skip": self._dataclass_to_dict(self.skip),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

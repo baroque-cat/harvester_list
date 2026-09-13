@@ -24,6 +24,7 @@ class ConfigValidator:
     def __init__(self):
         """Initialize configuration validator"""
         self.errors: List[str] = []
+        self.warnings: List[str] = []
 
     def validate(self, config: Config) -> None:
         """Validate complete configuration
@@ -35,6 +36,7 @@ class ConfigValidator:
             ValueError: If validation fails
         """
         self.errors.clear()
+        self.warnings.clear()
 
         # Validate global configuration
         self._validate_global_config(config)
@@ -54,11 +56,24 @@ class ConfigValidator:
         # Validate registry configuration
         self._validate_registry_config(config)
 
+        # Validate gather-skip configuration
+        self._validate_skip_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
         # Validate display configuration
         self._validate_display_config(config)
+
+        # Surface non-fatal configuration warnings.
+        # Lazy import: config/* must not import tools at module level —
+        # tools.coordinator imports config back (circular at package init).
+        if self.warnings:
+            from tools.logger import get_logger
+
+            logger = get_logger("config")
+            for warning in self.warnings:
+                logger.warning(f"Configuration warning: {warning}")
 
         # Check for validation errors
         if self.errors:
@@ -248,6 +263,28 @@ class ConfigValidator:
 
         if not isinstance(registry.path, str):
             self.errors.append("Registry path must be a string")
+
+    def _validate_skip_config(self, config: Config) -> None:
+        """Validate gather-skip configuration section
+
+        Args:
+            config: Configuration object
+        """
+        skip = config.skip
+
+        if skip.skip_known not in ("off", "shadow", "on"):
+            self.errors.append("Skip skip_known must be one of: off, shadow, on")
+
+        if skip.gather_ttl_hours <= 0:
+            self.errors.append("Skip gather_ttl_hours must be positive")
+
+        # Cross-check: the decision engine reads the registry; without it every
+        # lookup fails open and the flag silently degrades to a no-op.
+        if skip.skip_known != "off" and not config.registry.enabled:
+            self.warnings.append(
+                f"skip.skip_known='{skip.skip_known}' has no effect while registry.enabled is false "
+                "(no registry data to read; all links fail open to re-gather)"
+            )
 
     def _validate_rate_limits(self, config: Config) -> None:
         """Validate rate limits configuration

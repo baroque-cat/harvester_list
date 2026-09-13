@@ -124,11 +124,23 @@ class SearchStage(BasePipelineStage):
                     endpoint_pattern=task.endpoint_pattern,
                     model_pattern=task.model_pattern,
                 )
+                skip_map = self._gather_skip_map(task, results, patterns)
+                enforce = bool(getattr(getattr(self.resources, "gather_skip", None), "enforce", False))
+                suppressed = 0
                 for link in results:
+                    decision = skip_map.get(link)
+                    if enforce and decision is not None and decision.skip:
+                        suppressed += 1
+                        continue
                     acquisition_task = TaskFactory.create_acquisition_task(task.provider, link, patterns)
                     output.add_task(acquisition_task, PipelineStage.GATHER.value)
 
-                # Add links to be saved
+                if suppressed:
+                    logger.info(
+                        f"[{self.name}] suppressed {suppressed} already-known links, provider: {task.provider}"
+                    )
+
+                # Add links to be saved (audit log stays complete regardless of skips)
                 output.add_links(task.provider, results)
 
                 # Carry API-extracted freshness metadata to the registry writer.
@@ -177,6 +189,28 @@ class SearchStage(BasePipelineStage):
                 )
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(f"[{self.name}] registry discovery hook failed: {e}")
+
+    def _gather_skip_map(self, task: SearchTask, links: List[str], patterns: Patterns) -> Dict[str, Any]:
+        """Compute the gather-skip decision map for one result page (fail-open).
+
+        Returns ``{}`` when the engine is absent/off or the lookup errors, so
+        every link produces a task in the safe direction.
+        """
+        engine = getattr(self.resources, "gather_skip", None)
+        if engine is None or not engine.enabled:
+            return {}
+        try:
+            digest = patterns_hash(
+                key_pattern=patterns.key_pattern,
+                address_pattern=patterns.address_pattern,
+                endpoint_pattern=patterns.endpoint_pattern,
+                model_pattern=patterns.model_pattern,
+            )
+            decisions = engine.decide(links, provider=task.provider, patterns_hash=digest)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"[{self.name}] gather-skip decision failed: {e}")
+            return {}
+        return {decision.url: decision for decision in decisions}
 
     def _execute_first_page_search(
         self, task: SearchTask, metadata: Optional[Dict[str, LinkMetadata]] = None

@@ -19,6 +19,7 @@ from stage.base import BasePipelineStage, StageOutput, StageResources, StageUtil
 from stage.registry import StageRegistryMixin
 from stage.resolver import DependencyResolver
 from storage.persistence import MultiResultManager
+from storage.gather_skip import GatherSkipEngine
 from storage.registry import Registry, config_digest as build_config_digest, init_registry
 from tools.coordinator import get_session, get_token, get_user_agent
 from tools.logger import get_logger
@@ -66,6 +67,15 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         self.link_registry: Registry = init_registry(
             config.global_config.workspace,
             config=config.registry,
+        )
+
+        # Registry-driven gather-skip decision engine (off by default; never
+        # reads the registry unless skip_known is shadow/on).
+        self.gather_skip = GatherSkipEngine(
+            workspace=config.global_config.workspace,
+            mode=config.skip.skip_known,
+            ttl_hours=config.skip.gather_ttl_hours,
+            registry_path=self.link_registry.path,
         )
 
         # Date-extraction fill-rate observability (per run, fail-open).
@@ -154,6 +164,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             auth=get_auth_provider(),
             registry=self.link_registry,
             date_metrics=self.date_metrics,
+            gather_skip=self.gather_skip,
         )
 
         # Create stages in dependency order
@@ -217,6 +228,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
 
         # Drain and close the registry before result managers flush
         self.link_registry.stop()
+        self.gather_skip.close()
 
         # Stop managers
         self.queue_manager.stop()
@@ -229,6 +241,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         try:
             if self.link_registry.available:
                 self.link_registry.start_run(config_digest=build_config_digest(self.config))
+                self.gather_skip.run_id = self.link_registry.run_id
         except Exception as e:
             logger.warning(f"Failed to journal registry run start: {e}")
             self.link_registry.mark_degraded()
@@ -288,6 +301,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             stages=stage_status,
             runtime=time.time() - self.start_time,
             date_metrics=self.date_metrics.to_stats(),
+            skip_metrics=self.gather_skip.to_stats(),
         )
 
         return pipeline_status

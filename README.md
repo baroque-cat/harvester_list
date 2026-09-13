@@ -844,9 +844,10 @@ harvester/
 The registry is a durable, cross-provider SQLite ledger of every GitHub link
 the harvester has discovered, which provider/pattern set gathered it, and a
 journal of each run. It gives the pipeline memory across restarts and provider
-changes. **In this release it is write-only:** nothing reads it to influence
-task creation, skipping, stopping or checking, so enabling it does not change
-the produced shards.
+changes. **By default it is write-only:** with recording enabled and
+`skip.skip_known: off`, nothing reads it to influence task creation, so
+enabling recording does not change the produced shards. The opt-in gather-skip
+feature below is the first read path.
 
 - **Location:** `<workspace>/registry.sqlite` (plus WAL `-wal`/`-shm` sidecars),
   outside `providers/<folder>/`, so it survives provider-set changes.
@@ -924,6 +925,62 @@ See `docs/specs/date_extraction.md`.
 
 See `docs/specs/url_canonicalization.md` (identity canon) and
 `docs/specs/registry_flags_metrics.md` (flag matrix and metrics dictionary).
+
+### Gather-skip (`skip.skip_known`)
+
+Optional, default-off suppression of acquisition tasks for links the harvester
+already researched under the current provider/pattern set. It needs
+`registry.enabled: true` to have data to read.
+
+```yaml
+skip:
+  skip_known: "off"      # off | shadow | on
+  gather_ttl_hours: 168  # 7 days
+```
+
+An acquisition task is skipped **only when all four conditions hold**; the
+first failing condition names the `regathered_*` counter:
+
+| # | Condition | On failure |
+|---|-----------|------------|
+| 1 | `visit_status = 'gathered_ok'` | `failed` → `regathered_failed_retry`; never gathered → task, no reason |
+| 2 | `gathered_ts` within `gather_ttl_hours` | `regathered_ttl_expired` |
+| 3 | no change evidence: `repo_pushed_at` is NULL **or** not later than `gathered_ts` (+60 s grace) | `regathered_changed` |
+| 4 | a `link_coverage` row exists for the current `(provider, patterns_hash)` | `regathered_coverage_gap` |
+
+Any read error or missing row makes the link **unknown** ⇒ the task is created
+(fail-open: absence of evidence never causes a skip). A NULL `repo_pushed_at`
+passes condition 3 vacuously — with GitHub dates absent fleet-wide this is the
+prevailing mode, and `push_signal_coverage` makes the evidence quality visible.
+
+**Modes**
+- `off` (default): no registry reads during search; behavior is identical to
+  pre-change.
+- `shadow`: every would-skip decision is appended to
+  `<workspace>/registry_decisions.jsonl` and **all** acquisition tasks are
+  still created, so the false-skip price can be measured before enforcement.
+- `on`: computed skips are enforced.
+
+The `links` shard records **every** search hit in every mode; only task
+creation is suppressed, so the discovery audit trail is unaffected. Per-run
+counters `skipped_known`, `regathered_{changed,coverage_gap,ttl_expired,failed_retry}`
+and `push_signal_coverage` are exposed in `PipelineStatus.skip_metrics` and the
+status display.
+
+**Decision-log growth:** `registry_decisions.jsonl` is append-only (one line
+per would-skip). It is pure observability data — rotate, truncate or archive it
+freely between cycles; the run counters do not depend on the file.
+
+**Rollback:** set `skip.skip_known: off` — a config flip, no code removal. A run
+whose registry was degraded is not a trustworthy source of "known" counts.
+
+**Promotion `shadow` → `on`:** run at least one representative full cycle in
+`shadow`, join the decision log against that run's `material`/`valid` shards,
+and require the false-skip price (keys found at would-skipped URLs) ≈ 0 before
+flipping. Repeat the gate on a larger representative cycle before production
+rollout — while `push_signal_coverage` is near 0 the measurement validates the
+TTL-only regime only. The step-by-step procedure lives in
+`docs/specs/registry_flags_metrics.md`.
 
 ## Troubleshooting
 

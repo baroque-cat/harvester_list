@@ -28,7 +28,7 @@ Gather is the economic core of the pipeline: every search hit costs an HTTP GET 
 
 ## Impact
 
-- **Modified code:** `stage/definition.py` (decision point in SearchStage), `storage/registry.py` (read-only query helpers), `config/schemas.py` / `loader.py` / `validator.py`, `examples/config-full.yaml`, stats display (`state/display.py` or `manager/status.py`) for new metrics.
-- **New code:** shadow decision-log writer (JSONL under `<workspace>/`), skip-decision unit (`storage/` or `tools/`).
+- **Modified code:** `stage/definition.py` (decision point in SearchStage), `stage/base.py` (StageResources field), `config/schemas.py` / `loader.py` / `validator.py`, `examples/config-full.yaml`, `manager/pipeline.py` + `core/metrics.py` + `state/display.py` (engine wiring, run stats, display). `storage/registry.py` stays untouched — the write-only facade is preserved; the read path lives entirely in the new decision unit.
+- **New code:** `storage/gather_skip.py` — skip-decision engine (read-only connections, conjunctive rule, counters) incl. the shadow decision-log writer (JSONL under `<workspace>/`).
 - **Depends on:** add-link-registry (identities, statuses, coverage), add-date-extraction (`repo_pushed_at` invalidation signal; without dates condition 3 simply never fires — TTL-only degradation, safe).
 - **Behavior:** with default `off` — zero change. With `on` — fewer AcquisitionTasks and fewer downstream CheckTasks for unchanged known files; shard `links` records continue to be written for every search hit (audit log unaffected).

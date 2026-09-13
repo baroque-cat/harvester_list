@@ -197,6 +197,17 @@ registry:
   # Maximum queued operations before writes are dropped (and the run degraded)
   queue_size: 100000
 
+# Registry-driven gather-skip configuration (add-gather-skip)
+skip:
+  # Re-gather policy for already-researched links: off | shadow | on
+  #   off    - no registry reads, unchanged behavior
+  #   shadow - compute + log would-skip decisions, still create every task
+  #   on     - suppress acquisition tasks for unchanged already-gathered links
+  skip_known: "off"
+  # Gather freshness TTL in hours (default 168 = 7 days); push-date
+  # invalidation is applied on top whenever repo_pushed_at is available
+  gather_ttl_hours: 168
+
 # Global rate limiting configuration
 ratelimits:
   # GitHub API rate limits
