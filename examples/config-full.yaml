@@ -234,6 +234,29 @@ early_stop:
   # Minimum links rows for the trust gate (below this, full passes are forced)
   min_trust: 1000
 
+# Inline key check-skip configuration (add-key-ledger)
+# Requires registry.enabled; the ledger (keys table) stores hashes + masks only.
+check_skip:
+  # Skip policy: off | on
+  #   off - every arriving key is provider-checked (unchanged behavior)
+  #   on  - a known key fresher than its status TTL skips the provider call
+  mode: "off"
+  # Per-status freshness window in hours (missing statuses use these defaults)
+  ttl_hours:
+    wait_check: 12
+    no_quota: 72
+    invalid: 168
+    valid: 336
+
+# Periodic key re-check driver configuration (add-key-ledger)
+recheck:
+  # Enable the in-process cron that re-checks TTL-expired ledger keys
+  enabled: false
+  # Hours between re-check ticks
+  interval_hours: 6
+  # Maximum keys enqueued per tick (provider rate limits still apply)
+  batch_size: 50
+
 # Global rate limiting configuration
 ratelimits:
   # GitHub API rate limits

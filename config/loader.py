@@ -23,6 +23,7 @@ from core.models import Condition, Patterns, RateLimitConfig, inherit_patterns
 from .defaults import get_default_config
 from .schemas import (
     ApiConfig,
+    CheckSkipConfig,
     Config,
     CredentialsConfig,
     DisplayConfig,
@@ -34,6 +35,7 @@ from .schemas import (
     MonitoringConfig,
     PersistenceConfig,
     PipelineConfig,
+    RecheckConfig,
     RegistryConfig,
     SkipConfig,
     StageConfig,
@@ -126,6 +128,14 @@ class ConfigLoader:
         # Parse frontier-based early-stop configuration
         if "early_stop" in data:
             config.early_stop = self._parse_early_stop_config(data["early_stop"])
+
+        # Parse inline key check-skip configuration
+        if "check_skip" in data:
+            config.check_skip = self._parse_check_skip_config(data["check_skip"])
+
+        # Parse periodic key re-check configuration
+        if "recheck" in data:
+            config.recheck = self._parse_recheck_config(data["recheck"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -347,6 +357,36 @@ class ConfigLoader:
             theta=data.get("theta", 0.9),
             min_pages=data.get("min_pages", 2),
             min_trust=data.get("min_trust", 1000),
+        )
+
+    def _parse_check_skip_config(self, data: Dict[str, Any]) -> CheckSkipConfig:
+        """Parse inline key check-skip configuration section
+
+        Args:
+            data: Check-skip configuration data
+
+        Returns:
+            CheckSkipConfig: Parsed check-skip configuration
+        """
+        ttl = data.get("ttl_hours", {}) or {}
+        return CheckSkipConfig(
+            mode=data.get("mode", "off"),
+            ttl_hours=dict(ttl),
+        )
+
+    def _parse_recheck_config(self, data: Dict[str, Any]) -> RecheckConfig:
+        """Parse periodic key re-check configuration section
+
+        Args:
+            data: Re-check configuration data
+
+        Returns:
+            RecheckConfig: Parsed re-check configuration
+        """
+        return RecheckConfig(
+            enabled=data.get("enabled", False),
+            interval_hours=data.get("interval_hours", 6.0),
+            batch_size=data.get("batch_size", 50),
         )
 
     def _parse_rate_limits(self, data: Dict[str, Any]) -> Dict[str, RateLimitConfig]:

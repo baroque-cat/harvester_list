@@ -19,6 +19,21 @@ from typing import Any, Dict, List, Optional, Set
 from .enums import ErrorReason
 
 
+def _redact_secret(secret: str) -> str:
+    """Mask a secret for repr/log rendering (``<first6>…<last4>``).
+
+    Short strings are masked entirely so a complete short token is never
+    reconstructible from a log line.  Mirrors ``storage.key_ledger.mask_key``;
+    duplicated here to keep the core model free of a storage import cycle.
+    """
+    text = secret or ""
+    if not text:
+        return ""
+    if len(text) <= 16:
+        return "…"
+    return f"{text[:6]}…{text[-4:]}"
+
+
 @dataclass(frozen=True)
 class ResultStorage:
     """Result persistence layout for a provider."""
@@ -160,18 +175,23 @@ class CheckTask(ProviderTask):
     service: "Service" = field(default_factory=lambda: Service())
     custom_url: str = ""
     retries: int = 3
+    # Identity of the source link that yielded the key (add-key-ledger); empty
+    # when the key came from search content rather than a gathered page.
+    source_url_hash: str = ""
 
     def _serialize_data(self) -> Dict[str, Any]:
         return {
             "service": self.service.to_dict(),
             "custom_url": self.custom_url,
             "retries": self.retries,
+            "source_url_hash": self.source_url_hash,
         }
 
     def _deserialize_data(self, data: Dict[str, Any]) -> None:
         self.service = Service.from_dict(data["service"])
         self.custom_url = data.get("custom_url", "")
         self.retries = data.get("retries", 3)
+        self.source_url_hash = data.get("source_url_hash", "")
 
 
 @dataclass
@@ -387,6 +407,14 @@ class Service:
 
     # Model name for AI services
     model: str = ""
+
+    def __repr__(self) -> str:
+        # Never render the plaintext secret: task/manager logs interpolate this
+        # repr (add-key-ledger D7), so a debug dump must stay safe.
+        return (
+            f"Service(address={self.address!r}, endpoint={self.endpoint!r}, "
+            f"key={_redact_secret(self.key)!r}, model={self.model!r})"
+        )
 
     def __hash__(self) -> int:
         """Hash based on all fields for use in sets and dicts"""

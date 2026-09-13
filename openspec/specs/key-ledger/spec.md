@@ -1,11 +1,10 @@
-# Delta Spec: key-ledger
+# key-ledger Specification
 
 ## Purpose
 
-Maintains a persistent ledger of credential identities and their verification statuses so that redundant provider API calls are suppressed within status-dependent freshness windows, stored statuses are periodically refreshed toward reality, and no plaintext secret is ever persisted.
+Maintains a persistent ledger of credential identities and their verification statuses so that redundant provider API calls are suppressed within status-dependent freshness windows, stored statuses are periodically refreshed toward reality, and no plaintext secret is ever persisted. Validated on a live staging harness (2026-09-13): a repeat run dropped provider calls 20 → 0 with `check_skipped_by_status` exactly mirroring the ledger, and cron cycles refreshed every TTL-expired `valid` key with zero stale rows afterwards (measurement protocol and numbers in `docs/specs/registry_flags_metrics.md`).
 
-## ADDED Requirements
-
+## Requirements
 ### Requirement: Key ledger recording
 
 Every completed credential check SHALL upsert a ledger row identified by `key_hash = sha256(provider|key|address|endpoint)`, carrying the resulting status, a masked key reference, `first_seen_ts` (set once, never overwritten), `last_recheck_ts` (set whenever the provider was actually called), `last_seen_ts` (set on every observation), and the source link identity. Status transitions SHALL preserve history timestamps needed for audit via the runs journal.
@@ -46,7 +45,7 @@ When `check_skip=on`, before invoking a provider the system SHALL consult the le
 
 ### Requirement: Periodic re-check driver
 
-When `recheck_cron=on`, a periodic driver SHALL select ledger keys whose status TTL has expired — prioritizing `valid` and `wait_check` over `invalid`/`no_quota`, oldest `last_recheck_ts` first — in bounded batches, and SHALL enqueue ordinary CheckTasks that flow through the existing pipeline rate limiting. When the flag is `off`, no re-check tasks SHALL originate.
+When `recheck.enabled=true` (planning name `recheck_cron=on`), a periodic driver SHALL select ledger keys whose status TTL has expired — prioritizing `valid` and `wait_check` over `invalid`/`no_quota`, oldest `last_recheck_ts` first — in bounded batches, and SHALL enqueue ordinary CheckTasks that flow through the existing pipeline rate limiting. When the flag is `off`, no re-check tasks SHALL originate.
 
 #### Scenario: Expired keys are re-queued by priority
 
@@ -55,12 +54,12 @@ When `recheck_cron=on`, a periodic driver SHALL select ledger keys whose status 
 
 #### Scenario: Cron disabled produces no background checks
 
-- **WHEN** `recheck_cron=off` and many ledger keys are past TTL
+- **WHEN** `recheck.enabled=false` and many ledger keys are past TTL
 - **THEN** zero re-check tasks are generated outside the normal pipeline flow
 
 ### Requirement: Plaintext secret non-persistence
 
-The ledger SHALL store only the salt-free identity hash and a masked reference (prefix+suffix consistent with existing log redaction); the full secret SHALL NOT appear in the registry database, its WAL files, decision logs, or metrics.
+The ledger SHALL store only the salt-free identity hash and a masked reference (prefix+suffix masking in the same family as the existing log redaction; exact format `<first6>…<last4>` per design D2); the full secret SHALL NOT appear in the registry database, its WAL files, decision logs, or metrics.
 
 #### Scenario: Database contains no plaintext secrets
 
@@ -78,7 +77,7 @@ Any ledger read/write error around CheckStage SHALL degrade to current behavior:
 
 ### Requirement: Rollout flags
 
-`check_skip` and `recheck_cron` SHALL each accept `off|on`, default `off`, parsed and validated via the standard config path; flipping either back to `off` SHALL fully restore pre-change behavior without code changes.
+`check_skip.mode` SHALL accept `off|on` (default `off`) and `recheck.enabled` SHALL accept `true|false` (default `false`; planning name `recheck_cron`, see tasks 4.1 / design D5 for the canonical config shape), each parsed and validated via the standard config path; flipping either back to its default SHALL fully restore pre-change behavior without code changes.
 
 #### Scenario: Defaults preserve current behavior
 

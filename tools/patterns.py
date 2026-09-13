@@ -15,6 +15,9 @@ API_KEY_PATTERNS = [
     r"\banthrop[0-9A-Za-z_-]{20,}",  # Anthropic keys
     r"\bgsk_[0-9A-Za-z_-]{20,}",  # GooeyAI keys
     r"\bstab_[0-9A-Za-z_-]{20,}",  # StabilityAI keys
+    r"\bghp_[A-Za-z0-9]{36}",  # GitHub personal access tokens (classic)
+    r"\bgithub_pat_[A-Za-z0-9_]{20,}",  # GitHub fine-grained PATs
+    r"\bgho_[A-Za-z0-9]{36}",  # GitHub OAuth tokens
 ]
 
 # Query parsing patterns

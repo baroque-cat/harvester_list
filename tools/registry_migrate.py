@@ -25,6 +25,8 @@ import sys
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from storage.key_ledger import key_hash as _canonical_key_hash
+from storage.key_ledger import mask_key as _canonical_mask_key
 from storage.registry import (
     REGISTRY_FILENAME,
     bootstrap_schema,
@@ -127,27 +129,20 @@ def _parse_service(record: Any) -> Dict[str, str]:
 
 
 def _mask_key(key: str) -> str:
-    text = key or ""
-    if not text:
-        return ""
-    if len(text) <= 4:
-        return "*" * len(text)
-    if len(text) <= 8:
-        return f"{text[:2]}...{text[-2:]}"
-    return f"{text[:4]}...{text[-4:]}"
+    # Delegate to the add-key-ledger helper so migrated references match the
+    # ones the runtime writer produces (same masking convention).
+    return _canonical_mask_key(key)
 
 
 def _key_hash(provider: str, service: Dict[str, str]) -> str:
-    payload = json.dumps(
-        [
-            provider,
-            service.get("key", ""),
-            service.get("address", ""),
-            service.get("endpoint", ""),
-        ],
-        ensure_ascii=True,
+    # Delegate to the add-key-ledger identity so migration-seeded keys join
+    # exactly with rows written by CheckStage at runtime.
+    return _canonical_key_hash(
+        provider,
+        service.get("key", ""),
+        service.get("address", ""),
+        service.get("endpoint", ""),
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _provider_dirs(workspace: str) -> Iterable[Tuple[str, str]]:

@@ -65,6 +65,12 @@ class ConfigValidator:
         # Validate frontier-based early-stop configuration
         self._validate_early_stop_config(config)
 
+        # Validate inline key check-skip configuration
+        self._validate_check_skip_config(config)
+
+        # Validate periodic key re-check configuration
+        self._validate_recheck_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -344,6 +350,44 @@ class ConfigValidator:
             self.warnings.append(
                 f"early_stop.mode='{early_stop.mode}' has no effect while registry.enabled is false "
                 "(no registry data to classify; all windows fail open to full passes)"
+            )
+
+    def _validate_check_skip_config(self, config: Config) -> None:
+        """Validate inline key check-skip configuration section."""
+        check_skip = config.check_skip
+
+        if check_skip.mode not in ("off", "on"):
+            self.errors.append("Check skip mode must be one of: off, on")
+
+        for status, hours in (check_skip.ttl_hours or {}).items():
+            if hours <= 0:
+                self.errors.append(f"Check skip ttl_hours.{status} must be positive")
+
+        # Cross-check: the ledger lives in the registry; without it the skip
+        # lookup fails open every time and the flag silently degrades to a no-op.
+        if check_skip.mode != "off" and not config.registry.enabled:
+            self.warnings.append(
+                "check_skip.mode='on' has no effect while registry.enabled is false "
+                "(no ledger data to read; every key fails open to a provider check)"
+            )
+
+    def _validate_recheck_config(self, config: Config) -> None:
+        """Validate periodic key re-check configuration section."""
+        recheck = config.recheck
+
+        if not isinstance(recheck.enabled, bool):
+            self.errors.append("Recheck enabled must be a boolean")
+
+        if recheck.interval_hours <= 0:
+            self.errors.append("Recheck interval_hours must be positive")
+
+        if recheck.batch_size <= 0:
+            self.errors.append("Recheck batch_size must be positive")
+
+        if recheck.enabled and not config.registry.enabled:
+            self.warnings.append(
+                "recheck.enabled=true has no effect while registry.enabled is false "
+                "(the ledger lives in the registry; no keys to select)"
             )
 
     def _validate_rate_limits(self, config: Config) -> None:

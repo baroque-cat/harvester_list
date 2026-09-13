@@ -317,6 +317,8 @@ class StatusDisplayEngine:
         skip_line = self._format_skip_metrics_line(status)
         enrichment_line = self._format_enrichment_metrics_line(status)
         early_stop_line = self._format_early_stop_metrics_line(status)
+        key_ledger_line = self._format_key_ledger_metrics_line(status)
+        recheck_line = self._format_recheck_metrics_line(status)
 
         if not status.pipeline.stages:
             lines.append("No pipeline data available")
@@ -328,6 +330,10 @@ class StatusDisplayEngine:
                 lines.append(enrichment_line)
             if early_stop_line:
                 lines.append(early_stop_line)
+            if key_ledger_line:
+                lines.append(key_ledger_line)
+            if recheck_line:
+                lines.append(recheck_line)
             return lines
 
         # Table header
@@ -362,6 +368,12 @@ class StatusDisplayEngine:
 
         if early_stop_line:
             lines.append(early_stop_line)
+
+        if key_ledger_line:
+            lines.append(key_ledger_line)
+
+        if recheck_line:
+            lines.append(recheck_line)
 
         return lines
 
@@ -422,6 +434,32 @@ class StatusDisplayEngine:
             f"fired={metrics.get('early_stop_fired', 0)} "
             f"would_fire={metrics.get('early_stop_would_fire', 0)} "
             f"novel_after_stop={metrics.get('novel_after_stop', 0)}"
+        )
+
+    @staticmethod
+    def _format_key_ledger_metrics_line(status: SystemStatus) -> str:
+        """Render the key-ledger skip counter line (on only)."""
+        metrics = getattr(status.pipeline, "key_ledger_metrics", None)
+        if not metrics or metrics.get("mode", "off") == "off":
+            return ""
+        by_status = metrics.get("check_skipped_by_status", {}) or {}
+        rendered = ",".join(f"{key}={by_status.get(key, 0)}" for key in sorted(by_status))
+        return (
+            f"KeyLedger: mode={metrics.get('mode', 'off')} "
+            f"skipped[{rendered}] "
+            f"saved={metrics.get('provider_calls_saved', 0)}"
+        )
+
+    @staticmethod
+    def _format_recheck_metrics_line(status: SystemStatus) -> str:
+        """Render the periodic re-check driver counter line (enabled only)."""
+        metrics = getattr(status.pipeline, "recheck_metrics", None)
+        if not metrics or not metrics.get("enabled", False):
+            return ""
+        return (
+            f"Recheck: enqueued={metrics.get('rechecks_enqueued', 0)} "
+            f"refused={metrics.get('rechecks_refused', 0)} "
+            f"unresolved={metrics.get('unresolved', 0)}"
         )
 
     def _format_provider_section(self, status: SystemStatus) -> List[str]:

@@ -21,6 +21,7 @@ from stage.resolver import DependencyResolver
 from storage.persistence import MultiResultManager
 from storage.early_stop import EarlyStopEngine
 from storage.gather_skip import GatherSkipEngine
+from storage.key_ledger import KeyLedger
 from storage.registry import Registry, config_digest as build_config_digest, init_registry
 from storage.repo_meta import RepoMetaEnricher, RepoMetaStore, tokens_cooling_down
 from tools.coordinator import get_session, get_token, get_user_agent
@@ -29,6 +30,7 @@ from tools.ratelimit import RateLimiter
 
 from .base import LifecycleManager
 from .queue import QueueManager
+from .recheck import RecheckManager, ShardKeyResolver
 
 logger = get_logger("manager")
 
@@ -100,6 +102,26 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
 
         # Date-extraction fill-rate observability (per run, fail-open).
         self.date_metrics = DateFillMetrics()
+
+        # Key-ledger skip engine (off by default; never reads the registry
+        # unless check_skip.mode is on) plus its periodic re-check driver.
+        self.key_ledger = KeyLedger(
+            workspace=config.global_config.workspace,
+            mode=config.check_skip.mode,
+            ttl_hours=config.check_skip.ttl_hours,
+            registry_path=self.link_registry.path,
+            degraded_cb=self.link_registry.mark_degraded,
+        )
+        self.recheck = RecheckManager(
+            workspace=config.global_config.workspace,
+            registry_path=self.link_registry.path,
+            ttl_hours=config.check_skip.ttl_hours,
+            enabled=bool(config.recheck.enabled and config.registry.enabled),
+            interval_hours=config.recheck.interval_hours,
+            batch_size=config.recheck.batch_size,
+            enqueue=self._enqueue_recheck_task,
+            resolve=ShardKeyResolver(config.global_config.workspace),
+        )
 
         # Configure the shared HTTP opener before any stage starts making network requests
         client.set_proxy(config.global_config.proxy)
@@ -204,6 +226,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             gather_skip=self.gather_skip,
             enrichment=self.enrichment,
             early_stop=self.early_stop,
+            key_ledger=self.key_ledger,
         )
 
         # Create stages in dependency order
@@ -249,10 +272,19 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             if stage:
                 stage.start()
 
+        if self.recheck.enabled:
+            self.recheck.start()
+
         logger.info(f"Started {len(self.stages)} pipeline stages")
 
     def _on_stop(self) -> None:
         """Stop all pipeline stages"""
+        # Stop the re-check driver first so it cannot enqueue into draining stages.
+        try:
+            self.recheck.stop()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"Failed to stop recheck manager: {e}")
+
         if not self.stages:
             return
 
@@ -270,6 +302,8 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         self.gather_skip.close()
         self.enrichment.close()
         self.early_stop.close()
+        self.key_ledger.close()
+        self.recheck.close()
 
         # Stop managers
         self.queue_manager.stop()
@@ -346,6 +380,8 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             skip_metrics=self.gather_skip.to_stats(),
             enrichment_metrics=self.enrichment.to_stats(),
             early_stop_metrics=self.early_stop.to_stats(),
+            key_ledger_metrics=self.key_ledger.to_stats(),
+            recheck_metrics=self.recheck.to_stats(),
         )
 
         return pipeline_status
@@ -366,6 +402,24 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
     def get_stage(self, name: str) -> Optional[BasePipelineStage]:
         """Get stage by name"""
         return self.stages.get(name)
+
+    def _enqueue_recheck_task(self, task: ProviderTask) -> bool:
+        """Route a re-check task through the normal CheckStage queue.
+
+        Uses the standard stage entry point so provider rate limits and token
+        buckets apply exactly as for pipeline-originated checks (design D5).
+        Returns False when the task was refused (stage disabled/stopped or
+        deduped), so the driver's counters stay honest.
+        """
+        config = self.task_configs.get(task.provider)
+        if not config or not StageUtils.check(config, PipelineStage.CHECK.value):
+            logger.debug(f"[recheck] check stage disabled for provider {task.provider}, dropping task")
+            return False
+        stage = self.stages.get(PipelineStage.CHECK.value)
+        if stage is None:
+            logger.debug(f"[recheck] check stage not created, dropping task for {task.provider}")
+            return False
+        return bool(stage.put_task(task))
 
     def _init_order_cache(self) -> None:
         """Initialize and cache stage order"""

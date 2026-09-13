@@ -13,6 +13,10 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import pytest
 
+from core.enums import ErrorReason
+from core.models import CheckResult, Condition, Patterns, ResultStorage
+from core.types import IProvider
+
 REGISTRY_FILENAME = "registry.sqlite"
 
 
@@ -142,3 +146,113 @@ def write_links_shard():
 @pytest.fixture
 def write_result_shard():
     return _write_result_shard
+
+
+# ---------------------------------------------------------------------------
+# add-key-ledger harness: mocked provider, fast registry, fake rate limiter
+# ---------------------------------------------------------------------------
+
+
+class FastRegistryConfig:
+    """Registry config that flushes promptly and synchronously-ish."""
+
+    enabled = True
+    batch_size = 1
+    flush_interval = 0.05
+    queue_size = 100000
+    path = ""
+
+
+class FakeLimiter:
+    """Minimal RateLimiter stand-in: always admits, records results."""
+
+    def __init__(self):
+        self.acquires: List[str] = []
+        self.results: List[bool] = []
+
+    def acquire(self, service_type: str) -> bool:
+        self.acquires.append(service_type)
+        return True
+
+    def wait_time(self, service_type: str) -> float:
+        return 0.0
+
+    def report_result(self, service_type: str, success: bool) -> None:
+        self.results.append(bool(success))
+
+
+class MockProvider(IProvider):
+    """IProvider stub returning canned CheckResults and recording calls."""
+
+    def __init__(self, name: str = "openai", results: Optional[List[CheckResult]] = None):
+        self._name = name
+        self._results = list(results or [])
+        self.calls: List[Dict[str, Any]] = []
+        self._conditions = [Condition(query="sk-", patterns=Patterns(key_pattern=r"sk-[A-Za-z0-9]{16}"))]
+        self._result = ResultStorage(
+            folder=name,
+            filenames={
+                "valid": "valid-keys.txt",
+                "invalid": "invalid-keys.txt",
+                "no_quota": "no-quota-keys.txt",
+                "wait_check": "wait-check-keys.txt",
+                "material": "material.txt",
+                "links": "links.txt",
+                "summary": "summary.json",
+            },
+        )
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def conditions(self):
+        return self._conditions
+
+    @property
+    def result(self) -> ResultStorage:
+        return self._result
+
+    def get_patterns(self) -> Patterns:
+        return self._conditions[0].patterns
+
+    def check(self, token: str, address: str = "", endpoint: str = "", model: str = "", **kwargs) -> CheckResult:
+        self.calls.append({"token": token, "address": address, "endpoint": endpoint, "model": model})
+        if len(self._results) == 1:
+            return self._results[0]
+        if self._results:
+            return self._results.pop(0)
+        return CheckResult.fail(ErrorReason.INVALID_TOKEN)
+
+    def inspect(self, token: str, address: str = "", endpoint: str = "", **kwargs) -> List[str]:
+        return []
+
+
+@pytest.fixture
+def fast_registry():
+    """Factory: build and start a fast-flushing registry in ``workspace``."""
+
+    def _make(workspace: str):
+        from storage.registry import Registry
+
+        registry = Registry(workspace, config=FastRegistryConfig(), enabled=True)
+        assert registry.start() is True
+        return registry
+
+    return _make
+
+
+@pytest.fixture
+def mock_provider():
+    """Factory: build a mocked IProvider returning canned results."""
+
+    def _make(name: str = "openai", results: Optional[List[CheckResult]] = None) -> MockProvider:
+        return MockProvider(name=name, results=results)
+
+    return _make
+
+
+@pytest.fixture
+def fake_limiter() -> FakeLimiter:
+    return FakeLimiter()

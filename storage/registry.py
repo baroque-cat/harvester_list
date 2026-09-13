@@ -29,7 +29,7 @@ from tools.logger import get_logger
 logger = get_logger("storage")
 
 # Bump when the schema changes; later changes may only ADD columns/tables.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 REGISTRY_FILENAME = "registry.sqlite"
 
 # Operations understood by the writer thread.
@@ -41,6 +41,8 @@ _OP_REPO_UPSERT = "repo_upsert"
 _OP_REPO_TOUCH = "repo_touch"
 _OP_REPO_GONE = "repo_gone"
 _OP_REPO_LINKS = "repo_links"
+_OP_KEY_UPSERT = "key_upsert"
+_OP_KEY_OBSERVE = "key_observe"
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS links(
@@ -79,6 +81,7 @@ CREATE TABLE IF NOT EXISTS keys(
   status TEXT,
   first_seen_ts REAL,
   last_recheck_ts REAL,
+  last_seen_ts REAL,
   source_url_hash TEXT
 );
 
@@ -116,6 +119,7 @@ CREATE TABLE IF NOT EXISTS meta(
 CREATE INDEX IF NOT EXISTS idx_links_repo ON links(owner, repo);
 CREATE INDEX IF NOT EXISTS idx_links_last_seen ON links(last_seen_ts);
 CREATE INDEX IF NOT EXISTS idx_links_provider ON links(provider);
+CREATE INDEX IF NOT EXISTS idx_keys_recheck ON keys(status, last_recheck_ts);
 """
 
 _DISCOVER_SQL = """
@@ -153,6 +157,33 @@ INSERT INTO link_coverage (url_hash, provider, patterns_hash, gathered_ts)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(url_hash, provider, patterns_hash) DO UPDATE SET
   gathered_ts = excluded.gathered_ts
+"""
+
+# Ledger upsert after a real provider check (add-key-ledger D1/D2).  Identity is
+# the primary key, so an existing row keeps its original first_seen_ts while the
+# status and last_recheck_ts advance; last_seen_ts never regresses.  Only the
+# hash and masked reference are persisted -- never the plaintext secret.
+_KEY_UPSERT_SQL = """
+INSERT INTO keys (key_hash, provider, key_ref_masked, address, endpoint, status,
+                  first_seen_ts, last_recheck_ts, last_seen_ts, source_url_hash)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(key_hash) DO UPDATE SET
+  provider = COALESCE(NULLIF(excluded.provider, ''), keys.provider),
+  key_ref_masked = COALESCE(NULLIF(excluded.key_ref_masked, ''), keys.key_ref_masked),
+  address = COALESCE(NULLIF(excluded.address, ''), keys.address),
+  endpoint = COALESCE(NULLIF(excluded.endpoint, ''), keys.endpoint),
+  status = excluded.status,
+  last_recheck_ts = excluded.last_recheck_ts,
+  last_seen_ts = MAX(COALESCE(keys.last_seen_ts, excluded.last_seen_ts), excluded.last_seen_ts),
+  source_url_hash = COALESCE(excluded.source_url_hash, keys.source_url_hash)
+"""
+
+# Observation-only update for a skipped check (add-key-ledger D4): the status
+# and last_recheck_ts are intentionally left untouched; only recency advances.
+# UPDATE-only: an unknown hash affects zero rows and fabricates nothing.
+_KEY_OBSERVE_SQL = """
+UPDATE keys SET last_seen_ts = MAX(COALESCE(last_seen_ts, ?), ?)
+WHERE key_hash = ?
 """
 
 # Non-regressing metadata merge: a NULL observation never erases a known value;
@@ -227,7 +258,20 @@ ON CONFLICT(run_id) DO UPDATE SET
 def bootstrap_schema(conn: sqlite3.Connection) -> None:
     """Create tables/indexes if missing and record the schema version."""
     conn.executescript(_DDL)
+    _migrate_schema(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Apply additive migrations for registries created by earlier versions.
+
+    ``CREATE TABLE IF NOT EXISTS`` does not add columns to an existing table, so
+    databases created at schema_version < 4 need an explicit, idempotent ALTER
+    guard (design D6: additive columns only).
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(keys)")}
+    if "last_seen_ts" not in columns:
+        conn.execute("ALTER TABLE keys ADD COLUMN last_seen_ts REAL")
 
 
 def canonical_url(url: str) -> str:
@@ -626,6 +670,54 @@ class Registry:
             },
         )
 
+    def record_key(
+        self,
+        key_hash: str,
+        provider: str = "",
+        key_ref_masked: str = "",
+        address: str = "",
+        endpoint: str = "",
+        status: str = "",
+        source_url_hash: str = "",
+        ts: Optional[float] = None,
+    ) -> None:
+        """Upsert a ledger row after a real provider check (add-key-ledger).
+
+        ``key_ref_masked`` must already be a masked reference; callers must
+        never pass a plaintext secret (secret hygiene, key-ledger-S9).  On an
+        existing row ``first_seen_ts`` is preserved and ``last_recheck_ts`` /
+        ``last_seen_ts`` advance with the check.
+        """
+        if not key_hash:
+            return
+        moment = time.time() if ts is None else float(ts)
+        self._enqueue(
+            _OP_KEY_UPSERT,
+            {
+                "key_hash": key_hash,
+                "provider": provider or "",
+                "key_ref_masked": key_ref_masked or "",
+                "address": address or "",
+                "endpoint": endpoint or "",
+                "status": status or "",
+                "source_url_hash": source_url_hash or "",
+                "ts": moment,
+            },
+        )
+
+    def record_key_observation(self, key_hash: str, ts: Optional[float] = None) -> None:
+        """Advance ``last_seen_ts`` for a skipped observation (UPDATE-only)."""
+        if not key_hash:
+            return
+        moment = time.time() if ts is None else float(ts)
+        self._enqueue(
+            _OP_KEY_OBSERVE,
+            {
+                "key_hash": key_hash,
+                "ts": moment,
+            },
+        )
+
     # ------------------------------------------------------------------
     # Run journaling (low frequency, written synchronously)
     # ------------------------------------------------------------------
@@ -732,6 +824,8 @@ class Registry:
         repo_touches = [payload for op, payload in batch if op == _OP_REPO_TOUCH]
         repo_gones = [payload for op, payload in batch if op == _OP_REPO_GONE]
         repo_links = [payload for op, payload in batch if op == _OP_REPO_LINKS]
+        key_upserts = [payload for op, payload in batch if op == _OP_KEY_UPSERT]
+        key_observes = [payload for op, payload in batch if op == _OP_KEY_OBSERVE]
 
         with self._write_lock:
             conn = self._conn
@@ -767,6 +861,10 @@ class Registry:
                 conn.executemany(_REPO_GONE_SQL, [self._repo_gone_row(payload) for payload in repo_gones])
             if repo_links:
                 conn.executemany(_REPO_LINKS_SQL, [self._repo_links_row(payload) for payload in repo_links])
+            if key_upserts:
+                conn.executemany(_KEY_UPSERT_SQL, [self._key_upsert_row(payload) for payload in key_upserts])
+            if key_observes:
+                conn.executemany(_KEY_OBSERVE_SQL, [self._key_observe_row(payload) for payload in key_observes])
 
             conn.commit()
 
@@ -849,6 +947,26 @@ class Registry:
     @staticmethod
     def _repo_links_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
         return (payload["pushed_at"], payload["size_kb"], payload["owner"], payload["repo"])
+
+    @staticmethod
+    def _key_upsert_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+        ts = payload["ts"]
+        return (
+            payload["key_hash"],
+            payload["provider"],
+            payload["key_ref_masked"],
+            payload["address"],
+            payload["endpoint"],
+            payload["status"],
+            ts,
+            ts,
+            ts,
+            payload["source_url_hash"],
+        )
+
+    @staticmethod
+    def _key_observe_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (payload["ts"], payload["ts"], payload["key_hash"])
 
     def _enqueue(self, op: str, payload: Dict[str, Any]) -> None:
         if not self.enabled or not self._available or self._suppress_writes:

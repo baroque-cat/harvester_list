@@ -196,6 +196,12 @@ class PipelineStatus:
     # API pagination early-stop counters (empty while off).
     early_stop_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Key-ledger skip counters (empty while off).
+    key_ledger_metrics: Dict[str, Any] = field(default_factory=dict)
+
+    # Periodic re-check driver counters (empty while disabled).
+    recheck_metrics: Dict[str, Any] = field(default_factory=dict)
+
     def queue_size(self) -> int:
         """Get total queue size across all stages"""
         return sum(stage.queue_size for stage in self.stages.values())

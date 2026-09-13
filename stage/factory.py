@@ -70,9 +70,9 @@ class TaskFactory:
             )
 
     @staticmethod
-    def create_check_task(provider: str, service: Service) -> CheckTask:
+    def create_check_task(provider: str, service: Service, source_url_hash: str = "") -> CheckTask:
         """Create a check task for API key validation"""
-        return CheckTask(provider=provider, service=service)
+        return CheckTask(provider=provider, service=service, source_url_hash=source_url_hash)
 
     @staticmethod
     def create_inspect_task(provider: str, service: Service) -> InspectTask:

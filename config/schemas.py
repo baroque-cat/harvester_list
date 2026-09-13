@@ -402,9 +402,67 @@ class EarlyStopConfig:
 
 
 @dataclass
+class CheckSkipConfig:
+    """Inline CheckStage skip configuration (add-key-ledger).
+
+    ``mode`` is the two-position rollout flag: ``off`` never consults the ledger
+    for a skip decision, ``on`` suppresses redundant provider calls within the
+    per-status freshness window.  ``ttl_hours`` maps a stored status to how long
+    it is trusted before the key is re-checked; missing statuses fall back to the
+    canonical defaults in :mod:`storage.key_ledger`.
+    """
+
+    mode: str = "off"
+    ttl_hours: Dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_check_skip_config on purpose: this
+        # guards direct (non-loader) construction in tests and embedding.
+        mode = str(self.mode).strip().lower()
+        if mode not in ("off", "on"):
+            raise ValueError("check_skip.mode must be one of: off, on")
+        self.mode = mode
+
+        # Canonical defaults live in storage.key_ledger so the engine and the
+        # config never drift; imported lazily to keep config foundational.
+        from storage.key_ledger import DEFAULT_TTL_HOURS
+
+        merged: Dict[str, float] = {status: float(hours) for status, hours in DEFAULT_TTL_HOURS.items()}
+        for status, hours in (self.ttl_hours or {}).items():
+            merged[str(status)] = float(hours)
+        for status, hours in merged.items():
+            if hours <= 0:
+                raise ValueError(f"check_skip.ttl_hours.{status} must be positive")
+        self.ttl_hours = merged
+
+
+@dataclass
+class RecheckConfig:
+    """Periodic key re-check driver configuration (add-key-ledger).
+
+    ``enabled`` gates the background driver; ``interval_hours`` is the tick
+    period and ``batch_size`` bounds how many expired keys are enqueued per tick.
+    """
+
+    enabled: bool = False
+    interval_hours: float = 6.0
+    batch_size: int = 50
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_recheck_config on purpose.
+        if not isinstance(self.enabled, bool):
+            raise ValueError("recheck.enabled must be a boolean")
+        self.interval_hours = float(self.interval_hours)
+        if self.interval_hours <= 0:
+            raise ValueError("recheck.interval_hours must be positive")
+        self.batch_size = int(self.batch_size)
+        if self.batch_size <= 0:
+            raise ValueError("recheck.batch_size must be positive")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
-
     base_url: str = ""
     completion_path: str = ""
     model_path: str = ""
@@ -528,6 +586,8 @@ class Config:
     skip: SkipConfig = field(default_factory=SkipConfig)
     enrichment: EnrichmentConfig = field(default_factory=EnrichmentConfig)
     early_stop: EarlyStopConfig = field(default_factory=EarlyStopConfig)
+    check_skip: CheckSkipConfig = field(default_factory=CheckSkipConfig)
+    recheck: RecheckConfig = field(default_factory=RecheckConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -556,6 +616,8 @@ class Config:
             "skip": self._dataclass_to_dict(self.skip),
             "enrichment": self._dataclass_to_dict(self.enrichment),
             "early_stop": self._dataclass_to_dict(self.early_stop),
+            "check_skip": self._dataclass_to_dict(self.check_skip),
+            "recheck": self._dataclass_to_dict(self.recheck),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

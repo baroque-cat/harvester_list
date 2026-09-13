@@ -32,7 +32,8 @@ from core.models import (
 from core.types import IProvider
 from search import client
 from search.github.refine.engine import RefineEngine
-from storage.registry import patterns_hash
+from storage.key_ledger import KeyCheckRequest, key_hash, mask_key
+from storage.registry import patterns_hash, url_hash
 from tools.logger import get_logger
 from tools.state import GithubCredentialLimited
 from tools.utils import get_service_name, handle_exceptions
@@ -545,8 +546,9 @@ class AcquisitionStage(BasePipelineStage):
 
             # Create check tasks for found services
             if services:
+                source_hash = url_hash(task.url)
                 for service in services:
-                    check_task = TaskFactory.create_check_task(task.provider, service)
+                    check_task = TaskFactory.create_check_task(task.provider, service, source_url_hash=source_hash)
                     output.add_task(check_task, PipelineStage.CHECK.value)
 
                 # Add material keys to be saved
@@ -616,7 +618,9 @@ class CheckStage(BasePipelineStage):
         check_task = task if isinstance(task, CheckTask) else None
         if check_task and check_task.service:
             service = check_task.service
-            return f"{PipelineStage.CHECK.value}:{task.provider}:{service.key}:{service.address}:{service.endpoint}"
+            # Hash the secret: task ids are rendered in log lines.
+            digest = key_hash(task.provider, service.key, service.address, service.endpoint)
+            return f"{PipelineStage.CHECK.value}:{task.provider}:{digest}"
 
         return f"{PipelineStage.CHECK.value}:{task.provider}:unknown"
 
@@ -637,6 +641,17 @@ class CheckStage(BasePipelineStage):
                 logger.error(f"[{self.name}] unknown provider: {task.provider}, type: {type(provider)}")
                 return None
 
+            service = task.service
+            effective_address = task.custom_url or service.address
+            digest = key_hash(task.provider, service.key, effective_address, service.endpoint)
+            source_url_hash = getattr(task, "source_url_hash", "") or ""
+
+            # Ledger consultation (add-key-ledger D4): a known, fresh key skips
+            # the provider call entirely.  Fail-open: any ledger problem falls
+            # through to a normal check.
+            if self._should_skip_check(task, service, effective_address, digest, source_url_hash):
+                return self._skip_output(task, digest)
+
             # Apply rate limiting
             service_type = get_service_name(task.provider)
             if not self.resources.limiter.acquire(service_type):
@@ -654,13 +669,16 @@ class CheckStage(BasePipelineStage):
             # Execute check
             result = provider.check(
                 token=task.service.key,
-                address=task.custom_url or task.service.address,
+                address=effective_address,
                 endpoint=task.service.endpoint,
                 model=task.service.model,
             )
 
             # Report rate limit success
             self.resources.limiter.report_result(service_type, True)
+
+            # Persist the outcome to the ledger (hash/mask only; fail-open).
+            self._record_key_outcome(task, service, effective_address, digest, source_url_hash, result)
 
             # Create output object
             output = StageOutput(task=task)
@@ -698,6 +716,84 @@ class CheckStage(BasePipelineStage):
 
             return None
 
+    def _should_skip_check(
+        self, task: CheckTask, service: Service, effective_address: str, digest: str, source_url_hash: str
+    ) -> bool:
+        """Consult the ledger for a fresh-skip decision (fail-open in the check direction).
+
+        ``KeyLedger.decide`` is batch-ready, but the worker loop processes one
+        task per iteration, so the batch is size 1 here (design D4 note): one
+        indexed point lookup per check, no extra reads.
+        """
+        ledger = getattr(self.resources, "key_ledger", None)
+        if ledger is None or not getattr(ledger, "enabled", False):
+            return False
+        try:
+            decisions = ledger.decide(
+                [
+                    KeyCheckRequest(
+                        provider=task.provider,
+                        key=service.key,
+                        address=effective_address,
+                        endpoint=service.endpoint,
+                        source_url_hash=source_url_hash,
+                    )
+                ]
+            )
+        except Exception as e:  # defensive: decide itself fails open
+            logger.warning(f"[{self.name}] key-ledger consultation failed (fail-open): {e}")
+            return False
+        decision = decisions[0] if decisions else None
+        return bool(decision is not None and decision.skip)
+
+    def _skip_output(self, task: CheckTask, digest: str) -> StageOutput:
+        """Emit an observation-only output (no results => no shard append)."""
+        registry = getattr(self.resources, "registry", None)
+        if registry is not None:
+            try:
+                registry.record_key_observation(digest)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(f"[{self.name}] ledger observation hook failed: {e}")
+        return StageOutput(task=task)
+
+    def _record_key_outcome(
+        self,
+        task: CheckTask,
+        service: Service,
+        effective_address: str,
+        digest: str,
+        source_url_hash: str,
+        result: Any,
+    ) -> None:
+        """Write the check outcome to the ledger (fail-open; hash/mask only)."""
+        registry = getattr(self.resources, "registry", None)
+        if registry is None:
+            return
+        status = self._result_status(result)
+        try:
+            registry.record_key(
+                digest,
+                provider=task.provider,
+                key_ref_masked=mask_key(service.key),
+                address=effective_address,
+                endpoint=service.endpoint,
+                status=status,
+                source_url_hash=source_url_hash,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"[{self.name}] ledger upsert hook failed: {e}")
+
+    @staticmethod
+    def _result_status(result: Any) -> str:
+        """Map a CheckResult to the ledger status vocabulary."""
+        if result.available:
+            return ResultType.VALID.value
+        if result.reason == ErrorReason.NO_QUOTA:
+            return ResultType.NO_QUOTA.value
+        if result.reason in (ErrorReason.RATE_LIMITED, ErrorReason.NO_MODEL, ErrorReason.NO_ACCESS):
+            return ResultType.WAIT_CHECK.value
+        return ResultType.INVALID.value
+
 
 @register_stage(
     name=PipelineStage.INSPECT.value,
@@ -716,7 +812,9 @@ class InspectStage(BasePipelineStage):
         inspect_task = task if isinstance(task, InspectTask) else None
         if inspect_task and inspect_task.service:
             service = inspect_task.service
-            return f"{PipelineStage.INSPECT.value}:{task.provider}:{service.key}:{service.address}"
+            # Hash the secret: task ids are rendered in log lines.
+            digest = key_hash(task.provider, service.key, service.address, service.endpoint)
+            return f"{PipelineStage.INSPECT.value}:{task.provider}:{digest}"
 
         return f"{PipelineStage.INSPECT.value}:{task.provider}:unknown"
 

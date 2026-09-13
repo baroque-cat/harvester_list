@@ -1112,6 +1112,77 @@ removal. A run whose registry was degraded is not a trustworthy source of
 "known" counts, so early-stop is muted for that run. The promotion gate
 procedure lives in `docs/specs/registry_flags_metrics.md`.
 
+### Key ledger (`check_skip`, `recheck`)
+
+Links are the unit of discovery; **keys are the unit of value** — and the
+expensive one, because every check is a real billable call to a third-party
+provider. The registry's `keys` table is a persistent "two-ledger" memory:
+alongside the link ledger, it records each credential's identity and last
+verification status, so a repeat run stops re-verifying keys it already knows
+are fresh. This preserves the project's `--only-verified` philosophy: don't poke
+dead keys repeatedly, don't hammer live ones.
+
+**Identity and secret hygiene.** A ledger row is identified by
+`key_hash = sha256("provider|key|address|endpoint")` and stores only that hash
+plus a masked reference (`<first6>…<last4>`). The full secret is **never**
+written to the registry database, its WAL sidecars, the decision log, or any
+metric — the byte-scan test (`tests/test_key_ledger.py`, scenario S9) plants
+canary secrets and fails the build if one ever appears. Migrated historical keys
+use the same hash/mask helpers as the runtime writer, so imported rows join
+exactly.
+
+**Inline skip (`check_skip.mode`).** With `on`, CheckStage consults the ledger
+before calling the provider. A known key whose `last_recheck_ts` is inside the
+TTL for its stored status is skipped: no provider call, no duplicate shard
+record, and only the observation timestamp advances. Unknown hashes are always
+checked, and any missing/NULL `last_recheck_ts` resolves to "check it".
+
+| Status | Default TTL | Rationale |
+|--------|-------------|-----------|
+| `wait_check` | 12 h | "provider refused temporarily — retry soon" (rate-limit/no-model noise; short window absorbs flapping) |
+| `no_quota` | 72 h | billing state changes on recharge (days) |
+| `invalid` | 168 h | can resurrect via rotation, but rarely (a week) |
+| `valid` | 336 h (14 d) | leaked cloud keys are empirically long-lived; fortnightly confirmation balances freshness against API etiquette |
+
+TTLs are configurable per status:
+
+```yaml
+registry:
+  enabled: true
+check_skip:
+  mode: "off"          # off | on
+  ttl_hours:
+    wait_check: 12
+    no_quota: 72
+    invalid: 168
+    valid: 336
+recheck:
+  enabled: false       # in-process cron for TTL-expired keys
+  interval_hours: 6
+  batch_size: 50
+```
+
+**Periodic re-check (`recheck.enabled`).** When enabled, `RecheckManager`
+(a `PeriodicTaskManager`) selects TTL-expired ledger keys — priority
+`wait_check → valid → no_quota → invalid`, oldest `last_recheck_ts` first,
+bounded by `batch_size` — and enqueues ordinary `CheckTask`s through the normal
+CheckStage queue, so every existing provider rate limit and token bucket
+applies. Because the registry stores no plaintext, the driver recovers the key
+from the result shards (`ShardKeyResolver`); unresolved keys are counted and
+skipped rather than guessed. Legacy migration rows with `last_recheck_ts = NULL`
+count as expired and drain gradually through the batch cap.
+
+**Metrics & rollback.** `check_skipped_by_status{valid,wait_check,invalid,no_quota}`
+and `provider_calls_saved` are exposed in `PipelineStatus.key_ledger_metrics`;
+`rechecks_enqueued` in `PipelineStatus.recheck_metrics`. Ledger recording starts
+as soon as `registry.enabled` is true even while both flags are `off`, so the
+data accumulates safely. Flip `check_skip.mode` / `recheck.enabled` back to
+`off`/`false` to fully restore pre-change behavior — a config change, no code.
+
+**Fail-open.** Any ledger read/write error degrades to the pre-change path: the
+provider is still checked, a warning is logged once per error kind, and the run
+is marked degraded. A skip is never derived from an errored lookup.
+
 ## Troubleshooting
 
 ### **Common Issues**
