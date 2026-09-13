@@ -35,6 +35,7 @@ from .schemas import (
     MonitoringConfig,
     PersistenceConfig,
     PipelineConfig,
+    PrioritizationConfig,
     RecheckConfig,
     RegistryConfig,
     SkipConfig,
@@ -136,6 +137,10 @@ class ConfigLoader:
         # Parse periodic key re-check configuration
         if "recheck" in data:
             config.recheck = self._parse_recheck_config(data["recheck"])
+
+        # Parse repository prioritization configuration
+        if "prioritization" in data:
+            config.prioritization = self._parse_prioritization_config(data["prioritization"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -387,6 +392,26 @@ class ConfigLoader:
             enabled=data.get("enabled", False),
             interval_hours=data.get("interval_hours", 6.0),
             batch_size=data.get("batch_size", 50),
+        )
+
+    def _parse_prioritization_config(self, data: Dict[str, Any]) -> PrioritizationConfig:
+        """Parse repository prioritization configuration section
+
+        Args:
+            data: Prioritization configuration data
+
+        Returns:
+            PrioritizationConfig: Parsed prioritization configuration
+        """
+        return PrioritizationConfig(
+            w1=data.get("w1", 100.0),
+            w2=data.get("w2", 40.0),
+            w4=data.get("w4", 30.0),
+            half_life_days=data.get("half_life_days", 30.0),
+            w5=data.get("w5", 20.0),
+            threshold_kb=data.get("threshold_kb", 50_000.0),
+            ramp_kb=data.get("ramp_kb", 500_000.0),
+            display_top_n=data.get("display_top_n", 0),
         )
 
     def _parse_rate_limits(self, data: Dict[str, Any]) -> Dict[str, RateLimitConfig]:

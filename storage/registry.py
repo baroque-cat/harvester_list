@@ -24,6 +24,14 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
+from storage.priority import (
+    PriorityWeights,
+    apply_scores,
+    repos_for_url_hashes,
+    score_many,
+    sweep as sweep_priorities_sql,
+    weights_from_config,
+)
 from tools.logger import get_logger
 
 logger = get_logger("storage")
@@ -377,13 +385,23 @@ def config_digest(config: Any) -> str:
 class Registry:
     """Write-only facade over the SQLite registry with a buffered writer thread."""
 
-    def __init__(self, workspace: str, config: Any = None, enabled: Optional[bool] = None, run_id: Optional[str] = None):
+    def __init__(
+        self,
+        workspace: str,
+        config: Any = None,
+        enabled: Optional[bool] = None,
+        run_id: Optional[str] = None,
+        prioritization: Any = None,
+    ):
         self.workspace = str(workspace)
         self.config = config
 
         if enabled is None:
             enabled = bool(getattr(config, "enabled", False))
         self.enabled = bool(enabled)
+
+        # Scoring parameters for the denormalized links.priority column.
+        self.priority_weights: PriorityWeights = weights_from_config(prioritization)
 
         batch_size = int(getattr(config, "batch_size", 50) or 50)
         flush_interval = float(getattr(config, "flush_interval", 5) or 5)
@@ -740,6 +758,10 @@ class Registry:
         run_id = run_id or self.run_id
         if run_id is None or not self.enabled or not self._available or self._conn is None:
             return
+        # Hard convergence guarantee (design D3): recompute every repository's
+        # priority before journaling the finish, healing any mutations that
+        # bypassed dirty-marking (migrations, manual edits).
+        self.sweep_priorities()
         finished = time.time() if ts is None else float(ts)
         degraded = 1 if self._degraded else 0
 
@@ -759,6 +781,29 @@ class Registry:
         deadline = time.time() + max(0.0, timeout)
         while self._queue.unfinished_tasks and time.time() < deadline:
             time.sleep(0.001)
+
+    def sweep_priorities(self, weights: Any = None, now: Optional[float] = None) -> int:
+        """Recompute and persist priority for every repository (fail-open).
+
+        Drains pending writes first so the sweep observes a settled ledger, then
+        runs the full ``DISTINCT owner, repo`` recomputation through the writer
+        connection.  Returns the number of repositories scored (0 when the
+        registry is disabled/unavailable).
+        """
+        if not self.enabled or not self._available or self._conn is None:
+            return 0
+        try:
+            self.flush(max(10.0, self.flush_interval * 2))
+        except Exception:
+            pass
+        resolved = weights_from_config(weights) if weights is not None else self.priority_weights
+        result = {"count": 0}
+
+        def action(conn: sqlite3.Connection) -> None:
+            result["count"] = sweep_priorities_sql(conn, resolved, now=now)
+
+        self._execute(action, "priority_sweep")
+        return result["count"]
 
     # ------------------------------------------------------------------
     # Internals
@@ -865,6 +910,25 @@ class Registry:
                 conn.executemany(_KEY_UPSERT_SQL, [self._key_upsert_row(payload) for payload in key_upserts])
             if key_observes:
                 conn.executemany(_KEY_OBSERVE_SQL, [self._key_observe_row(payload) for payload in key_observes])
+
+            # Priority denormalization (add-target-prioritization D3): evidence
+            # changes mark their owning repositories dirty; the same transaction
+            # rescores them so `links.priority` never lags the ledger by a batch.
+            dirty_repos = set()
+            if key_upserts:
+                dirty_repos |= repos_for_url_hashes(
+                    conn, (payload["source_url_hash"] for payload in key_upserts)
+                )
+            if metadatas:
+                dirty_repos |= repos_for_url_hashes(conn, (row[3] for row in rows))
+            if repo_links:
+                dirty_repos |= {
+                    (payload["owner"], payload["repo"])
+                    for payload in repo_links
+                    if payload["owner"] and payload["repo"]
+                }
+            if dirty_repos:
+                apply_scores(conn, score_many(conn, dirty_repos, self.priority_weights))
 
             conn.commit()
 
@@ -1010,10 +1074,15 @@ class Registry:
 _registry: Optional[Registry] = None
 
 
-def init_registry(workspace: str, config: Any = None, enabled: Optional[bool] = None) -> Registry:
+def init_registry(
+    workspace: str,
+    config: Any = None,
+    enabled: Optional[bool] = None,
+    prioritization: Any = None,
+) -> Registry:
     """Create and install the process-wide registry instance."""
     global _registry
-    _registry = Registry(workspace, config=config, enabled=enabled)
+    _registry = Registry(workspace, config=config, enabled=enabled, prioritization=prioritization)
     return _registry
 
 

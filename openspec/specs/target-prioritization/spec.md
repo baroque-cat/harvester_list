@@ -1,11 +1,10 @@
-# Delta Spec: target-prioritization
+# target-prioritization Specification
 
 ## Purpose
 
 Orders the harvested corpus by deep-scan value: computes a configurable weighted priority per repository from accumulated registry evidence (key statuses, push freshness, size), keeps scores converged with ledger state through event-driven recomputation and run-finish sweeps, and publishes a deterministic, schema-versioned candidate export as the stable handoff contract for downstream deep-scan consumers.
 
-## ADDED Requirements
-
+## Requirements
 ### Requirement: Repository priority scoring
 
 The system SHALL compute a numeric priority per repository as `W1·[has VALID key] + W2·[has wait_check/no_quota key] + W4·freshness(repo_pushed_at) − W5·size_penalty(repo_size_kb)` with documented default weights, denormalized into every `links.priority` row of that repository. Freshness SHALL decay monotonically with age toward zero; the size penalty SHALL grow with repository size above a configured threshold. Missing inputs (NULL dates, sizes, or absent keys) SHALL contribute zero to their components without error.
@@ -69,7 +68,7 @@ Scoring and export SHALL NOT alter pipeline behavior or persisted results: resul
 
 ### Requirement: Configurable weights and thresholds
 
-All scoring parameters (W1, W2, W4 magnitude and decay half-life, W5 magnitude, threshold, ramp) SHALL be configurable via the standard config path with validated positive ranges; defaults SHALL match the documented values used at introduction. An optional top-N candidates display SHALL be gated by configuration and disabled by default.
+All scoring parameters (W1, W2, W4 magnitude and decay half-life, W5 magnitude, threshold, ramp) SHALL be configurable via the standard config path with validated ranges: weight magnitudes are non-negative (zero disables a component, as exercised by the Custom-weights scenario), the decay half-life is positive, and the ramp end exceeds the threshold; defaults SHALL match the documented values used at introduction. An optional top-N candidates display SHALL be gated by configuration and disabled by default.
 
 #### Scenario: Custom weights change ordering
 

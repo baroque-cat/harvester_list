@@ -23,6 +23,7 @@ from storage.early_stop import EarlyStopEngine
 from storage.gather_skip import GatherSkipEngine
 from storage.key_ledger import KeyLedger
 from storage.registry import Registry, config_digest as build_config_digest, init_registry
+from storage.priority import top_candidates
 from storage.repo_meta import RepoMetaEnricher, RepoMetaStore, tokens_cooling_down
 from tools.coordinator import get_session, get_token, get_user_agent
 from tools.logger import get_logger
@@ -71,6 +72,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         self.link_registry: Registry = init_registry(
             config.global_config.workspace,
             config=config.registry,
+            prioritization=config.prioritization,
         )
 
         # Registry-driven gather-skip decision engine (off by default; never
@@ -382,9 +384,21 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             early_stop_metrics=self.early_stop.to_stats(),
             key_ledger_metrics=self.key_ledger.to_stats(),
             recheck_metrics=self.recheck.to_stats(),
+            prioritization_metrics=self._prioritization_metrics(),
         )
 
         return pipeline_status
+
+    def _prioritization_metrics(self) -> Dict[str, object]:
+        """Top-N candidate line data (empty unless display_top_n > 0)."""
+        top_n = int(getattr(self.config.prioritization, "display_top_n", 0) or 0)
+        if top_n <= 0 or not self.link_registry.available:
+            return {}
+        try:
+            return {"display_top_n": top_n, "candidates": top_candidates(self.link_registry.path, top_n)}
+        except Exception as e:  # pragma: no cover - cosmetic best-effort
+            logger.debug(f"Failed to build prioritization metrics: {e}")
+            return {}
 
     def add_initial_tasks(self, initial_tasks: List[ProviderTask]) -> None:
         """Add initial search tasks to pipeline"""

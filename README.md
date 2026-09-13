@@ -1183,6 +1183,82 @@ data accumulates safely. Flip `check_skip.mode` / `recheck.enabled` back to
 provider is still checked, a warning is logged once per error kind, and the run
 is marked degraded. A skip is never derived from an errored lookup.
 
+### Target prioritization (`prioritization`)
+
+The registry answers not just *what* was found but *what to scan next*. Each
+repository gets a deterministic, explainable priority from evidence already in
+the registry — verified key status, push freshness and size — denormalized into
+every `links.priority` row of that repository. This is a purely read-side
+capability plus one reserved column write: pipeline decisions are untouched, no
+network activity occurs and no shard format changes.
+
+**Formula (defaults).**
+
+```
+priority = W1·[valid key] + W2·[wait_check/no_quota key]
+           + W4·exp(−ln2·age_days / half_life_days)
+           − W5·clamp((size_kb − threshold_kb) / (ramp_kb − threshold_kb), 0, 1)
+```
+
+| Weight | Default | Meaning |
+|--------|---------|---------|
+| `w1` | 100 | Repository has at least one attributed `valid` key (0 disables). |
+| `w2` | 40 | Repository has only soft evidence (`wait_check`/`no_quota`). |
+| `w4` | 30 | Peak freshness weight (decays with age). |
+| `half_life_days` | 30 | Freshness half-life in days. |
+| `w5` | 20 | Maximum size penalty. |
+| `threshold_kb` | 50000 | Size below which no penalty applies (~50 MB). |
+| `ramp_kb` | 500000 | Size at/above which the penalty is capped (~500 MB). |
+| `display_top_n` | 0 | Optional StatusManager top-N candidates line (0 = off). |
+
+Missing inputs degrade neutrally: `NULL` dates/sizes and absent keys contribute
+zero and a fully sparse repository scores `0` without error. A repository's
+`valid` key is attributed through `keys.source_url_hash → links.url_hash →
+(owner, repo)`; legacy keys imported without a source URL contribute only to
+global statistics, never to a repo score (documented limitation).
+
+**Recomputation.** Key-status upserts, date/size merges and repo-wide metadata
+merges mark the owning repository dirty; the next writer batch rescores it, and
+a full sweep at run finish reconciles everything — scores never lag the ledger
+by more than one run. All knobs are validated (weights non-negative, half-life
+positive, `ramp_kb > threshold_kb`).
+
+```yaml
+registry:
+  enabled: true
+prioritization:
+  w1: 100
+  w2: 40
+  w4: 30
+  half_life_days: 30
+  w5: 20
+  threshold_kb: 50000
+  ramp_kb: 500000
+  display_top_n: 0     # cosmetic status line; off by default
+```
+
+**Candidate export (`tools/export_candidates.py`).** A read-only CLI publishes
+the ordered corpus as the stable, schema-versioned handoff contract for the
+future clone/TruffleHog project. NDJSON is the default; `--csv` is supported.
+Records are sorted by `priority` desc, `repo_pushed_at` desc (nulls last), then
+`owner`/`repo`, and carry `schema_version`, owner/repo, priority, best key
+status, status counts, freshness/size, `links_total` and a bounded sample of
+link URLs.
+
+```bash
+# All candidates, NDJSON to stdout
+python -m tools.export_candidates --workspace ./data
+
+# Top 100 with priority >= 50, CSV, up to 10 sample links each
+python -m tools.export_candidates --workspace ./data \
+    --csv --min-priority 50 --limit 100 --sample-links 10
+```
+
+Because every raw input is in the record, consumers can re-rank offline with
+their own weights without touching the database. See
+`docs/specs/candidates_export.md` for the frozen field dictionary, the
+`schema_version` policy and advanced direct-SQLite guidance.
+
 ## Troubleshooting
 
 ### **Common Issues**

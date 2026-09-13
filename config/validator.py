@@ -71,6 +71,9 @@ class ConfigValidator:
         # Validate periodic key re-check configuration
         self._validate_recheck_config(config)
 
+        # Validate repository prioritization configuration
+        self._validate_prioritization_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -389,6 +392,26 @@ class ConfigValidator:
                 "recheck.enabled=true has no effect while registry.enabled is false "
                 "(the ledger lives in the registry; no keys to select)"
             )
+
+    def _validate_prioritization_config(self, config: Config) -> None:
+        """Validate repository prioritization configuration section."""
+        prioritization = config.prioritization
+
+        for name in ("w1", "w2", "w4", "w5"):
+            if float(getattr(prioritization, name)) < 0:
+                self.errors.append(f"Prioritization {name} must be non-negative")
+
+        if prioritization.half_life_days <= 0:
+            self.errors.append("Prioritization half_life_days must be positive")
+
+        if prioritization.threshold_kb < 0:
+            self.errors.append("Prioritization threshold_kb must be non-negative")
+
+        if prioritization.ramp_kb <= prioritization.threshold_kb:
+            self.errors.append("Prioritization ramp_kb must be > threshold_kb")
+
+        if prioritization.display_top_n < 0:
+            self.errors.append("Prioritization display_top_n must be non-negative")
 
     def _validate_rate_limits(self, config: Config) -> None:
         """Validate rate limits configuration

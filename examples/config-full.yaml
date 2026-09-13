@@ -257,6 +257,28 @@ recheck:
   # Maximum keys enqueued per tick (provider rate limits still apply)
   batch_size: 50
 
+# Repository priority scoring configuration (add-target-prioritization)
+# Score = w1*[valid key] + w2*[wait_check/no_quota key]
+#         + w4*exp(-ln2*age_days/half_life_days) - w5*size_penalty
+# Scores are denormalized into links.priority; export reads them read-only.
+prioritization:
+  # Weight of a repository that has at least one VALID key (0 disables)
+  w1: 100
+  # Weight of a repository with only soft evidence (wait_check/no_quota)
+  w2: 40
+  # Peak freshness weight (decays toward zero with age)
+  w4: 30
+  # Freshness half-life in days
+  half_life_days: 30
+  # Maximum size penalty
+  w5: 20
+  # Repository size (KB) below which no penalty applies (~50 MB)
+  threshold_kb: 50000
+  # Repository size (KB) at/above which the penalty is capped (~500 MB)
+  ramp_kb: 500000
+  # Optional StatusManager top-N candidates line; 0 = off
+  display_top_n: 0
+
 # Global rate limiting configuration
 ratelimits:
   # GitHub API rate limits

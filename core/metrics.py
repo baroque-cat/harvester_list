@@ -202,6 +202,9 @@ class PipelineStatus:
     # Periodic re-check driver counters (empty while disabled).
     recheck_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Optional top-N priority candidates (empty while display_top_n == 0).
+    prioritization_metrics: Dict[str, Any] = field(default_factory=dict)
+
     def queue_size(self) -> int:
         """Get total queue size across all stages"""
         return sum(stage.queue_size for stage in self.stages.values())

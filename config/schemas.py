@@ -461,6 +461,50 @@ class RecheckConfig:
 
 
 @dataclass
+class PrioritizationConfig:
+    """Repository priority scoring configuration (add-target-prioritization).
+
+    Weights and thresholds mirror the scoring formula; ``display_top_n`` gates
+    the optional StatusManager top-N candidates line (0 = off).
+    """
+
+    w1: float = 100.0
+    w2: float = 40.0
+    w4: float = 30.0
+    half_life_days: float = 30.0
+    w5: float = 20.0
+    threshold_kb: float = 50_000.0
+    ramp_kb: float = 500_000.0
+    display_top_n: int = 0
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_prioritization_config on purpose.
+        # Weights are magnitudes, so zero is valid (S10 sets W1=0); the decay
+        # half-life must stay positive to avoid division by zero.
+        for name in ("w1", "w2", "w4", "w5"):
+            value = float(getattr(self, name))
+            if value < 0:
+                raise ValueError(f"prioritization.{name} must be non-negative")
+            setattr(self, name, value)
+
+        self.half_life_days = float(self.half_life_days)
+        if self.half_life_days <= 0:
+            raise ValueError("prioritization.half_life_days must be positive")
+
+        self.threshold_kb = float(self.threshold_kb)
+        if self.threshold_kb < 0:
+            raise ValueError("prioritization.threshold_kb must be non-negative")
+
+        self.ramp_kb = float(self.ramp_kb)
+        if self.ramp_kb <= self.threshold_kb:
+            raise ValueError("prioritization.ramp_kb must be > threshold_kb")
+
+        self.display_top_n = int(self.display_top_n)
+        if self.display_top_n < 0:
+            raise ValueError("prioritization.display_top_n must be non-negative")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
     base_url: str = ""
@@ -588,6 +632,7 @@ class Config:
     early_stop: EarlyStopConfig = field(default_factory=EarlyStopConfig)
     check_skip: CheckSkipConfig = field(default_factory=CheckSkipConfig)
     recheck: RecheckConfig = field(default_factory=RecheckConfig)
+    prioritization: PrioritizationConfig = field(default_factory=PrioritizationConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -618,6 +663,7 @@ class Config:
             "early_stop": self._dataclass_to_dict(self.early_stop),
             "check_skip": self._dataclass_to_dict(self.check_skip),
             "recheck": self._dataclass_to_dict(self.recheck),
+            "prioritization": self._dataclass_to_dict(self.prioritization),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

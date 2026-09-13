@@ -10,7 +10,9 @@ metrics are implemented by `add-gather-skip`; the `enrichment.*` flag and
 `novel_after_stop` metrics are implemented by `add-search-early-stop`; the
 `check_skip` / `recheck_cron` flags and their `check_skipped_by_status` /
 `rechecks_enqueued` / `provider_calls_saved` metrics are implemented by
-`add-key-ledger`. All flags default to the safest (off) state.
+`add-key-ledger`; the `prioritization` section and its `links.priority`
+denormalization / candidate export are implemented by
+`add-target-prioritization`. All flags default to the safest (off) state.
 
 ## Feature-flag matrix
 
@@ -25,6 +27,7 @@ decision is computed and logged but not applied.
 | `early_stop` | `off` / `shadow` / `on` | `off` | Stop paging an **API-transport** partition once its trailing window is saturated with known links and the trust gate passes. Web transport is inert at code level. | `add-search-early-stop` | Yes |
 | `check_skip.mode` | `off` / `on` | `off` | Skip re-validating keys whose last check is fresh and conclusive (per-status TTL in `check_skip.ttl_hours`). | `add-key-ledger` | Yes |
 | `recheck.enabled` (planning name `recheck_cron`) | `true` / `false` | `false` | Schedule periodic re-checks of previously-seen keys (in-process cron; `recheck.interval_hours` / `batch_size`). | `add-key-ledger` | Yes |
+| `prioritization.display_top_n` | integer ≥ 0 | `0` | Render a cosmetic top-N owner/repo:priority line in the status display. Scoring/export are always on (read-side). | `add-target-prioritization` | Yes (read-only top-N) |
 
 Trust gate: a run whose registry was **degraded** (write failure, queue overflow,
 corrupt open) must not be trusted as a source of "known" counts. Skip/early-stop
@@ -62,6 +65,8 @@ per run unless noted.
 | `repos_cached` | Successful `200` fetches that replaced/cached a `repos` row and re-triggered the link-column merge. | `add-repo-meta-enrichment` |
 | `gone` | Repositories answered `404` and marked `repos.gone=1`; retries are suppressed within TTL and existing link rows are preserved. | `add-repo-meta-enrichment` |
 | `cooling_skips` | **Diagnostic**: enrichment encounters yielded without requests because every API token was cooling down (non-blocking probe; transient — resumes in-run when a token recovers). Logged once at info level. | `add-repo-meta-enrichment` |
+| `prioritization.display_top_n` | Configured N for the optional status line (mirror of the config value; `0` disables). | `add-target-prioritization` |
+| `prioritization.candidates` | Flattened `[[owner, repo, priority], ...]` top-N list read from `links.priority` while `display_top_n > 0`. Empty otherwise. | `add-target-prioritization` |
 
 `skip_known`, the four `regathered_*` counters and `push_signal_coverage` are
 flattened by `GatherSkipEngine.to_stats()` into `PipelineStatus.skip_metrics`
@@ -205,6 +210,13 @@ monitor the `early_stop_fired` vs novel-links trend.
   `{"mode": "off", ...}` and performs zero registry reads; with
   `recheck.enabled=false` the driver emits `{"enabled": false, ...}` and enqueues
   nothing.
+- `links.priority` is the single denormalized scoring target
+  (`add-target-prioritization`); its value for a repo is a pure function of
+  `keys` (via `source_url_hash`) and the repo's `repo_pushed_at`/
+  `repo_size_kb`. `prioritization.candidates` is flattened by
+  `Pipeline._prioritization_metrics()` into `PipelineStatus.prioritization_metrics`
+  (rendered only when `display_top_n > 0`); the export tool reads the same column
+  read-only.
 
 ## Key-ledger semantics (`add-key-ledger`)
 
@@ -232,6 +244,36 @@ monitor the `early_stop_fired` vs novel-links trend.
 - **Trust/degradation.** A ledger read error warns once per error kind, marks
   the run degraded, and forces checks for the affected batch. `off` flags
   restore pre-change behavior exactly.
+
+## Prioritization semantics (`add-target-prioritization`)
+
+- **Formula.** `priority = W1·valid_present + W2·soft_present +
+  W4·exp(−ln2·age_days/H) − W5·clamp((size_kb−T)/(R−T), 0, 1)` with defaults
+  `W1=100, W2=40, W4=30, H=30 d, W5=20, T=50000 KB, R=500000 KB` (all under the
+  `prioritization` config section). `valid_present` / `soft_present` come from
+  keys attributed through `keys.source_url_hash → links.url_hash → (owner,repo)`;
+  `age_days`/`size_kb` are `MAX(repo_pushed_at)` / `MAX(repo_size_kb)` over the
+  repo's `links` rows. Missing inputs contribute zero; a sparse repo scores 0.
+- **Denormalization.** The repo score is written to **every** `links.priority`
+  row of that repo (grouped by `idx_links_repo`). Consumers read a single
+  numeric column without joins.
+- **Convergence.** Key-status upserts, date/size merges and repo-wide metadata
+  merges mark `(owner,repo)` dirty and are rescored in the same writer-batch
+  transaction. `Registry.finish_run()` runs a full `DISTINCT owner,repo` sweep,
+  so priorities never lag the ledger by more than one run and externally
+  mutated registries self-heal.
+- **Attribution limitation.** Legacy keys imported without a source URL
+  contribute only to global statistics, never to a repo score. This is
+  documented in `candidates_export.md`; `links_total` on each export record
+  lets consumers sanity-check coverage.
+- **Attribution caveat for future work.** `keys.source_url_hash` is set on real
+  provider-check writes; migration-imported keys have `source_url_hash=NULL`
+  and are excluded until a migration improvement attributes them.
+- **Read-side isolation.** Scoring and export never change pipeline behavior;
+  the only `links.priority` writes and internal bookkeeping are involved. The
+  export tool opens the registry `mode=ro` and performs zero network activity.
+- **Rollback.** Purely additive: stop using the export or set `display_top_n: 0`.
+  A stale `priority` column harms nothing.
 
 ## Gather-skip shadow promotion procedure (`shadow` → `on`)
 

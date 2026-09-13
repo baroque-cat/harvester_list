@@ -319,6 +319,7 @@ class StatusDisplayEngine:
         early_stop_line = self._format_early_stop_metrics_line(status)
         key_ledger_line = self._format_key_ledger_metrics_line(status)
         recheck_line = self._format_recheck_metrics_line(status)
+        prioritization_line = self._format_prioritization_metrics_line(status)
 
         if not status.pipeline.stages:
             lines.append("No pipeline data available")
@@ -334,6 +335,8 @@ class StatusDisplayEngine:
                 lines.append(key_ledger_line)
             if recheck_line:
                 lines.append(recheck_line)
+            if prioritization_line:
+                lines.append(prioritization_line)
             return lines
 
         # Table header
@@ -374,6 +377,9 @@ class StatusDisplayEngine:
 
         if recheck_line:
             lines.append(recheck_line)
+
+        if prioritization_line:
+            lines.append(prioritization_line)
 
         return lines
 
@@ -461,6 +467,16 @@ class StatusDisplayEngine:
             f"refused={metrics.get('rechecks_refused', 0)} "
             f"unresolved={metrics.get('unresolved', 0)}"
         )
+
+    @staticmethod
+    def _format_prioritization_metrics_line(status: SystemStatus) -> str:
+        """Render the optional top-N candidates line (display_top_n > 0 only)."""
+        metrics = getattr(status.pipeline, "prioritization_metrics", None)
+        if not metrics:
+            return ""
+        candidates = metrics.get("candidates") or []
+        rendered = ", ".join(f"{owner}/{repo}:{priority:.1f}" for owner, repo, priority in candidates)
+        return f"Top candidates: {rendered}" if rendered else ""
 
     def _format_provider_section(self, status: SystemStatus) -> List[str]:
         """Format provider section with table-like layout"""
