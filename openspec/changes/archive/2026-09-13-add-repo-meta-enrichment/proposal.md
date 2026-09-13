@@ -13,7 +13,7 @@ Deliberately separated from add-date-extraction (which remains the opportunistic
 - **Additive `repos` cache table** + `PRAGMA user_version` bump:
   `repos(owner TEXT, repo TEXT, pushed_at REAL, size_kb INTEGER, default_branch TEXT, etag TEXT, fetched_at REAL, gone INTEGER DEFAULT 0, PRIMARY KEY(owner, repo))`.
 - **Fetcher rides the existing GitHubClient `github_api` service type** — inheriting per-credential adaptive TokenBuckets, `GithubCredentialState` cooldowns [60,900]×2, `GithubCredentialLimited` rotation, and `Retry-After`/`X-RateLimit-Reset` handling. Shares the bucket with search deliberately: a rate-limited token must not be hammered from two subsystems.
-- **Propagation into `links.repo_pushed_at`/`repo_size_kb` through the existing COALESCE non-regression merge channel** (② plumbing reuse; UPDATE-only `_OP_METADATA` op-kind — never inserts phantom link rows).
+- **Propagation into `links.repo_pushed_at`/`repo_size_kb` through the existing COALESCE non-regression merge pattern** (② plumbing reuse as a repo-scoped UPDATE-only `_OP_REPO_LINKS` op keyed by `(owner,repo)` — never inserts phantom link rows).
 - **Conditional refresh economics:** cached entry older than TTL → `If-None-Match: <etag>`; `304` bumps `fetched_at` and preserves values; `200` replaces `pushed_at`/`size_kb`/`default_branch`/`etag`.
 - **Lazy TTL-gated triggers:** (a) AcquisitionStage — novel or stale-cache repos encountered at gather; (b) SearchStage skip-evaluator — candidates whose cache entry is stale (wired **after** add-gather-skip lands; gated task 4.2). Deduplication per `(owner, repo)` within batch/page/run.
 - **404 → `gone=1` takedown signal:** no exception, no retry within TTL; exposed for future dangling-commit targeting and the ⑥ export contract.

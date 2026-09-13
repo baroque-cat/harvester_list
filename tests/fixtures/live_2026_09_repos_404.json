@@ -1,0 +1,21 @@
+{
+  "provenance": {
+    "endpoint": "GET https://api.github.com/repos/octocat/ThisRepoDoesNotExist-xyz-123",
+    "captured_at": "2026-09-13T00:30:45.353306+00:00",
+    "auth_mode": "bearer",
+    "api_version": "2022-11-28",
+    "accept": "application/vnd.github+json",
+    "owner": "octocat",
+    "repo": "ThisRepoDoesNotExist-xyz-123"
+  },
+  "status": 404,
+  "headers": {
+    "x-ratelimit-limit": "5000",
+    "x-ratelimit-remaining": "4995"
+  },
+  "body": {
+    "message": "Not Found",
+    "documentation_url": "https://docs.github.com/rest/repos/repos#get-a-repository",
+    "status": "404"
+  }
+}

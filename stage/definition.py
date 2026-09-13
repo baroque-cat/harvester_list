@@ -44,6 +44,21 @@ from .registry import register_stage
 logger = get_logger("stage")
 
 
+def _refresh_repo_meta(resources: StageResources, urls: List[str]) -> None:
+    """Lazily refresh stale/missing repository metadata (fail-open).
+
+    Consulted before a stage acts on repository-level evidence so the skip
+    evaluator and gather hook always see the freshest cached values.
+    """
+    enricher = getattr(resources, "enrichment", None)
+    if enricher is None or not getattr(enricher, "enabled", False):
+        return
+    try:
+        enricher.enrich_urls(urls)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"[enrichment] repository metadata refresh failed (fail-open): {e}")
+
+
 @register_stage(
     name=PipelineStage.SEARCH.value,
     depends_on=[],
@@ -199,6 +214,8 @@ class SearchStage(BasePipelineStage):
         engine = getattr(self.resources, "gather_skip", None)
         if engine is None or not engine.enabled:
             return {}
+        # Refresh stale repository metadata before evaluating push evidence.
+        _refresh_repo_meta(self.resources, links)
         try:
             digest = patterns_hash(
                 key_pattern=patterns.key_pattern,
@@ -428,6 +445,10 @@ class AcquisitionStage(BasePipelineStage):
                 model_pattern=task.model_pattern,
                 metadata=metadata,
             )
+
+            # Lazily enrich the gathered repository's metadata (cache-first;
+            # fail-open) so link rows carry repository push evidence.
+            _refresh_repo_meta(self.resources, [task.url])
 
             # Create output object
             output = StageOutput(task=task)

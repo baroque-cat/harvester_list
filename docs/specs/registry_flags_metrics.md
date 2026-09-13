@@ -3,9 +3,11 @@
 **Owning change:** `add-link-registry`
 **Status:** `registry.enabled` is implemented by `add-link-registry`;
 `skip_known` and its `skipped_known` / `regathered_*` / `push_signal_coverage`
-metrics are implemented by `add-gather-skip`. The remaining early-stop/check
-flags and their metrics are **defined now, emitted by later changes**, so
-later designs share one vocabulary and one trust model.
+metrics are implemented by `add-gather-skip`; the `enrichment.*` flag and
+`enrichment_fetches` / `enrichment_304s` / `enrichment_failures` / `repos_cached`
+/ `gone` metrics are implemented by `add-repo-meta-enrichment`. The remaining
+early-stop/check flags and their metrics are **defined now, emitted by later
+changes**, so later designs share one vocabulary and one trust model.
 
 ## Feature-flag matrix
 
@@ -16,6 +18,7 @@ decision is computed and logged but not applied.
 |------|--------|---------|--------|-------|-----------------|
 | `registry.enabled` | `true` / `false` | `false` | Record links, coverage and runs. No behavior change. | `add-link-registry` | No |
 | `skip_known` | `off` / `shadow` / `on` | `off` | Skip acquisition for links already `gathered_ok` for the provider + `patterns_hash` when the four-condition rule holds. | `add-gather-skip` | Yes |
+| `enrichment.enabled` | `true` / `false` | `false` | Fetch and TTL-cache repository metadata (`pushed_at`/`size_kb`/`default_branch`/ETag) and merge it into `links`. `off` is byte-for-byte inert. | `add-repo-meta-enrichment` | Yes (cache lives in `repos`) |
 | `early_stop` | `off` / `shadow` / `on` | `off` | Stop paging a search once enough known links dominate the page. | `add-search-early-stop` | Yes |
 | `check_skip` | `off` / `on` | `off` | Skip re-validating keys whose last check is fresh and conclusive. | `add-key-ledger` | Yes |
 | `recheck_cron` | `off` / `on` | `off` | Schedule periodic re-checks of previously-seen keys. | `add-key-ledger` | Yes |
@@ -46,10 +49,40 @@ per run unless noted.
 | `date_fill_rate_api` | Share of API search items that yielded a usable `repo_pushed_at` (documented **0.0 baseline**: the September 2026 live probe found trimmed `repository` objects without date/size fields — design D7; a sustained rise signals GitHub restored the fields or `add-repo-meta-enrichment` began feeding). Exposed per run in `PipelineStatus.date_metrics`. | `add-date-extraction` |
 | `date_fill_rate_web` | Share of gathered blob pages that yielded a `file_commit_date` (documented **0.0 baseline**: served blob HTML renders `<relative-time>` timestamps client-side — design D7; a sustained rise signals restored server-side markers). Exposed per run in `PipelineStatus.date_metrics`. | `add-date-extraction` |
 | `metadata_noops` | Date-metadata updates that matched no known link (the UPDATE-only merge never inserts phantom rows); logged once at debug level. Exposed by `Registry.get_stats()`. | `add-date-extraction` |
+| `enrichment_fetches` | Completed repository-metadata HTTP exchanges (`200`/`304`/`404`) issued for stale-or-missing cache entries. One per unique `(owner, repo)` per TTL window. | `add-repo-meta-enrichment` |
+| `enrichment_304s` | Subset of `enrichment_fetches` answered `304 Not Modified` (ETag conditional refresh). Zero rate-limit cost, touch-only `fetched_at` bump, no link merge. | `add-repo-meta-enrichment` |
+| `enrichment_failures` | Failed fetches (network/5xx/credential exhaustion) that degraded fail-open; warned once per enricher. | `add-repo-meta-enrichment` |
+| `repos_cached` | Successful `200` fetches that replaced/cached a `repos` row and re-triggered the link-column merge. | `add-repo-meta-enrichment` |
+| `gone` | Repositories answered `404` and marked `repos.gone=1`; retries are suppressed within TTL and existing link rows are preserved. | `add-repo-meta-enrichment` |
+| `cooling_skips` | **Diagnostic**: enrichment encounters yielded without requests because every API token was cooling down (non-blocking probe; transient — resumes in-run when a token recovers). Logged once at info level. | `add-repo-meta-enrichment` |
 
 `skip_known`, the four `regathered_*` counters and `push_signal_coverage` are
 flattened by `GatherSkipEngine.to_stats()` into `PipelineStatus.skip_metrics`
 and rendered on the status display only when the mode is `shadow` or `on`.
+
+`enrichment.*` counters are flattened by `RepoMetaEnricher.to_stats()` into
+`PipelineStatus.enrichment_metrics` and rendered only when the flag is enabled.
+With `enrichment.enabled=false` the enricher emits no metrics (`{"enabled":
+false}`) and performs zero requests or `repos` writes.
+
+## Enrichment semantics (`add-repo-meta-enrichment`)
+
+- **Cache-first / TTL.** The `repos` table is both cache and work ledger. A row
+  fresh within `enrichment.ttl_hours` is served with zero requests; only
+  stale-or-missing `(owner, repo)` pairs are fetched. Duplicate encounters
+  within a batch/run coalesce to one fetch.
+- **Conditional economics.** A stale refresh sends `If-None-Match: <stored
+  etag>`; a `304` bumps `fetched_at` only and enqueues no link merge. A `200`
+  replaces all cached values and merges `pushed_at`/`size_kb` into every
+  `links` row of that repository through the UPDATE-only COALESCE channel.
+- **Takedowns (`gone`).** A `404` sets `repos.gone=1`, suppresses retries within
+  TTL, and preserves existing link rows. The `gone` flag is the forward
+  contract for candidate export (change ⑥ `candidates_export.md`): dangling
+  commits in taken-down repositories become explicitly targetable rather than
+  silently lost.
+- **Tokenless asymmetry.** Without a usable `github_api` token the enricher
+  silently self-disables (zero requests, ≤1 info log, `disabled_tokenless`
+  surfaced); web-only deployments keep working exactly as before.
 
 ## Storage mapping
 

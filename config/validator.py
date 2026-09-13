@@ -59,6 +59,9 @@ class ConfigValidator:
         # Validate gather-skip configuration
         self._validate_skip_config(config)
 
+        # Validate repository metadata enrichment configuration
+        self._validate_enrichment_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -284,6 +287,28 @@ class ConfigValidator:
             self.warnings.append(
                 f"skip.skip_known='{skip.skip_known}' has no effect while registry.enabled is false "
                 "(no registry data to read; all links fail open to re-gather)"
+            )
+
+    def _validate_enrichment_config(self, config: Config) -> None:
+        """Validate repository metadata enrichment configuration section
+
+        Args:
+            config: Configuration object
+        """
+        enrichment = config.enrichment
+
+        if not isinstance(enrichment.enabled, bool):
+            self.errors.append("Enrichment enabled must be a boolean")
+
+        if enrichment.ttl_hours <= 0:
+            self.errors.append("Enrichment ttl_hours must be positive")
+
+        # Cross-check: the cache lives in the registry; without it enrichment
+        # has nowhere durable to read/write and silently degrades to a no-op.
+        if enrichment.enabled and not config.registry.enabled:
+            self.warnings.append(
+                "enrichment.enabled=true has no effect while registry.enabled is false "
+                "(no persistent repo cache; all fetches would be retried every encounter)"
             )
 
     def _validate_rate_limits(self, config: Config) -> None:

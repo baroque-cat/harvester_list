@@ -29,7 +29,7 @@ from tools.logger import get_logger
 logger = get_logger("storage")
 
 # Bump when the schema changes; later changes may only ADD columns/tables.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REGISTRY_FILENAME = "registry.sqlite"
 
 # Operations understood by the writer thread.
@@ -37,6 +37,10 @@ _OP_DISCOVER = "discover"
 _OP_GATHER = "gather"
 _OP_COVERAGE = "coverage"
 _OP_METADATA = "metadata"
+_OP_REPO_UPSERT = "repo_upsert"
+_OP_REPO_TOUCH = "repo_touch"
+_OP_REPO_GONE = "repo_gone"
+_OP_REPO_LINKS = "repo_links"
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS links(
@@ -84,6 +88,21 @@ CREATE TABLE IF NOT EXISTS runs(
   finished_at REAL,
   config_digest TEXT,
   degraded INTEGER NOT NULL DEFAULT 0
+);
+
+-- Repo-level metadata cache (add-repo-meta-enrichment D2).  Denormalized
+-- freshness is deliberately kept out of `links` so the acquisition channel is
+-- additive and independently migratable.
+CREATE TABLE IF NOT EXISTS repos(
+  owner TEXT NOT NULL,
+  repo TEXT NOT NULL,
+  pushed_at REAL,
+  size_kb INTEGER,
+  default_branch TEXT,
+  etag TEXT,
+  fetched_at REAL NOT NULL,
+  gone INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(owner, repo)
 );
 
 CREATE INDEX IF NOT EXISTS idx_links_repo ON links(owner, repo);
@@ -139,6 +158,52 @@ UPDATE links SET
   repo_size_kb = COALESCE(?, repo_size_kb),
   file_commit_date = COALESCE(?, file_commit_date)
 WHERE url_hash = ?
+"""
+
+# Repo-scoped metadata merge (add-repo-meta-enrichment D3/D2).  Same
+# non-regression contract as `_METADATA_SQL` but keyed by (owner, repo) so a
+# single successful fetch propagates to every link of the repository.
+# UPDATE-only on purpose: unknown repositories affect zero rows and never
+# fabricate phantom link rows.
+_REPO_LINKS_SQL = """
+UPDATE links SET
+  repo_pushed_at = COALESCE(?, repo_pushed_at),
+  repo_size_kb = COALESCE(?, repo_size_kb)
+WHERE owner = ? AND repo = ?
+"""
+
+# Full-replacement upsert for a 200 fetch (add-repo-meta-enrichment D3).  A 200
+# is a complete repository object, so absent (trimmed) fields deliberately
+# become NULL -- the opportunistic contract.
+_REPO_UPSERT_SQL = """
+INSERT INTO repos (owner, repo, pushed_at, size_kb, default_branch, etag, fetched_at, gone)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(owner, repo) DO UPDATE SET
+  pushed_at = excluded.pushed_at,
+  size_kb = excluded.size_kb,
+  default_branch = excluded.default_branch,
+  etag = excluded.etag,
+  fetched_at = excluded.fetched_at,
+  gone = excluded.gone
+"""
+
+# Touch-only refresh for a 304 (add-repo-meta-enrichment D3): bump fetched_at
+# and, defensively, refresh the etag without touching any value column.
+_REPO_TOUCH_SQL = """
+UPDATE repos SET
+  fetched_at = COALESCE(?, fetched_at),
+  etag = COALESCE(?, etag)
+WHERE owner = ? AND repo = ?
+"""
+
+# Takedown marker (add-repo-meta-enrichment D8): records gone=1 while keeping
+# any previously known values, so a temporary 404 never erases evidence.
+_REPO_GONE_SQL = """
+INSERT INTO repos (owner, repo, pushed_at, size_kb, default_branch, etag, fetched_at, gone)
+VALUES (?, ?, NULL, NULL, NULL, NULL, ?, 1)
+ON CONFLICT(owner, repo) DO UPDATE SET
+  fetched_at = excluded.fetched_at,
+  gone = 1
 """
 
 _RUN_UPSERT_SQL = """
@@ -486,6 +551,73 @@ class Registry:
         if items:
             self._enqueue(_OP_METADATA, {"items": items})
 
+    def record_repo_upsert(
+        self,
+        owner: str,
+        repo: str,
+        pushed_at: Optional[float] = None,
+        size_kb: Optional[int] = None,
+        default_branch: Optional[str] = None,
+        etag: Optional[str] = None,
+        ts: Optional[float] = None,
+        gone: int = 0,
+    ) -> None:
+        """Replace the cached repository metadata from a full 200 response."""
+        self._enqueue(
+            _OP_REPO_UPSERT,
+            {
+                "owner": owner or "",
+                "repo": repo or "",
+                "pushed_at": pushed_at,
+                "size_kb": size_kb,
+                "default_branch": default_branch,
+                "etag": etag,
+                "ts": time.time() if ts is None else float(ts),
+                "gone": 1 if gone else 0,
+            },
+        )
+
+    def record_repo_touch(self, owner: str, repo: str, ts: Optional[float] = None, etag: Optional[str] = None) -> None:
+        """Touch-only refresh after a 304 (fetched_at bump, values preserved)."""
+        self._enqueue(
+            _OP_REPO_TOUCH,
+            {
+                "owner": owner or "",
+                "repo": repo or "",
+                "ts": time.time() if ts is None else float(ts),
+                "etag": etag,
+            },
+        )
+
+    def record_repo_gone(self, owner: str, repo: str, ts: Optional[float] = None) -> None:
+        """Record a takedown (404) without erasing previously known values."""
+        self._enqueue(
+            _OP_REPO_GONE,
+            {
+                "owner": owner or "",
+                "repo": repo or "",
+                "ts": time.time() if ts is None else float(ts),
+            },
+        )
+
+    def record_repo_link_metadata(
+        self,
+        owner: str,
+        repo: str,
+        pushed_at: Optional[float] = None,
+        size_kb: Optional[int] = None,
+    ) -> None:
+        """Propagate repo metadata to every link of ``(owner, repo)`` (UPDATE-only)."""
+        self._enqueue(
+            _OP_REPO_LINKS,
+            {
+                "owner": owner or "",
+                "repo": repo or "",
+                "pushed_at": pushed_at,
+                "size_kb": size_kb,
+            },
+        )
+
     # ------------------------------------------------------------------
     # Run journaling (low frequency, written synchronously)
     # ------------------------------------------------------------------
@@ -588,6 +720,10 @@ class Registry:
         gathers = [payload for op, payload in batch if op == _OP_GATHER]
         coverages = [payload for op, payload in batch if op == _OP_COVERAGE]
         metadatas = [payload["items"] for op, payload in batch if op == _OP_METADATA]
+        repo_upserts = [payload for op, payload in batch if op == _OP_REPO_UPSERT]
+        repo_touches = [payload for op, payload in batch if op == _OP_REPO_TOUCH]
+        repo_gones = [payload for op, payload in batch if op == _OP_REPO_GONE]
+        repo_links = [payload for op, payload in batch if op == _OP_REPO_LINKS]
 
         with self._write_lock:
             conn = self._conn
@@ -615,6 +751,14 @@ class Registry:
                             "[registry] metadata update matched no existing link rows "
                             f"({len(rows)} observations ignored)"
                         )
+            if repo_upserts:
+                conn.executemany(_REPO_UPSERT_SQL, [self._repo_upsert_row(payload) for payload in repo_upserts])
+            if repo_touches:
+                conn.executemany(_REPO_TOUCH_SQL, [self._repo_touch_row(payload) for payload in repo_touches])
+            if repo_gones:
+                conn.executemany(_REPO_GONE_SQL, [self._repo_gone_row(payload) for payload in repo_gones])
+            if repo_links:
+                conn.executemany(_REPO_LINKS_SQL, [self._repo_links_row(payload) for payload in repo_links])
 
             conn.commit()
 
@@ -672,6 +816,31 @@ class Registry:
         digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()
         # Keyed by url_hash: metadata only updates rows already discovered.
         return (repo_pushed_at, repo_size_kb, file_commit_date, digest)
+
+    @staticmethod
+    def _repo_upsert_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (
+            payload["owner"],
+            payload["repo"],
+            payload["pushed_at"],
+            payload["size_kb"],
+            payload["default_branch"],
+            payload["etag"],
+            payload["ts"],
+            payload["gone"],
+        )
+
+    @staticmethod
+    def _repo_touch_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (payload["ts"], payload["etag"], payload["owner"], payload["repo"])
+
+    @staticmethod
+    def _repo_gone_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (payload["owner"], payload["repo"], payload["ts"])
+
+    @staticmethod
+    def _repo_links_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (payload["pushed_at"], payload["size_kb"], payload["owner"], payload["repo"])
 
     def _enqueue(self, op: str, payload: Dict[str, Any]) -> None:
         if not self.enabled or not self._available or self._suppress_writes:

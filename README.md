@@ -982,6 +982,60 @@ rollout — while `push_signal_coverage` is near 0 the measurement validates the
 TTL-only regime only. The step-by-step procedure lives in
 `docs/specs/registry_flags_metrics.md`.
 
+### Repository metadata enrichment (`enrichment.enabled`)
+
+Optional, default-off restoration of repository-level freshness evidence that
+the September 2026 probe lost to trimmed search payloads. It fetches
+`GET /repos/{owner}/{repo}` through the shared `github_api` client (adaptive
+bucket, cooldown, credential rotation, `Retry-After`/`X-RateLimit-Reset`) and
+caches the result in the registry's `repos` table, which doubles as the work
+ledger. It needs `registry.enabled: true` for a durable cache.
+
+```yaml
+enrichment:
+  enabled: false        # default off; byte-for-byte inert when off
+  ttl_hours: 24         # cache freshness before a conditional refresh
+```
+
+**Quota model.** Cost is bounded by unique repositories, not by links:
+
+- First sighting of a repository in a run: at most **one request per unique
+  `(owner, repo)` per TTL window**, regardless of how many links point at it
+  (duplicate encounters coalesce to one fetch).
+- A TTL-expired entry is refreshed conditionally with
+  `If-None-Match: <stored etag>`. An unchanged repo answers `304 Not Modified`:
+  GitHub charges **zero** rate-limit units, only `fetched_at` advances, and no
+  link merge runs. Only a genuine `200` (repo changed) replaces values and
+  propagates `pushed_at`/`size_kb` into the repository's `links` rows via the
+  existing UPDATE-only COALESCE channel.
+- A repository that was taken down answers `404`: it is marked `gone=1`,
+  retries are suppressed within TTL, and existing link rows are preserved (no
+  silent cleanup). The `gone` flag is the forward contract for candidate export
+  so dangling commits stay targetable.
+- Transient failures (network/5xx/credential exhaustion) degrade **fail-open**:
+  link dates stay NULL, a warning is logged once, and the pipeline proceeds.
+
+The steady-state cost therefore decays toward one cheap conditional request per
+unique repository per TTL window, with 304s dominating once the corpus is warm.
+
+**Tokenless asymmetry.** Enrichment needs an API token; web sessions cannot
+call the REST endpoint. With no usable token the enricher silently
+self-disables — zero requests, dates stay NULL, at most one informational log
+line, and the web-only pipeline is unaffected. When every API token is cooling
+down, enrichment transiently yields instead of blocking (zero requests,
+`cooling_skips` counter, one info log) and resumes within the same run once a
+token recovers — search keeps its own blocking cooldown policy untouched.
+
+**Metrics.** `enrichment_fetches`, `enrichment_304s`, `enrichment_failures`,
+`repos_cached` and `gone` are exposed in `PipelineStatus.enrichment_metrics` and
+the status display when enabled (nothing is emitted while `off`).
+
+**Rollback:** set `enrichment.enabled: false` — a config flip; the `repos`
+cache simply stops being consulted and no code is removed.
+
+See `docs/specs/registry_flags_metrics.md` for the flag/metrics dictionary and
+the enrichment semantics.
+
 ## Troubleshooting
 
 ### **Common Issues**

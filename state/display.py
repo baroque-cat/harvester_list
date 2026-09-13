@@ -315,6 +315,7 @@ class StatusDisplayEngine:
         lines: List[str] = []
         date_line = self._format_date_metrics_line(status)
         skip_line = self._format_skip_metrics_line(status)
+        enrichment_line = self._format_enrichment_metrics_line(status)
 
         if not status.pipeline.stages:
             lines.append("No pipeline data available")
@@ -322,6 +323,8 @@ class StatusDisplayEngine:
                 lines.append(date_line)
             if skip_line:
                 lines.append(skip_line)
+            if enrichment_line:
+                lines.append(enrichment_line)
             return lines
 
         # Table header
@@ -350,6 +353,9 @@ class StatusDisplayEngine:
 
         if skip_line:
             lines.append(skip_line)
+
+        if enrichment_line:
+            lines.append(enrichment_line)
 
         return lines
 
@@ -382,6 +388,21 @@ class StatusDisplayEngine:
             f"t={metrics.get('regathered_ttl_expired', 0)},"
             f"f={metrics.get('regathered_failed_retry', 0)}] "
             f"push={metrics.get('push_signal_coverage', 0.0):.3f}"
+        )
+
+    @staticmethod
+    def _format_enrichment_metrics_line(status: SystemStatus) -> str:
+        """Render the repo-metadata enrichment counter line (enabled only)."""
+        metrics = getattr(status.pipeline, "enrichment_metrics", None)
+        if not metrics or not metrics.get("enabled", False):
+            return ""
+        suffix = " tokenless" if metrics.get("disabled_tokenless") else ""
+        return (
+            f"Enrichment: fetches={metrics.get('enrichment_fetches', 0)} "
+            f"304={metrics.get('enrichment_304s', 0)} "
+            f"fail={metrics.get('enrichment_failures', 0)} "
+            f"cached={metrics.get('repos_cached', 0)} "
+            f"gone={metrics.get('gone', 0)}{suffix}"
         )
 
     def _format_provider_section(self, status: SystemStatus) -> List[str]:

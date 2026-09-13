@@ -190,6 +190,9 @@ class PipelineStatus:
     # Gather-skip decision counters/reasons (empty until wired).
     skip_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Repository metadata enrichment counters (empty while disabled).
+    enrichment_metrics: Dict[str, Any] = field(default_factory=dict)
+
     def queue_size(self) -> int:
         """Get total queue size across all stages"""
         return sum(stage.queue_size for stage in self.stages.values())

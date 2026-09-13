@@ -21,6 +21,7 @@ from stage.resolver import DependencyResolver
 from storage.persistence import MultiResultManager
 from storage.gather_skip import GatherSkipEngine
 from storage.registry import Registry, config_digest as build_config_digest, init_registry
+from storage.repo_meta import RepoMetaEnricher, RepoMetaStore, tokens_cooling_down
 from tools.coordinator import get_session, get_token, get_user_agent
 from tools.logger import get_logger
 from tools.ratelimit import RateLimiter
@@ -86,6 +87,23 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
 
         # Initialize GitHub client rate limiter
         client.init_github_client(config.ratelimits)
+
+        # Repo-metadata enrichment (off by default).  The cache is the registry
+        # and the enricher rides the shared github_api client/buckets.
+        self.repo_meta_store = RepoMetaStore(
+            workspace=config.global_config.workspace,
+            ttl_hours=config.enrichment.ttl_hours,
+            registry=self.link_registry,
+            registry_path=self.link_registry.path,
+        )
+        self.enrichment = RepoMetaEnricher(
+            self.repo_meta_store,
+            auth=get_auth_provider(),
+            client=client.get_github_client(),
+            enabled=config.enrichment.enabled,
+            ttl_hours=config.enrichment.ttl_hours,
+            cooling_probe=tokens_cooling_down,
+        )
 
         self.queue_manager = QueueManager(
             workspace=config.global_config.workspace,
@@ -165,6 +183,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             registry=self.link_registry,
             date_metrics=self.date_metrics,
             gather_skip=self.gather_skip,
+            enrichment=self.enrichment,
         )
 
         # Create stages in dependency order
@@ -229,6 +248,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         # Drain and close the registry before result managers flush
         self.link_registry.stop()
         self.gather_skip.close()
+        self.enrichment.close()
 
         # Stop managers
         self.queue_manager.stop()
@@ -302,6 +322,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             runtime=time.time() - self.start_time,
             date_metrics=self.date_metrics.to_stats(),
             skip_metrics=self.gather_skip.to_stats(),
+            enrichment_metrics=self.enrichment.to_stats(),
         )
 
         return pipeline_status

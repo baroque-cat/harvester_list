@@ -208,6 +208,15 @@ skip:
   # invalidation is applied on top whenever repo_pushed_at is available
   gather_ttl_hours: 168
 
+# Repository metadata enrichment configuration (add-repo-meta-enrichment)
+# Uses authenticated GET /repos/{owner}/{repo}, TTL-cached in the registry
+# (requires registry.enabled for a durable cache). Default is off.
+enrichment:
+  # Enable the ETag-conditioned repository metadata cache
+  enabled: false
+  # Cache freshness TTL in hours before a conditional (If-None-Match) refresh
+  ttl_hours: 24
+
 # Global rate limiting configuration
 ratelimits:
   # GitHub API rate limits

@@ -391,6 +391,116 @@ class GitHubClient:
 
         return content, response_headers
 
+    def get_with_status(
+        self,
+        url: str,
+        headers: Optional[Dict] = None,
+        params: Optional[Dict] = None,
+        retries: int = 3,
+        interval: float = 0,
+        timeout: float = 10,
+        credential: Optional[str] = None,
+    ) -> Tuple[int, str, Dict[str, str]]:
+        """Rate-limited GET that surfaces the HTTP status (conditional requests).
+
+        Unlike :meth:`get_with_headers`, a 4xx status is returned to the caller
+        instead of raising, which is required to distinguish ``304``/``404``
+        enrichment outcomes.  ``GithubCredentialLimited`` still propagates so
+        callers can rotate credentials.
+        """
+        service = self._service(url)
+
+        if service and not self._limit(service, credential):
+            logger.debug(f"Rate limit acquisition failed for {service}")
+            return 0, "", {}
+
+        status, content, response_headers = self._http_get_status(url, headers, params, retries, interval, timeout)
+        ok = status in (200, 304, 404)
+
+        self._report(service, ok, credential)
+
+        if (
+            service
+            and credential
+            and status not in (304, 404)
+            and self.is_rate_limited_content(service, content)
+        ):
+            self.mark_credential_limited(
+                service=service,
+                credential=credential,
+                headers=response_headers,
+                content=content,
+                reason="response content indicates rate limit",
+            )
+
+        if service and credential and ok:
+            github_credential_state.mark_success(service, credential)
+
+        return status, content, response_headers
+
+    def _http_get_status(
+        self,
+        url: str,
+        headers: Optional[Dict] = None,
+        params: Optional[Dict] = None,
+        retries: int = 3,
+        interval: float = 1.0,
+        timeout: float = 10,
+    ) -> Tuple[int, str, Dict[str, str]]:
+        """HTTP GET preserving the status code (mirrors ``_http_get`` retries)."""
+        if isblank(url):
+            raise ValidationError("URL cannot be empty", field="url")
+
+        headers = headers or DEFAULT_HEADERS.copy()
+        timeout = max(1, timeout)
+        retries = max(1, retries)
+        interval = max(0.1, interval)
+        encoded_url = self._build_url(url, params)
+        last_error: Optional[Exception] = None
+
+        for attempt in range(retries):
+            try:
+                with managed_network(
+                    request("GET", encoded_url, headers=headers, timeout=timeout), "http_connection"
+                ) as response:
+                    status = int(getattr(response, "status_code", 200) or 200)
+                    return status, self._decode_response(response.content), dict(response.headers)
+            except GithubCredentialLimited:
+                raise
+            except requests.exceptions.HTTPError as e:
+                code = http_error_status(e)
+                reason = http_error_message(e)
+                response_headers = dict(e.response.headers) if e.response is not None else {}
+                if self._is_http_rate_limited(code, reason):
+                    service = self._service(url)
+                    credential = self._credential_from_headers(headers or {}, service)
+                    if service and credential:
+                        self.mark_credential_limited(service, credential, response_headers, reason, reason)
+
+                if code == 429 or code >= 500:
+                    last_error = ConnectionError(f"HTTP {code} error: {reason}")
+                elif code in (401, 402, 403):
+                    raise NetworkError(f"Authentication failed (HTTP {code})")
+                else:
+                    # 4xx (404, 400, 422, ...): hand the status to the caller.
+                    return code, "", response_headers
+            except requests.exceptions.Timeout as e:
+                last_error = TimeoutError(f"Request timeout: {e}")
+            except requests.exceptions.RequestException as e:
+                last_error = ConnectionError(f"Request error: {e}")
+            except Exception as e:
+                if "timeout" in str(e).lower():
+                    last_error = TimeoutError(f"Request timeout: {e}")
+                else:
+                    raise NetworkError(f"Unexpected error: {e}")
+
+            if attempt < retries - 1 and last_error:
+                time.sleep(interval * (2**attempt) + random.random() * 0.1)
+
+        if last_error:
+            raise last_error
+        return 0, "", {}
+
     def mark_credential_limited(
         self,
         service: str,

@@ -337,6 +337,28 @@ class SkipConfig:
 
 
 @dataclass
+class EnrichmentConfig:
+    """Repository metadata enrichment configuration (add-repo-meta-enrichment).
+
+    ``enabled`` defaults to off so the subsystem is byte-for-byte inert until an
+    operator opts in.  ``ttl_hours`` bounds how long a cached ``repos`` row is
+    trusted before a conditional refresh is attempted.
+    """
+
+    enabled: bool = False
+    ttl_hours: float = 24.0
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_enrichment_config on purpose: this
+        # guards direct (non-loader) construction in tests and embedding.
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enrichment.enabled must be a boolean")
+        self.ttl_hours = float(self.ttl_hours)
+        if self.ttl_hours <= 0:
+            raise ValueError("enrichment.ttl_hours must be positive")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
 
@@ -461,6 +483,7 @@ class Config:
     worker: WorkerManagerConfig = field(default_factory=WorkerManagerConfig)
     registry: RegistryConfig = field(default_factory=RegistryConfig)
     skip: SkipConfig = field(default_factory=SkipConfig)
+    enrichment: EnrichmentConfig = field(default_factory=EnrichmentConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -481,13 +504,13 @@ class Config:
         return {
             "global": self._dataclass_to_dict(self.global_config),
             "pipeline": self._dataclass_to_dict(self.pipeline),
-            "stats": self._dataclass_to_dict(self.stats),
             "monitoring": self._dataclass_to_dict(self.monitoring),
             "display": self._dataclass_to_dict(self.display),
             "persistence": self._dataclass_to_dict(self.persistence),
             "worker": self._dataclass_to_dict(self.worker),
             "registry": self._dataclass_to_dict(self.registry),
             "skip": self._dataclass_to_dict(self.skip),
+            "enrichment": self._dataclass_to_dict(self.enrichment),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

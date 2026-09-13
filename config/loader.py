@@ -27,6 +27,7 @@ from .schemas import (
     CredentialsConfig,
     DisplayConfig,
     DisplayContextConfig,
+    EnrichmentConfig,
     GlobalConfig,
     LoadBalanceStrategy,
     MonitoringConfig,
@@ -116,6 +117,10 @@ class ConfigLoader:
         # Parse gather-skip configuration
         if "skip" in data:
             config.skip = self._parse_skip_config(data["skip"])
+
+        # Parse repository metadata enrichment configuration
+        if "enrichment" in data:
+            config.enrichment = self._parse_enrichment_config(data["enrichment"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -306,6 +311,20 @@ class ConfigLoader:
         return SkipConfig(
             skip_known=data.get("skip_known", "off"),
             gather_ttl_hours=data.get("gather_ttl_hours", 168.0),
+        )
+
+    def _parse_enrichment_config(self, data: Dict[str, Any]) -> EnrichmentConfig:
+        """Parse repository metadata enrichment configuration section
+
+        Args:
+            data: Enrichment configuration data
+
+        Returns:
+            EnrichmentConfig: Parsed enrichment configuration
+        """
+        return EnrichmentConfig(
+            enabled=data.get("enabled", False),
+            ttl_hours=data.get("ttl_hours", 24.0),
         )
 
     def _parse_rate_limits(self, data: Dict[str, Any]) -> Dict[str, RateLimitConfig]:
