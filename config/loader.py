@@ -27,6 +27,7 @@ from .schemas import (
     CredentialsConfig,
     DisplayConfig,
     DisplayContextConfig,
+    EarlyStopConfig,
     EnrichmentConfig,
     GlobalConfig,
     LoadBalanceStrategy,
@@ -121,6 +122,10 @@ class ConfigLoader:
         # Parse repository metadata enrichment configuration
         if "enrichment" in data:
             config.enrichment = self._parse_enrichment_config(data["enrichment"])
+
+        # Parse frontier-based early-stop configuration
+        if "early_stop" in data:
+            config.early_stop = self._parse_early_stop_config(data["early_stop"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -325,6 +330,23 @@ class ConfigLoader:
         return EnrichmentConfig(
             enabled=data.get("enabled", False),
             ttl_hours=data.get("ttl_hours", 24.0),
+        )
+
+    def _parse_early_stop_config(self, data: Dict[str, Any]) -> EarlyStopConfig:
+        """Parse frontier-based early-stop configuration section
+
+        Args:
+            data: Early-stop configuration data
+
+        Returns:
+            EarlyStopConfig: Parsed early-stop configuration
+        """
+        return EarlyStopConfig(
+            mode=data.get("mode", "off"),
+            window=data.get("window", 100),
+            theta=data.get("theta", 0.9),
+            min_pages=data.get("min_pages", 2),
+            min_trust=data.get("min_trust", 1000),
         )
 
     def _parse_rate_limits(self, data: Dict[str, Any]) -> Dict[str, RateLimitConfig]:

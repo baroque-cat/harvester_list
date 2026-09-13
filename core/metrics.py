@@ -193,6 +193,9 @@ class PipelineStatus:
     # Repository metadata enrichment counters (empty while disabled).
     enrichment_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # API pagination early-stop counters (empty while off).
+    early_stop_metrics: Dict[str, Any] = field(default_factory=dict)
+
     def queue_size(self) -> int:
         """Get total queue size across all stages"""
         return sum(stage.queue_size for stage in self.stages.values())

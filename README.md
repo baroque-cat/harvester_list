@@ -1036,6 +1036,82 @@ cache simply stops being consulted and no code is removed.
 See `docs/specs/registry_flags_metrics.md` for the flag/metrics dictionary and
 the enrichment semantics.
 
+### API pagination early-stop (`early_stop.mode`)
+
+Optional, default-off termination of deeper API pagination once a refined
+partition's result stream is saturated with already-researched links. Because
+GitHub's `sort=indexed&order=desc` returns freshly-indexed files first, once the
+frontier (the boundary between new and already-researched content) is behind the
+window, deeper pages are re-runs of the past — a repeat run becomes delta
+collection. It needs `registry.enabled: true` to classify links and to pass the
+trust gate.
+
+```yaml
+early_stop:
+  mode: "off"      # off | shadow | on
+  window: 100      # trailing result identities in the ratio window
+  theta: 0.9       # known-ratio threshold in [0.5, 1.0]
+  min_pages: 2     # never stop on the first page(s)
+  min_trust: 1000  # minimum links rows before the trust gate can pass
+```
+
+**Four independent gates.** A partition stops only when ALL hold, so every
+failure mode is biased toward a full pass:
+
+1. **Ratio** — the trailing window of `window` de-duplicated result identities
+   is at least `theta` known.
+2. **Page floor** — at least `min_pages` pages were fetched (never page 1).
+3. **Trust gate** — `COUNT(links) >= min_trust`, the one-time
+   `tools.registry_migrate` completed (`meta.migration_complete`), and the run
+   is not degraded.
+4. **Kill-switch** — any registry read/write error during the run mutes
+   stopping until the run ends.
+
+Gate 3 needs the one-time migration marker. On a fresh workspace run
+`python -m tools.registry_migrate --workspace ./data` once (it is idempotent and
+harmless with nothing to import) so `meta.migration_complete` exists; without
+it early-stop stays safely inert.
+
+**"Known" is gather-skip.** A result counts as known only when the amended
+gather-skip conjunction would skip it (`gathered_ok` ∧ within
+`skip.gather_ttl_hours` ∧ no push invalidation ∧ coverage for the current
+provider/patterns). Discovered-only, foreign-coverage, TTL-expired and failed
+links all count as novel, so a corpus due for a re-gather keeps early-stop
+inert while that work is genuinely needed.
+
+**Modes**
+- `off` (default): the detector never evaluates; pagination is byte-for-byte
+  unchanged.
+- `shadow`: each partition's first saturation point is logged as a
+  `type: "early_stop"` record in `<workspace>/registry_decisions.jsonl`, and
+  every page is still fetched. The run then reports `novel_after_stop` — how
+  many links that still require research arrived after the hypothetical stop —
+  making the false-stop price a measured number before enforcement.
+- `on`: computed stops are enforced; no page task is emitted beyond the stop
+  point.
+
+**API transport only.** Web results are relevance-ordered, so saturation there
+carries no information; the detector is inert for web tasks at code level and
+web pagination remains byte-for-byte as before regardless of the flag.
+
+**Tuning `theta` and `window`.** `theta` (validated to `[0.5, 1.0]`) is the
+aggressiveness dial: higher stops only on nearly-pure known windows, lower saves
+more quota at higher false-stop risk. `window` (default 100) spans roughly one
+API page, so the ratio reflects the current frontier rather than run history.
+For a first rollout keep the conservative default `0.9`, promote only after a
+`shadow` period shows `novel_after_stop ≈ 0` across diverse query sets, and
+lower `theta` only with measurement. Per-provider tuning is safe — both are
+plain config.
+
+Per-run counters `early_stop_would_fire`, `early_stop_fired` and
+`novel_after_stop` are exposed in `PipelineStatus.early_stop_metrics` and the
+status display (`shadow`/`on` only).
+
+**Rollback:** set `early_stop.mode: shadow` or `off` — a config flip, no code
+removal. A run whose registry was degraded is not a trustworthy source of
+"known" counts, so early-stop is muted for that run. The promotion gate
+procedure lives in `docs/specs/registry_flags_metrics.md`.
+
 ## Troubleshooting
 
 ### **Common Issues**

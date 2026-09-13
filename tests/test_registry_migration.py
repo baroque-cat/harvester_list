@@ -81,6 +81,16 @@ def test_s22_migration_never_regresses_live_data(workspace, db_rows, db_scalar, 
     assert db_scalar(workspace, "SELECT COUNT(*) FROM links") == 1
 
 
+def test_migration_writes_early_stop_trust_marker(workspace, db_scalar, write_links_shard):
+    """Task 3.1: a successful migration marks it complete for the trust gate."""
+    write_links_shard(workspace, "openai", [URL_A], first_ts=1000.0, last_ts=1100.0)
+
+    migrate_workspace(workspace)
+
+    assert db_scalar(workspace, "SELECT COUNT(*) FROM meta WHERE key = 'migration_complete'") == 1
+    assert db_scalar(workspace, "SELECT value FROM meta WHERE key = 'migration_complete'") is not None
+
+
 def test_migration_dry_run_writes_nothing(workspace, registry_path, write_links_shard):
     """Supporting check for --dry-run: no registry file is created."""
     write_links_shard(workspace, "openai", [URL_A], first_ts=1000.0, last_ts=1100.0)

@@ -62,6 +62,9 @@ class ConfigValidator:
         # Validate repository metadata enrichment configuration
         self._validate_enrichment_config(config)
 
+        # Validate frontier-based early-stop configuration
+        self._validate_early_stop_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -309,6 +312,38 @@ class ConfigValidator:
             self.warnings.append(
                 "enrichment.enabled=true has no effect while registry.enabled is false "
                 "(no persistent repo cache; all fetches would be retried every encounter)"
+            )
+
+    def _validate_early_stop_config(self, config: Config) -> None:
+        """Validate frontier-based early-stop configuration section
+
+        Args:
+            config: Configuration object
+        """
+        early_stop = config.early_stop
+
+        if early_stop.mode not in ("off", "shadow", "on"):
+            self.errors.append("Early stop mode must be one of: off, shadow, on")
+
+        if early_stop.window <= 0:
+            self.errors.append("Early stop window must be positive")
+
+        if not (0.5 <= early_stop.theta <= 1.0):
+            self.errors.append("Early stop theta must be between 0.5 and 1.0")
+
+        if early_stop.min_pages < 1:
+            self.errors.append("Early stop min_pages must be at least 1")
+
+        if early_stop.min_trust < 0:
+            self.errors.append("Early stop min_trust must be non-negative")
+
+        # Cross-check: the detector reads the registry for both "known"
+        # classification and the trust gate; without it every evaluation fails
+        # open and the flag silently degrades to a no-op.
+        if early_stop.mode != "off" and not config.registry.enabled:
+            self.warnings.append(
+                f"early_stop.mode='{early_stop.mode}' has no effect while registry.enabled is false "
+                "(no registry data to classify; all windows fail open to full passes)"
             )
 
     def _validate_rate_limits(self, config: Config) -> None:

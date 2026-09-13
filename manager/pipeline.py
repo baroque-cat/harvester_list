@@ -19,6 +19,7 @@ from stage.base import BasePipelineStage, StageOutput, StageResources, StageUtil
 from stage.registry import StageRegistryMixin
 from stage.resolver import DependencyResolver
 from storage.persistence import MultiResultManager
+from storage.early_stop import EarlyStopEngine
 from storage.gather_skip import GatherSkipEngine
 from storage.registry import Registry, config_digest as build_config_digest, init_registry
 from storage.repo_meta import RepoMetaEnricher, RepoMetaStore, tokens_cooling_down
@@ -77,6 +78,24 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             mode=config.skip.skip_known,
             ttl_hours=config.skip.gather_ttl_hours,
             registry_path=self.link_registry.path,
+        )
+
+        # Frontier-based API pagination early-stop detector (off by default;
+        # API transport only).  "Known" reuses gather-skip semantics and the
+        # kill-switch is the existing registry degraded flag.
+        self.early_stop = EarlyStopEngine(
+            workspace=config.global_config.workspace,
+            mode=config.early_stop.mode,
+            window=config.early_stop.window,
+            theta=config.early_stop.theta,
+            min_pages=config.early_stop.min_pages,
+            min_trust=config.early_stop.min_trust,
+            ttl_hours=config.skip.gather_ttl_hours,
+            registry_path=self.link_registry.path,
+            degraded_probe=lambda: self.link_registry.degraded,
+            # Share the gather-skip engine so its registry read errors (the
+            # spec kill-switch) also mute early-stop for the run.
+            skip_engine=self.gather_skip,
         )
 
         # Date-extraction fill-rate observability (per run, fail-open).
@@ -184,6 +203,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             date_metrics=self.date_metrics,
             gather_skip=self.gather_skip,
             enrichment=self.enrichment,
+            early_stop=self.early_stop,
         )
 
         # Create stages in dependency order
@@ -249,6 +269,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         self.link_registry.stop()
         self.gather_skip.close()
         self.enrichment.close()
+        self.early_stop.close()
 
         # Stop managers
         self.queue_manager.stop()
@@ -262,6 +283,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             if self.link_registry.available:
                 self.link_registry.start_run(config_digest=build_config_digest(self.config))
                 self.gather_skip.run_id = self.link_registry.run_id
+                self.early_stop.run_id = self.link_registry.run_id
         except Exception as e:
             logger.warning(f"Failed to journal registry run start: {e}")
             self.link_registry.mark_degraded()
@@ -323,6 +345,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             date_metrics=self.date_metrics.to_stats(),
             skip_metrics=self.gather_skip.to_stats(),
             enrichment_metrics=self.enrichment.to_stats(),
+            early_stop_metrics=self.early_stop.to_stats(),
         )
 
         return pipeline_status

@@ -49,6 +49,7 @@ class StageResources:
     date_metrics: Any = None  # DateFillMetrics accumulator (fail-open observability)
     gather_skip: Any = None  # GatherSkipEngine (add-gather-skip; off by default)
     enrichment: Any = None  # RepoMetaEnricher (add-repo-meta-enrichment; off by default)
+    early_stop: Any = None  # EarlyStopEngine (add-search-early-stop; off by default)
 
     def is_enabled(self, provider: str, stage: str) -> bool:
         """Check if stage is enabled for provider"""

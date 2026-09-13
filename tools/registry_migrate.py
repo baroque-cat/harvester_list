@@ -22,6 +22,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from storage.registry import (
@@ -329,6 +330,13 @@ def migrate_workspace(
                 conn.executemany(_MIGRATE_LINK_SQL, link_rows)
             if key_rows:
                 conn.executemany(_MIGRATE_KEY_SQL, key_rows)
+            # Trust marker for add-search-early-stop: proves the one-time shard
+            # migration completed so early-stop may enforce (design D4).
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('migration_complete', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(time.time()),),
+            )
             conn.commit()
         finally:
             conn.close()

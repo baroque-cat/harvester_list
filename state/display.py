@@ -316,6 +316,7 @@ class StatusDisplayEngine:
         date_line = self._format_date_metrics_line(status)
         skip_line = self._format_skip_metrics_line(status)
         enrichment_line = self._format_enrichment_metrics_line(status)
+        early_stop_line = self._format_early_stop_metrics_line(status)
 
         if not status.pipeline.stages:
             lines.append("No pipeline data available")
@@ -325,6 +326,8 @@ class StatusDisplayEngine:
                 lines.append(skip_line)
             if enrichment_line:
                 lines.append(enrichment_line)
+            if early_stop_line:
+                lines.append(early_stop_line)
             return lines
 
         # Table header
@@ -356,6 +359,9 @@ class StatusDisplayEngine:
 
         if enrichment_line:
             lines.append(enrichment_line)
+
+        if early_stop_line:
+            lines.append(early_stop_line)
 
         return lines
 
@@ -403,6 +409,19 @@ class StatusDisplayEngine:
             f"fail={metrics.get('enrichment_failures', 0)} "
             f"cached={metrics.get('repos_cached', 0)} "
             f"gone={metrics.get('gone', 0)}{suffix}"
+        )
+
+    @staticmethod
+    def _format_early_stop_metrics_line(status: SystemStatus) -> str:
+        """Render the early-stop counter line (shadow/on only)."""
+        metrics = getattr(status.pipeline, "early_stop_metrics", None)
+        if not metrics or metrics.get("mode", "off") == "off":
+            return ""
+        return (
+            f"EarlyStop: mode={metrics.get('mode', 'off')} "
+            f"fired={metrics.get('early_stop_fired', 0)} "
+            f"would_fire={metrics.get('early_stop_would_fire', 0)} "
+            f"novel_after_stop={metrics.get('novel_after_stop', 0)}"
         )
 
     def _format_provider_section(self, status: SystemStatus) -> List[str]:

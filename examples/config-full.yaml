@@ -217,6 +217,23 @@ enrichment:
   # Cache freshness TTL in hours before a conditional (If-None-Match) refresh
   ttl_hours: 24
 
+# Frontier-based API pagination early-stop configuration
+# (add-search-early-stop; API transport only, gated by registry trust)
+early_stop:
+  # Rollout policy: off | shadow | on
+  #   off    - detector never evaluates, unchanged pagination
+  #   shadow - log would_stop_at decisions, still fetch every page
+  #   on     - stop requesting deeper pages once a partition is saturated
+  mode: "off"
+  # Trailing result identities the known-ratio is computed over (default 100)
+  window: 100
+  # Known-ratio threshold in [0.5, 1.0] (default 0.9); lower stops earlier
+  theta: 0.9
+  # Minimum pages fetched before a stop may fire (default 2; never the first)
+  min_pages: 2
+  # Minimum links rows for the trust gate (below this, full passes are forced)
+  min_trust: 1000
+
 # Global rate limiting configuration
 ratelimits:
   # GitHub API rate limits

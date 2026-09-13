@@ -29,7 +29,7 @@ from tools.logger import get_logger
 logger = get_logger("storage")
 
 # Bump when the schema changes; later changes may only ADD columns/tables.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 REGISTRY_FILENAME = "registry.sqlite"
 
 # Operations understood by the writer thread.
@@ -103,6 +103,14 @@ CREATE TABLE IF NOT EXISTS repos(
   fetched_at REAL NOT NULL,
   gone INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(owner, repo)
+);
+
+-- Additive key/value markers (add-search-early-stop D4).  The trust gate reads
+-- `migration_complete=<ts>` written by tools/registry_migrate.py to prove the
+-- one-time shard migration has run before early-stop may enforce.
+CREATE TABLE IF NOT EXISTS meta(
+  key TEXT PRIMARY KEY,
+  value TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_links_repo ON links(owner, repo);

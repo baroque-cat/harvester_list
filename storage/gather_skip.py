@@ -157,6 +157,11 @@ class GatherSkipEngine:
         with self._stat_lock:
             return set(self._logged_error_kinds)
 
+    def has_read_errors(self) -> bool:
+        """Thread-safe kill-switch probe: True once any lookup has errored."""
+        with self._stat_lock:
+            return self.read_errors > 0
+
     # ------------------------------------------------------------------
     # Decision path
     # ------------------------------------------------------------------
@@ -188,6 +193,32 @@ class GatherSkipEngine:
             if decision.skip:
                 self._log_decision(decision, provider)
         return decisions
+
+    def classify(
+        self,
+        urls: Sequence[str],
+        provider: str,
+        patterns_hash: str,
+        now: Optional[float] = None,
+    ) -> List[SkipDecision]:
+        """Read-only classification with no counters and no decision logging.
+
+        Consumers such as early-stop frontier detection need the exact same
+        conjunctive "known" rule as gather-skip but must not double-count skip
+        decisions or append duplicate skip records.  Fails open exactly like
+        ``decide``: errored lookups and missing rows yield non-skipped
+        decisions.
+        """
+        url_list = [url for url in (urls or []) if url]
+        if not url_list:
+            return []
+        try:
+            links, covered = self._lookup(url_list, provider, patterns_hash)
+        except Exception as exc:  # fail-open in the safe direction
+            self._record_read_error(exc, len(url_list))
+            return [self._unknown(url) for url in url_list]
+        moment = self._clock() if now is None else float(now)
+        return [self._decide_one(url, links, covered, moment) for url in url_list]
 
     def to_stats(self) -> Dict[str, Any]:
         """Flatten per-run counters for run statistics / status display."""

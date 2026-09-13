@@ -173,9 +173,13 @@ class SearchStage(BasePipelineStage):
                 # Write-only hook: record discovered links
                 self._record_discovered(task, results)
 
-            # Handle first page results for pagination/refinement
+            # Handle pagination/refinement.  API transport may chain pages
+            # through the early-stop detector; web keeps the pre-change bulk
+            # generation (the detector is inert for web at code level).
             if task.page == 1 and total > 0:
-                self._handle_first_page_results(task, total, output)
+                self._handle_first_page_results(task, results or [], total, output)
+            elif task.page > 1:
+                self._handle_page_results(task, results or [], output)
 
             logger.info(
                 f"[{self.name}] search completed for {task.provider}: {len(results) if results else 0} links, {len(keys)} keys"
@@ -316,8 +320,10 @@ class SearchStage(BasePipelineStage):
                     return False
         return True
 
-    def _handle_first_page_results(self, task: SearchTask, total: int, output: StageOutput) -> None:
-        """Handle first page results - decide pagination or refinement"""
+    def _handle_first_page_results(
+        self, task: SearchTask, results: List[str], total: int, output: StageOutput
+    ) -> None:
+        """Handle first page results - decide refinement or pagination"""
         limit = API_LIMIT if task.use_api else WEB_LIMIT
         per_page = API_RESULTS_PER_PAGE if task.use_api else WEB_RESULTS_PER_PAGE
 
@@ -359,6 +365,24 @@ class SearchStage(BasePipelineStage):
 
         # If needs pagination and not refining
         elif total > per_page:
+            max_pages = min(
+                math.ceil(total / per_page),
+                API_MAX_PAGES if task.use_api else WEB_MAX_PAGES,
+            )
+
+            engine = self._early_stop_engine(task)
+            if engine is not None:
+                # API-only chained pagination: record page 1, then emit only the
+                # next page so every later boundary can be evaluated.
+                stopped = self._observe_page(task, results, page=1, max_pages=max_pages, engine=engine)
+                if not stopped and max_pages >= 2:
+                    output.add_task(self._generate_page_task(task, 2), PipelineStage.SEARCH.value)
+                    logger.info(
+                        f"[{self.name}] early-stop chaining page tasks for provider: {task.provider}, "
+                        f"query: {task.query}, max_pages: {max_pages}"
+                    )
+                return
+
             page_tasks = self._generate_page_tasks(task, total, per_page)
             for page_task in page_tasks:
                 output.add_task(page_task, PipelineStage.SEARCH.value)
@@ -366,29 +390,84 @@ class SearchStage(BasePipelineStage):
                 f"[{self.name}] generated {len(page_tasks)} page tasks for provider: {task.provider}, query: {task.query}"
             )
 
+    def _handle_page_results(self, task: SearchTask, results: List[str], output: StageOutput) -> None:
+        """Handle a subsequent page when API early-stop chaining is active."""
+        engine = self._early_stop_engine(task)
+        if engine is None:
+            return
+
+        stopped = self._observe_page(task, results, page=task.page, engine=engine)
+        if stopped:
+            logger.info(
+                f"[{self.name}] early stop suppressed page {task.page + 1} for provider: {task.provider}, "
+                f"query: {task.query}"
+            )
+            return
+
+        max_pages = engine.max_pages(task.provider, task.query)
+        if task.page + 1 <= max_pages:
+            output.add_task(self._generate_page_task(task, task.page + 1), PipelineStage.SEARCH.value)
+
+    def _early_stop_engine(self, task: SearchTask):
+        """Return the early-stop engine for API tasks, else None (web inert)."""
+        if not getattr(task, "use_api", False):
+            return None
+        engine = getattr(self.resources, "early_stop", None)
+        if engine is None or not getattr(engine, "enabled", False):
+            return None
+        return engine
+
+    def _observe_page(
+        self,
+        task: SearchTask,
+        results: List[str],
+        page: int,
+        max_pages: Optional[int] = None,
+        engine=None,
+    ) -> bool:
+        """Record one page in the frontier tracker; True when it stopped."""
+        try:
+            digest = patterns_hash(
+                key_pattern=task.regex,
+                address_pattern=task.address_pattern,
+                endpoint_pattern=task.endpoint_pattern,
+                model_pattern=task.model_pattern,
+            )
+            result = engine.observe(
+                provider=task.provider,
+                query=task.query,
+                page=page,
+                links=results,
+                patterns_hash=digest,
+                max_pages=max_pages,
+            )
+        except Exception as e:  # pragma: no cover - defensive (fail open)
+            logger.warning(f"[{self.name}] early-stop evaluation failed (fail-open): {e}")
+            return False
+        return bool(result.stopped)
+
+    def _generate_page_task(self, task: SearchTask, page: int) -> SearchTask:
+        """Build a single pagination task for ``page`` of the same partition."""
+        return SearchTask(
+            provider=task.provider,
+            query=task.query,
+            regex=task.regex,
+            page=page,
+            use_api=task.use_api,
+            address_pattern=task.address_pattern,
+            endpoint_pattern=task.endpoint_pattern,
+            model_pattern=task.model_pattern,
+        )
+
     def _generate_page_tasks(self, task: SearchTask, total: int, per_page: int) -> List[SearchTask]:
-        """Generate pagination tasks"""
+        """Generate all pagination tasks (pre-change behavior for off/web)."""
         # Limit max pages
         max_pages = min(
             math.ceil(total / per_page),
             API_MAX_PAGES if task.use_api else WEB_MAX_PAGES,
         )
 
-        page_tasks: List[SearchTask] = []
-        for page in range(2, max_pages + 1):  # Start from page 2
-            page_task = SearchTask(
-                provider=task.provider,
-                query=task.query,
-                regex=task.regex,
-                page=page,
-                use_api=task.use_api,
-                address_pattern=task.address_pattern,
-                endpoint_pattern=task.endpoint_pattern,
-                model_pattern=task.model_pattern,
-            )
-            page_tasks.append(page_task)
-
-        return page_tasks
+        return [self._generate_page_task(task, page) for page in range(2, max_pages + 1)]
 
     @handle_exceptions(default_result=[], log_level="error")
     def _extract_keys_from_content(self, content: str, task: SearchTask) -> List[Service]:

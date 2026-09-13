@@ -69,7 +69,7 @@ Early-stop SHALL evaluate only when the registry is trusted: total `links` rows 
 
 ### Requirement: Three-mode flag with shadow measurement
 
-`early_stop` SHALL accept `off` (default, detector never evaluates), `shadow` (decisions computed and logged, pagination always continues), and `on` (enforced). In shadow mode the system SHALL log `would_stop_at` records (partition, page, window stats) and SHALL compute `novel_after_stop` — the count of links first-seen in this run that arrived after the hypothetical stop point — quantifying the false-stop price.
+`early_stop` SHALL accept `off` (default, detector never evaluates), `shadow` (decisions computed and logged, pagination always continues), and `on` (enforced). In shadow mode the system SHALL log `would_stop_at` records (partition, page, window stats) and SHALL compute `novel_after_stop` — the count of distinct links that the gather-skip conjunction would **not** skip (i.e., that still require research) and that arrived after the hypothetical stop point — quantifying the false-stop price conservatively (any missed work counts, regardless of when it was first seen).
 
 #### Scenario: Shadow logs but never acts
 

@@ -359,6 +359,49 @@ class EnrichmentConfig:
 
 
 @dataclass
+class EarlyStopConfig:
+    """Frontier-based API pagination early-stop configuration.
+
+    ``mode`` is the three-position rollout flag: ``off`` never evaluates,
+    ``shadow`` logs decisions and keeps paginating, ``on`` enforces the stop.
+    ``window`` bounds how many trailing result identities the saturation ratio
+    is computed over; ``theta`` is the known-ratio threshold; ``min_pages``
+    forbids stopping on the first page(s); ``min_trust`` is the registry row
+    count below which the trust gate fails and full passes are forced.
+    """
+
+    mode: str = "off"
+    window: int = 100
+    theta: float = 0.9
+    min_pages: int = 2
+    min_trust: int = 1000
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_early_stop_config on purpose: this
+        # guards direct (non-loader) construction in tests and embedding.
+        mode = str(self.mode).strip().lower()
+        if mode not in ("off", "shadow", "on"):
+            raise ValueError("early_stop.mode must be one of: off, shadow, on")
+        self.mode = mode
+
+        self.window = int(self.window)
+        if self.window <= 0:
+            raise ValueError("early_stop.window must be positive")
+
+        self.theta = float(self.theta)
+        if not (0.5 <= self.theta <= 1.0):
+            raise ValueError("early_stop.theta must be between 0.5 and 1.0")
+
+        self.min_pages = int(self.min_pages)
+        if self.min_pages < 1:
+            raise ValueError("early_stop.min_pages must be at least 1")
+
+        self.min_trust = int(self.min_trust)
+        if self.min_trust < 0:
+            raise ValueError("early_stop.min_trust must be non-negative")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
 
@@ -484,6 +527,7 @@ class Config:
     registry: RegistryConfig = field(default_factory=RegistryConfig)
     skip: SkipConfig = field(default_factory=SkipConfig)
     enrichment: EnrichmentConfig = field(default_factory=EnrichmentConfig)
+    early_stop: EarlyStopConfig = field(default_factory=EarlyStopConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -511,6 +555,7 @@ class Config:
             "registry": self._dataclass_to_dict(self.registry),
             "skip": self._dataclass_to_dict(self.skip),
             "enrichment": self._dataclass_to_dict(self.enrichment),
+            "early_stop": self._dataclass_to_dict(self.early_stop),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }
