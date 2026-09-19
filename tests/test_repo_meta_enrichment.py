@@ -334,7 +334,13 @@ def test_s4_unchanged_repository_refreshes_via_304(workspace):
 
     assert fetched == 1
     assert client.headers_sent[0].get("if-none-match") == "E-OLD"
-    assert merge_calls == []  # 304 requires no merge work
+    # Amendment (late-link gap): a 304 preserves stored values AND re-propagates
+    # them through the merge channel, so links that surfaced after the caching
+    # event get dated too -- still zero extra HTTP requests.
+    assert len(merge_calls) == 1
+    merge_args, merge_kwargs = merge_calls[0]
+    assert merge_args == (OWNER, REPO)
+    assert merge_kwargs == {"pushed_at": old_pushed, "size_kb": 7}
 
     row = _repo_row(workspace, OWNER, REPO)
     assert row["pushed_at"] == old_pushed
@@ -342,6 +348,13 @@ def test_s4_unchanged_repository_refreshes_via_304(workspace):
     assert row["default_branch"] == "trunk"
     assert row["etag"] == "E-OLD"
     assert row["fetched_at"] == NOW  # touch-only bump
+
+    # The two seeded links were never dated by a 200 merge; the 304
+    # re-propagation must date them from the preserved values.
+    links = _link_rows(workspace, OWNER, REPO)
+    assert len(links) == 2
+    assert all(link["repo_pushed_at"] == old_pushed for link in links)
+    assert all(link["repo_size_kb"] == 7 for link in links)
 
     stats = enricher.to_stats()
     assert stats["enrichment_304s"] == 1
@@ -436,6 +449,42 @@ def test_s12_crash_resume_completes_without_redo(workspace):
     row_b = _repo_row(workspace, OTHER_OWNER, OTHER_REPO)
     assert row_a is not None and row_a["etag"] == "E-A"
     assert row_b is not None and row_b["etag"] == "E-B"
+
+
+# ---------------------------------------------------------------------------
+# Supplement: late-discovered links receive cached metadata without HTTP
+# ---------------------------------------------------------------------------
+def test_supplement_fresh_cache_propagates_to_late_links(workspace):
+    """SYNTHETIC supplement (live-probe observation 2026-09-19).
+
+    A link discovered AFTER its repository was cached must be dated from the
+    cache entry on the fresh-skip path -- with zero HTTP requests.  Without
+    this, links of static repositories stay NULL indefinitely (no future 200).
+    """
+    registry = _registry(workspace)
+    try:
+        # Run 1: first link surfaces; the 200 fetch caches and dates it.
+        _seed_links(registry, OWNER, REPO, 1, prefix="old")
+        client = FakeClient([(200, _body(NOW - HOUR, size=5), {"etag": "E-FRESH"})])
+        enricher = _enricher(workspace, registry, client)
+        assert enricher.enrich_pairs([(OWNER, REPO)]) == 1
+        registry.flush(10.0)
+
+        # Run 2 (within TTL): a NEW link of the same repo is discovered.
+        _seed_links(registry, OWNER, REPO, 1, prefix="new")
+        fetched = enricher.enrich_pairs([(OWNER, REPO)])
+        registry.flush(10.0)
+    finally:
+        registry.stop()
+
+    assert fetched == 0             # cache-first: nothing fetched
+    assert len(client.calls) == 1   # only the original 200; zero HTTP for the late link
+
+    expected_pushed = _epoch(_iso(NOW - HOUR))
+    links = _link_rows(workspace, OWNER, REPO)
+    assert len(links) == 2
+    assert all(link["repo_pushed_at"] == expected_pushed for link in links)
+    assert all(link["repo_size_kb"] == 5 for link in links)
 
 
 # ---------------------------------------------------------------------------

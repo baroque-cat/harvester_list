@@ -438,6 +438,10 @@ class RepoMetaEnricher:
                 now = self._clock()
                 entry = self.store.get(owner, repo)
                 if self.store.is_fresh(entry, now):
+                    # Late-discovered links of an already-cached repository must
+                    # still receive its metadata; serve them from the cache with
+                    # zero HTTP requests (same merge channel as the 200 path).
+                    self._propagate_cached(owner, repo, entry)
                     continue
                 if self._enrich_one(owner, repo, entry, flush):
                     fetched += 1
@@ -526,7 +530,7 @@ class RepoMetaEnricher:
                 return False
 
             if result.status in (200, 304, 404):
-                self._apply_result(owner, repo, result)
+                self._apply_result(owner, repo, result, entry)
                 if flush:
                     self.store.flush(self.flush_timeout)
                 return True
@@ -537,7 +541,9 @@ class RepoMetaEnricher:
         self._record_failure(RuntimeError("github credentials exhausted"))
         return False
 
-    def _apply_result(self, owner: str, repo: str, result: RepoFetchResult) -> None:
+    def _apply_result(
+        self, owner: str, repo: str, result: RepoFetchResult, entry: Optional[RepoMetaEntry] = None
+    ) -> None:
         now = self._clock()
         if result.status == 200:
             self.store.record_upsert(
@@ -556,6 +562,10 @@ class RepoMetaEnricher:
                 self._repos_cached += 1
         elif result.status == 304:
             self.store.record_touch(owner, repo, ts=now, etag=result.etag)
+            # A 304 preserves the stored values; re-propagate them so links
+            # discovered after the caching event are not left NULL until a 200
+            # that may never come for static repositories.  Zero extra HTTP.
+            self._propagate_cached(owner, repo, entry)
             with self._counters_lock:
                 self._fetches += 1
                 self._threes += 1
@@ -564,6 +574,23 @@ class RepoMetaEnricher:
             with self._counters_lock:
                 self._fetches += 1
                 self._gone += 1
+
+    def _propagate_cached(self, owner: str, repo: str, entry: Optional[RepoMetaEntry]) -> None:
+        """Merge cached repository metadata into its links without any HTTP.
+
+        Covers the late-link gap (observed live 2026-09-19): links discovered
+        AFTER a repository was cached would otherwise keep NULL
+        ``repo_pushed_at``/``repo_size_kb`` until the next real 200 -- which
+        may never come for static repositories, because the fresh-skip path
+        issues no request and a 304 refresh previously merged nothing.  The
+        merge is UPDATE-only COALESCE, so re-propagating known values is
+        idempotent and never fabricates link rows.
+        """
+        if entry is None:
+            return
+        if entry.pushed_at is None and entry.size_kb is None:
+            return
+        self.store.record_link_metadata(owner, repo, pushed_at=entry.pushed_at, size_kb=entry.size_kb)
 
     def _record_failure(self, exc: Exception) -> None:
         with self._counters_lock:

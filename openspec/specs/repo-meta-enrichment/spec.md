@@ -27,12 +27,12 @@ When enrichment is enabled and at least one API credential is available, the sys
 
 ### Requirement: Conditional refresh economics
 
-Cache entries older than the configured TTL SHALL be refreshed with `If-None-Match: <stored etag>`. A `304 Not Modified` response SHALL bump `fetched_at` while preserving all stored values and SHALL require no merge work; a `200` response SHALL replace `pushed_at`/`size_kb`/`default_branch`/`etag` and re-trigger link-column merge. Zero rate-limit accounting of 304s is documented GitHub behavior whose live confirmation was an early implementation task (probe, completed September 2026: `rate_limit_delta = 0`), not a spec guarantee.
+Cache entries older than the configured TTL SHALL be refreshed with `If-None-Match: <stored etag>`. A `304 Not Modified` response SHALL bump `fetched_at` while preserving all stored values, and SHALL re-propagate the preserved `pushed_at`/`size_kb` to the repository's links through the same UPDATE-only COALESCE merge (zero additional HTTP requests); a `200` response SHALL replace `pushed_at`/`size_kb`/`default_branch`/`etag` and re-trigger link-column merge. Zero rate-limit accounting of 304s is documented GitHub behavior whose live confirmation was an early implementation task (probe, completed September 2026: `rate_limit_delta = 0`), not a spec guarantee.
 
 #### Scenario: Unchanged repository refreshes via 304
 
 - **WHEN** a TTL-expired entry is conditionally refreshed and the server answers 304
-- **THEN** stored values and etag are unchanged, `fetched_at` advances, `enrichment_304s` increments, and no links merge is performed
+- **THEN** stored values and etag are unchanged, `fetched_at` advances, `enrichment_304s` increments, and the preserved values are re-propagated to the repository's link columns through the merge channel (idempotent COALESCE, no additional HTTP)
 
 #### Scenario: Changed repository replaces values
 
@@ -41,12 +41,17 @@ Cache entries older than the configured TTL SHALL be refreshed with `If-None-Mat
 
 ### Requirement: Cache-first lazy triggering
 
-Every enrichment need SHALL consult the cache first; entries fresh within TTL SHALL be served with zero network requests. Fetches trigger lazily at two points: (a) AcquisitionStage encountering a repository that is uncached or stale; (b) the gather-skip evaluator encountering stale cache for candidate links (wired against the landed add-gather-skip evaluator, under a bounded per-batch wall-clock budget). Duplicate encounters of the same repository within a batch, page, or run SHALL coalesce into a single fetch.
+Every enrichment need SHALL consult the cache first; entries fresh within TTL SHALL be served with zero network requests. Entries served from cache SHALL additionally propagate their stored `pushed_at`/`size_kb` to the repository's links through the UPDATE-only merge (zero network), so links discovered after the caching event are not left with NULL metadata until the next `200`. (Amendment, September 2026: live probing exposed this late-link gap — the fresh-skip and 304 paths previously skipped propagation, which for static repositories with no future `200` left late links permanently NULL.) Fetches trigger lazily at two points: (a) AcquisitionStage encountering a repository that is uncached or stale; (b) the gather-skip evaluator encountering stale cache for candidate links (wired against the landed add-gather-skip evaluator, under a bounded per-batch wall-clock budget). Duplicate encounters of the same repository within a batch, page, or run SHALL coalesce into a single fetch.
 
 #### Scenario: Fresh cache serves offline
 
 - **WHEN** every repository on a processed page has a cache entry younger than TTL
 - **THEN** zero enrichment HTTP requests occur during that page's processing
+
+#### Scenario: Late-discovered links receive cached metadata without HTTP
+
+- **WHEN** a link belonging to a repository whose cache entry is fresh within TTL reaches enrichment
+- **THEN** the link's `repo_pushed_at`/`repo_size_kb` columns are populated from the cached entry via the merge channel and zero HTTP requests are issued
 
 #### Scenario: Stale cache at skip evaluation triggers one shared refresh
 
