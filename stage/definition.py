@@ -33,6 +33,7 @@ from core.models import (
 from core.types import IProvider
 from search import client
 from search.github.refine.engine import RefineEngine
+from search.querykey import wire_query
 from storage.key_ledger import KeyCheckRequest, key_hash, mask_key
 from storage.registry import patterns_hash, url_hash
 from tools.logger import get_logger
@@ -273,13 +274,14 @@ class SearchStage(BasePipelineStage):
                 )
 
     def _preprocess_query(self, query: str, use_api: bool) -> str:
-        """Github Rest API search syntax don't support regex, so we need remove it if exists"""
-        if use_api:
-            keyword = RefineEngine.get_instance().clean_regex(query=query)
-            if keyword:
-                query = keyword
+        """Delegate to the shared wire-query source of truth (design D2).
 
-        return query
+        Github Rest API search syntax doesn't support regex, so it is removed
+        for the API transport; the web transport keeps the raw query.  Keeping
+        this identical to the runtime cache key is what makes planning and the
+        shared-response store agree on aggregatable identities.
+        """
+        return wire_query(query, use_api)
 
     def _execute_page_search(
         self, task: SearchTask, metadata: Optional[Dict[str, LinkMetadata]] = None

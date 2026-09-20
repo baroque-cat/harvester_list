@@ -1301,6 +1301,75 @@ their own weights without touching the database. See
 `docs/specs/candidates_export.md` for the frozen field dictionary, the
 `schema_version` policy and advanced direct-SQLite guidance.
 
+### Search-response aggregation (`aggregation`)
+
+Providers whose conditions produce the identical wire query on the same
+transport used to each run their own full GitHub search chain — waste that
+refine expands deterministically (one broad web condition can expand into
+hundreds of identical subquery chains per provider). A GitHub search response is
+a pure function of `(transport, wire_query, page)` and is provider-agnostic
+(patterns are applied only after the answer arrives), so within a short TTL
+window one response can feed every provider.
+
+**Layout.** Sharing lives strictly below the task boundary: the two
+stage-facing dispatchers (`search_with_count`, `search_code`) route through a
+TTL + byte-capped LRU store with singleflight coalescing. Every provider still
+executes its own task and writes its own basket, shards and registry rows —
+only the HTTP fetch is shared. The wire-query fingerprint
+(`sha256("<api|web>|<wire_query>")`) is produced by one helper
+(`search/querykey.py`) used by both task planning and the runtime cache key, so
+the two cannot drift apart.
+
+**Modes.** `aggregation.mode` is a three-position flag; the default `off` is
+byte-for-byte the pre-change behavior.
+
+- `off` — no sharing, no store maintenance. Kill-switch / rollback state.
+- `shadow` — every fetch performs its real request; the store is maintained in
+  parallel and each would-be hit is compared against the live answer (Jaccard
+  of URL sets, total-count delta) and appended to
+  `<workspace>/aggregation_decisions.jsonl`. Served results are always live.
+- `on` — full sharing: a fresh hit is served without touching the transport
+  (and therefore without consuming a rate-limit bucket, adaptive reporting or
+  credential cooldown state); concurrent identical fetches coalesce onto one
+  leader request.
+
+```yaml
+aggregation:
+  mode: "off"          # off | shadow | on
+  ttl_web_s: 120       # web response freshness window (1..3600)
+  ttl_api_s: 300       # API response freshness window (1..3600)
+  max_bytes: 67108864  # in-memory LRU cap (>= 1 MiB)
+  join_timeout_s: 60   # singleflight joiner bound (1..600)
+```
+
+**TTL basis.** A live drift experiment (28 fetches, 2026-09-20) measured
+Jaccard = 1.000 for identical queries across 900 s on both transports; the
+defaults (web 120 s, API 300 s) are deliberately conservative against that
+horizon and are raised only on shadow data.
+
+**Safety.** Only fully successful returns are storable: typed transient
+failures and limiter-suppressed blanks propagate verbatim to every waiter and
+are never stored (the archived `fix-silent-losses` taxonomy raises before the
+store is reached), while legitimate HTTP 200 zero-result answers are storable
+and servable. Consumers receive independent URL-list and metadata copies;
+immutable content is shared. Waiting on an in-flight leader is bounded by
+`join_timeout_s`, after which the waiter issues its own request — the worst
+case equals pre-change behavior and no task is ever dropped.
+
+**Metrics.** Exposed in `PipelineStatus.aggregation_metrics`: `hits`, `misses`,
+`joins`, `join_timeouts`, `evictions`, `entries`, `bytes`, `poisoned_rejected`
+(should stay 0), `shadow_comparisons`, `shadow_jaccard_min` /
+`shadow_jaccard_p95`, and the planning-time `aggregatable_pairs`. The store is
+in-memory only: a restart starts cold and no workspace artifact is created in
+`off`/`on` (the shadow decision log is the sole on-disk output, append-only
+audit data).
+
+**Promotion & rollback.** Run `shadow` for a representative production cycle
+(including a rate-limit storm), review `aggregation_decisions.jsonl` (p95
+Jaccard ≥ 0.95, deep-page divergence, hit-rate) and `aggregation_metrics`, then
+flip `mode: on`. Rollback is the reverse config flip — no code change and no
+data migration.
+
 ### Failure handling (`pipeline.failure_handling`)
 
 Transient fetch failures used to be indistinguishable from legitimate empty

@@ -15,6 +15,7 @@ from core.metrics import DateFillMetrics, PipelineStatus
 from core.models import ProviderTask
 from core.types import IPipelineStats, IProvider
 from search import client
+from search.aggregation import get_aggregation_metrics
 from stage.base import BasePipelineStage, StageOutput, StageResources, StageUtils
 from stage.registry import StageRegistryMixin
 from stage.resolver import DependencyResolver
@@ -131,6 +132,9 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         # Initialize GitHub client rate limiter
         client.init_github_client(config.ratelimits)
 
+        # Shared search-response aggregation (off by default; config-only rollback)
+        self._configure_aggregation(config)
+
         # Repo-metadata enrichment (off by default).  The cache is the registry
         # and the enricher rides the shared github_api client/buckets.
         self.repo_meta_store = RepoMetaStore(
@@ -182,6 +186,36 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         self.initial_tasks_count = 0
 
         logger.info(f"Initialized dynamic pipeline with {len(self.stages)} stages: {list(self.stages.keys())}")
+
+    def _configure_aggregation(self, config: Config) -> None:
+        """Install the process-wide shared-response aggregator from config.
+
+        Read once at wiring time (mode flips require a restart, consistent
+        with the other tri-mode features).  A construction failure is loud but
+        non-fatal: the run falls back to ``off`` (every fetch real).
+        """
+        from search.aggregation import SearchAggregator, configure_aggregator
+
+        agg_cfg = config.aggregation
+        try:
+            configure_aggregator(
+                SearchAggregator(
+                    mode=agg_cfg.mode,
+                    ttl_web_s=agg_cfg.ttl_web_s,
+                    ttl_api_s=agg_cfg.ttl_api_s,
+                    max_bytes=agg_cfg.max_bytes,
+                    join_timeout_s=agg_cfg.join_timeout_s,
+                    workspace=config.global_config.workspace,
+                )
+            )
+            logger.info(
+                f"Aggregation configured: mode={agg_cfg.mode} "
+                f"ttl_web={agg_cfg.ttl_web_s}s ttl_api={agg_cfg.ttl_api_s}s "
+                f"max_bytes={agg_cfg.max_bytes} join_timeout={agg_cfg.join_timeout_s}s"
+            )
+        except Exception as e:
+            logger.error(f"Failed to configure aggregation, falling back to off: {e}")
+            configure_aggregator(None)
 
     def _aggregate_stages(self) -> List[str]:
         """Aggregate stage requirements from all enabled tasks"""
@@ -385,6 +419,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             key_ledger_metrics=self.key_ledger.to_stats(),
             recheck_metrics=self.recheck.to_stats(),
             prioritization_metrics=self._prioritization_metrics(),
+            aggregation_metrics=get_aggregation_metrics(),
         )
 
         return pipeline_status

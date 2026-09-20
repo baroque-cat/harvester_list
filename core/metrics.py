@@ -206,6 +206,9 @@ class PipelineStatus:
     # Key-ledger skip counters (empty while off).
     key_ledger_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Shared search-response aggregation counters (empty while off/unconfigured).
+    aggregation_metrics: Dict[str, Any] = field(default_factory=dict)
+
     # Periodic re-check driver counters (empty while disabled).
     recheck_metrics: Dict[str, Any] = field(default_factory=dict)
 

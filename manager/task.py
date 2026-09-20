@@ -19,6 +19,7 @@ from core.types import IProvider
 from provider.base import AIBaseProvider
 from provider.registry import ProviderRegistry
 from search import client
+from search.querykey import fingerprint
 from stage.base import StageUtils
 from stage.factory import TaskFactory
 from state.builder import StatusBuilder
@@ -33,6 +34,37 @@ from .pipeline import Pipeline
 from .recovery import TaskRecoveryManager
 
 logger = get_logger("manager")
+
+
+def _search_identity(task: SearchTask) -> tuple:
+    """Transport-aware aggregation identity of a search task (design D2/D9)."""
+    use_api = bool(task.use_api)
+    return (use_api, fingerprint(task.query, use_api))
+
+
+def order_tasks_for_locality(tasks: List[SearchTask]) -> List[SearchTask]:
+    """Stably group initial tasks by (transport, fingerprint) (design D9).
+
+    Pure and multiset-invariant: the very same task objects are returned in a
+    new order, never merged, dropped or mutated.  Providers that produced the
+    identical wire query become queue neighbors so their duplicate fetches
+    land close enough for the shared-response layer to coalesce them, while
+    relative order inside each group keeps the original provider/condition
+    sequence.
+    """
+    return sorted(tasks, key=_search_identity)
+
+
+def count_aggregatable_pairs(tasks: List[SearchTask]) -> int:
+    """Count cross-provider duplicate pairs implied by N conditions - M identities.
+
+    Each duplicate member beyond the first in an identity group is one HTTP
+    chain that sharing can save (design D7 planning metric).
+    """
+    if not tasks:
+        return 0
+    distinct = {_search_identity(task) for task in tasks}
+    return len(tasks) - len(distinct)
 
 
 class CompletionEventManager:
@@ -417,6 +449,13 @@ class TaskManager(LifecycleManager, TaskDataProvider):
                     model_pattern=condition.patterns.model_pattern,
                 )
                 tasks.append(task)
+
+        # Stable locality grouping (no merge/drop/mutation) and the planning
+        # savings metric that rides the runtime status surface (design D7/D9).
+        tasks = order_tasks_for_locality(tasks)
+        from search import aggregation as search_aggregation
+
+        search_aggregation.set_aggregatable_pairs(count_aggregatable_pairs(tasks))
 
         # Log summary of initial task creation
         if tasks:

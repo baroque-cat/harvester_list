@@ -22,6 +22,7 @@ from core.models import Condition, Patterns, RateLimitConfig, inherit_patterns
 
 from .defaults import get_default_config
 from .schemas import (
+    AggregationConfig,
     ApiConfig,
     CheckSkipConfig,
     Config,
@@ -141,6 +142,10 @@ class ConfigLoader:
         # Parse repository prioritization configuration
         if "prioritization" in data:
             config.prioritization = self._parse_prioritization_config(data["prioritization"])
+
+        # Parse shared search-response aggregation configuration
+        if "aggregation" in data:
+            config.aggregation = self._parse_aggregation_config(data["aggregation"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -416,6 +421,23 @@ class ConfigLoader:
             threshold_kb=data.get("threshold_kb", 50_000.0),
             ramp_kb=data.get("ramp_kb", 500_000.0),
             display_top_n=data.get("display_top_n", 0),
+        )
+
+    def _parse_aggregation_config(self, data: Dict[str, Any]) -> AggregationConfig:
+        """Parse shared search-response aggregation configuration section.
+
+        Args:
+            data: Aggregation configuration data
+
+        Returns:
+            AggregationConfig: Parsed aggregation configuration
+        """
+        return AggregationConfig(
+            mode=data.get("mode", "off"),
+            ttl_web_s=data.get("ttl_web_s", 120.0),
+            ttl_api_s=data.get("ttl_api_s", 300.0),
+            max_bytes=data.get("max_bytes", 64 * 1024 * 1024),
+            join_timeout_s=data.get("join_timeout_s", 60.0),
         )
 
     def _parse_rate_limits(self, data: Dict[str, Any]) -> Dict[str, RateLimitConfig]:

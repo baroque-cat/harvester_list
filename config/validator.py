@@ -79,6 +79,9 @@ class ConfigValidator:
         # Validate repository prioritization configuration
         self._validate_prioritization_config(config)
 
+        # Validate shared search-response aggregation configuration
+        self._validate_aggregation_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -448,6 +451,30 @@ class ConfigValidator:
 
         if prioritization.display_top_n < 0:
             self.errors.append("Prioritization display_top_n must be non-negative")
+
+    def _validate_aggregation_config(self, config: Config) -> None:
+        """Validate shared search-response aggregation configuration section.
+
+        Misconfiguration here is loud: an unknown mode or an out-of-range TTL
+        would either silently disable sharing or expose stale data beyond the
+        measured stability horizon, so these are errors rather than warnings.
+        """
+        aggregation = config.aggregation
+
+        if aggregation.mode not in ("off", "shadow", "on"):
+            self.errors.append("Aggregation mode must be one of: off, shadow, on")
+
+        for name in ("ttl_web_s", "ttl_api_s"):
+            value = float(getattr(aggregation, name))
+            if not (1 <= value <= 3600):
+                self.errors.append(f"Aggregation {name} must be between 1 and 3600")
+
+        if int(aggregation.max_bytes) < 1024 * 1024:
+            self.errors.append("Aggregation max_bytes must be at least 1 MiB")
+
+        join_timeout = float(aggregation.join_timeout_s)
+        if not (1 <= join_timeout <= 600):
+            self.errors.append("Aggregation join_timeout_s must be between 1 and 600")
 
     def _validate_rate_limits(self, config: Config) -> None:
         """Validate rate limits configuration

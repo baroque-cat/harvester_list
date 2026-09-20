@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
 from core.models import LinkMetadata, Service
+from search.aggregation import get_aggregator
 from tools.logger import get_logger
 from tools.utils import encoding_url, isblank, trim
 
@@ -1158,7 +1159,30 @@ def search_with_count(
 
     ``metadata`` is populated for the API transport only; web search-results
     HTML is deliberately not parsed for dates (transport asymmetry).
+
+    When the process-wide aggregator is enabled this routes through the
+    shared-response layer (design D1): a hit never reaches the transport
+    function, so rate-limit accounting and cooldown state are untouched (I3).
     """
+    aggregator = get_aggregator()
+    if aggregator is None or aggregator.mode == "off":
+        return _search_with_count_impl(query, session, page, with_api, peer_page, callback, metadata)
+
+    def real_fn() -> Tuple[List[str], int, str]:
+        return _search_with_count_impl(query, session, page, with_api, peer_page, callback, metadata)
+
+    return aggregator.call(with_api, query, page, real_fn, metadata=metadata)
+
+
+def _search_with_count_impl(
+    query: str,
+    session: str,
+    page: int,
+    with_api: bool,
+    peer_page: int,
+    callback: Optional[Callable[[List[str], str], None]] = None,
+    metadata: Optional[Dict[str, LinkMetadata]] = None,
+) -> Tuple[List[str], int, str]:
     keywords = urllib.parse.quote_plus(query)
     if with_api:
         return search_api_with_count(keywords, session, page, peer_page, metadata=metadata)
@@ -1300,7 +1324,32 @@ def search_code(
 
     ``metadata`` is populated for the API transport only; web search-results
     HTML is deliberately not parsed for dates (transport asymmetry).
+
+    When the process-wide aggregator is enabled this routes through the
+    shared-response layer (design D1); the cached identity is the same
+    ``(transport, wire_query, page)`` used by :func:`search_with_count`.
     """
+    aggregator = get_aggregator()
+    if aggregator is None or aggregator.mode == "off":
+        return _search_code_impl(query, session, page, with_api, peer_page, callback, metadata)
+
+    def real_fn() -> Tuple[List[str], int, str]:
+        results, content = _search_code_impl(query, session, page, with_api, peer_page, callback, metadata)
+        return results, 0, content
+
+    results, _total, content = aggregator.call(with_api, query, page, real_fn, metadata=metadata)
+    return results, content
+
+
+def _search_code_impl(
+    query: str,
+    session: str,
+    page: int,
+    with_api: bool,
+    peer_page: int,
+    callback: Optional[Callable[[List[str], str], None]] = None,
+    metadata: Optional[Dict[str, LinkMetadata]] = None,
+) -> Tuple[List[str], str]:
     keyword = urllib.parse.quote_plus(trim(query))
     if not keyword:
         return [], ""

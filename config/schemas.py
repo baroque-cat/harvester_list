@@ -508,6 +508,46 @@ class PrioritizationConfig:
 
 
 @dataclass
+class AggregationConfig:
+    """Shared search-response aggregation configuration (add-search-aggregation).
+
+    ``mode`` is a three-position rollout flag: ``off`` never shares, ``shadow``
+    performs every real request and records would-be-hit comparisons without
+    serving them, ``on`` serves shared responses.  TTLs are per transport;
+    the byte cap bounds the in-memory LRU; ``join_timeout_s`` bounds how long a
+    singleflight joiner waits before falling back to its own request.
+    """
+
+    mode: str = "off"
+    ttl_web_s: float = 120.0
+    ttl_api_s: float = 300.0
+    max_bytes: int = 64 * 1024 * 1024
+    join_timeout_s: float = 60.0
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_aggregation_config on purpose: this
+        # guards direct (non-loader) construction in tests and embedding.
+        mode = str(self.mode).strip().lower()
+        if mode not in ("off", "shadow", "on"):
+            raise ValueError("aggregation.mode must be one of: off, shadow, on")
+        self.mode = mode
+
+        for name in ("ttl_web_s", "ttl_api_s"):
+            value = float(getattr(self, name))
+            if not (1 <= value <= 3600):
+                raise ValueError(f"aggregation.{name} must be between 1 and 3600")
+            setattr(self, name, value)
+
+        self.max_bytes = int(self.max_bytes)
+        if self.max_bytes < 1024 * 1024:
+            raise ValueError("aggregation.max_bytes must be at least 1 MiB")
+
+        self.join_timeout_s = float(self.join_timeout_s)
+        if not (1 <= self.join_timeout_s <= 600):
+            raise ValueError("aggregation.join_timeout_s must be between 1 and 600")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
     base_url: str = ""
@@ -636,6 +676,7 @@ class Config:
     check_skip: CheckSkipConfig = field(default_factory=CheckSkipConfig)
     recheck: RecheckConfig = field(default_factory=RecheckConfig)
     prioritization: PrioritizationConfig = field(default_factory=PrioritizationConfig)
+    aggregation: AggregationConfig = field(default_factory=AggregationConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -667,6 +708,7 @@ class Config:
             "check_skip": self._dataclass_to_dict(self.check_skip),
             "recheck": self._dataclass_to_dict(self.recheck),
             "prioritization": self._dataclass_to_dict(self.prioritization),
+            "aggregation": self._dataclass_to_dict(self.aggregation),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

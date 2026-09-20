@@ -1,0 +1,38 @@
+{
+  "_provenance": {
+    "kind": "live-captured",
+    "captured_at": "2026-09-20",
+    "auth": "credential read at runtime from .secrets (redacted)",
+    "note": "trimmed to the extracted html_url set + total_count for aggregation drift evidence",
+    "endpoint": "GET https://github.com/search",
+    "transport": "web",
+    "query": "\"ghp_\"",
+    "page": 1
+  },
+  "total_count": 3,
+  "urls": [
+    "https://github.com/Dalaho-bangin/Bug-Bounty/blob/20fc0770ea0b6c38db17dcb333db657eb43b959e/RegeX.md?plain=1",
+    "https://github.com/DusanCar-sudo/enables/blob/77e1143a4a3cf09e703b5a17b795d5178b8479e4/AURA.md?plain=1",
+    "https://github.com/Hefezopf/hopf-it.de/blob/30adb5103061aafe972c6e2a337d4fe12d38d1c1/todo.txt",
+    "https://github.com/Nirmalkoswatta/Monitoring-Dashboard/blob/990b7ff762cc89a13bf3ba46159e77f01798a7c0/SETUP.md?plain=1",
+    "https://github.com/SocialGouv/egapro/blob/f733c502fdba433fe45c910b15fe784526046a7d/CODEX.md?plain=1",
+    "https://github.com/YoavLax/agent-compass/blob/06fc57831655b9fc773767dd82f190f8657d5609/plan.md?plain=1",
+    "https://github.com/ZainulabdeenOfficial/github-language-stats-card-main/blob/d237851a20de639a166057f58c4b69d2dd1ad535/learn.md?plain=1",
+    "https://github.com/bethington/re-universe/blob/c6eea0185485a9025d8528e20e49ae292c6ea5ae/TODO.md?plain=1",
+    "https://github.com/danieltamas/cloak/blob/fbc1aee59cba49edd8964baab8515ef3f3009453/llms.txt",
+    "https://github.com/dsifry/goodtogo/blob/08bc6ad7290ae603615e77e5b7b918489b07529e/USAGE.md?plain=1",
+    "https://github.com/eeeeeeeeee-code/e0e1-wx/blob/1f8dded6a3e8c3c76806fb504999dc45ed61eac0/SKILL.md?plain=1",
+    "https://github.com/hokingyang/learngit/blob/b8e32a0c0372bacebe74b2f45a0bce6554b01f4a/git.txt",
+    "https://github.com/krishvsoni/opengap/blob/d7a8e2edb54b942d6b4635cdd8b919ebd23e5da5/docs.md?plain=1",
+    "https://github.com/nirholas/automate-glama-submit/blob/04464e5ddeebb1891e423a95aee5244b55090ae0/README.md?plain=1",
+    "https://github.com/open-gitagent/opengap/blob/d7a8e2edb54b942d6b4635cdd8b919ebd23e5da5/docs.md?plain=1",
+    "https://github.com/opendatalab/dsdl-docs/blob/510ca28a88a8fadc5a2af3a3bcdf67ce1463b079/1.1.2",
+    "https://github.com/php/web-downloads/blob/30c99b5290cd5cb5165e3867207b6fb332a90941/API.md?plain=1",
+    "https://github.com/prithvi471/opensoirceor/blob/5508c02444a416340bb77f1dde07ad0b63365fde/TRUST.md?plain=1",
+    "https://github.com/q-qp-p/gitagent/blob/d7a8e2edb54b942d6b4635cdd8b919ebd23e5da5/docs.md?plain=1",
+    "https://github.com/reewardius/bbgithub-dorks/blob/dd79e2f0d343fb8aad2d199a1c160165624b4fd2/raw.txt",
+    "https://github.com/valinorintelligence/Gridwolf/blob/28feff2852985de2bc19cf57f4c902a905945c0d/log.txt",
+    "https://github.com/zapstiko/Bug-Bounty/blob/20fc0770ea0b6c38db17dcb333db657eb43b959e/RegeX.md?plain=1",
+    "https://github.com/zhengyunhui123-dev/PMBrain/blob/f16aac64e4f8e36fc02c58c8068b2872fb3eabf5/TODOS.md?plain=1"
+  ]
+}

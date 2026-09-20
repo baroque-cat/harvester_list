@@ -286,6 +286,28 @@ prioritization:
   # Optional StatusManager top-N candidates line; 0 = off
   display_top_n: 0
 
+# Shared search-response aggregation (add-search-aggregation)
+# One GitHub search response per (transport, wire_query, page) within a TTL,
+# shared by every provider that produced the identical wire query. Lives below
+# the task boundary: baskets, shards and registry hooks are untouched.
+aggregation:
+  # Rollout policy: off | shadow | on
+  #   off    - no sharing, no store maintenance (byte-for-byte pre-change)
+  #   shadow - every fetch is real; maintain the store and append would-be-hit
+  #            comparisons (Jaccard, total delta) to aggregation_decisions.jsonl
+  #   on     - serve fresh hits from the store; coalesce concurrent fetches
+  mode: "off"
+  # Web-transport response freshness window in seconds (1..3600)
+  # Conservative vs the measured 900 s stability horizon (J=1.000).
+  ttl_web_s: 120
+  # API-transport response freshness window in seconds (1..3600)
+  ttl_api_s: 300
+  # In-memory LRU byte cap (>= 1 MiB; default 64 MiB)
+  max_bytes: 67108864
+  # Singleflight joiner bound in seconds (1..600); after this the waiter
+  # issues its own real request (worst case equals pre-change behavior)
+  join_timeout_s: 60
+
 # Global rate limiting configuration
 ratelimits:
   # GitHub API rate limits
