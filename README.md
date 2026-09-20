@@ -515,6 +515,29 @@ The system features a sophisticated **Query Optimization Engine** with mathemati
 - **Resource Management**: Prevents resource exhaustion through intelligent limiting
 - **Performance Optimization**: Singleton pattern ensures optimal memory usage
 
+### API Query Cleaning (`clean_regex`)
+
+Before an API-transport condition is sent, `RefineEngine.clean_regex` reduces
+`/regex/` parts to their quoted fixed literals (GitHub's REST code search does
+not accept regex). Cleaning is **search-syntax-aware**: the query is tokenized
+into escape-aware `/regex/` spans, double-quoted literals, `qualifier:value`
+tokens (`filename:.env`, `repo:owner/name`), boolean operators and bare words.
+Fixed-string extraction applies only to genuine `/regex/` spans; quoted literals
+and qualifiers pass through verbatim, so `"sk-" filename:.env` is sent unchanged
+instead of being mangled into a zero-result wire query.
+
+- **Stability contract** — already-correct forms stay byte-identical
+  (`"sk-"` → `"sk-"`, `filename:.env` → `filename:.env`,
+  `/sk-[a-zA-Z0-9]{32}/` → `"sk-"`, bare `AKIA` → `"AKIA"`); the
+  search-aggregation golden vectors and the `_preprocess_query == wire_query`
+  pin enforce it.
+- **Composition** — `search/querykey.py::wire_query` delegates to `clean_regex`,
+  so wire forms, fingerprints, cache keys and queue locality inherit the fix
+  with no extra code.
+- **Fail-open fallback** — a remnant the tokenizer cannot classify (e.g. an
+  unbalanced quote) is emitted verbatim with a counted warning
+  (`RefineEngine._remnant_count`); the regex parser never runs over plain text.
+
 ## Supported Data Sources & Use Cases
 
 ### 🔍 Current Implementation (AI Service Discovery)
@@ -1369,6 +1392,13 @@ audit data).
 Jaccard ≥ 0.95, deep-page divergence, hit-rate) and `aggregation_metrics`, then
 flip `mode: on`. Rollback is the reverse config flip — no code change and no
 data migration.
+
+> **Sequencing.** Land the search-syntax-aware `clean_regex` fix
+> (`fix-refine-query-split`) *before* promoting `mode` beyond `shadow`, so
+> hit-rate and `aggregatable_pairs` statistics reflect live queries rather than
+> cached zeros of dead conditions. That fix has no flag and no data surface —
+> its rollback is simply reverting the commit, and it never changes
+> `aggregation_decisions.jsonl` Jaccards for the already-correct query class.
 
 ### Failure handling (`pipeline.failure_handling`)
 

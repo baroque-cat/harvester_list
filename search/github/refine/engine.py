@@ -28,6 +28,10 @@ from .types import (
 
 logger = get_logger("refine")
 
+# Qualifier-name head for search-syntax tokenization (``filename:``, ``repo:``…).
+# Compiled once; matched with an absolute position to avoid per-token slicing.
+_QUALIFIER_NAME_RE = re.compile(r"[a-zA-Z][A-Za-z0-9_-]*:")
+
 _instance: Optional["RefineEngine"] = None
 _lock = threading.Lock()
 
@@ -47,6 +51,12 @@ class RefineEngine:
             config = RefineEngineConfig()
 
         self.config = config
+
+        # Counted warnings for fail-open query cleaning (design D2).
+        # The singleton is shared across worker threads, so the diagnostic
+        # counter is incremented under its own lock (never lost updates).
+        self._remnant_count = 0
+        self._remnant_lock = threading.Lock()
 
         # Use injected dependencies or create defaults
         self.parser = parser or RegexParser(config.max_quantifier_length)
@@ -325,7 +335,18 @@ class RefineEngine:
 
     def clean_regex(self, query: str, separator: str = "AND") -> str:
         """
-        Clean regex query by extracting fixed strings from regex patterns.
+        Clean a search query by making it search-syntax-aware.
+
+        The query is tokenized left-to-right into search-syntax tokens:
+        escape-aware ``/regex/`` spans, double-quoted literals,
+        ``qualifier:value`` tokens, boolean operators (``AND``/``OR``/``NOT``)
+        and bare words.  Fixed strings are extracted from genuine ``/regex/``
+        spans only; every other token is emitted verbatim.  Bare words keep the
+        historical quoting behaviour (``AKIA`` -> ``"AKIA"``).
+
+        Any remnant the tokenizer cannot classify (e.g. an unbalanced quote) is
+        emitted VERBATIM as a fail-open fallback plus a counted warning - the
+        regex parser never runs over non-``/regex/`` text (design D2).
 
         Args:
             query: Input query string containing regex patterns
@@ -341,119 +362,177 @@ class RefineEngine:
         if separator not in ALLOWED_OPERATORS:
             separator = "AND"
 
-        # Create the actual separator with spaces
-        delimiter = f" {separator} "
+        tokens = self._tokenize_query(query)
+        if tokens is None:
+            # Fail-open: unclassifiable syntax passes through verbatim.
+            with self._remnant_lock:
+                self._remnant_count += 1
+                count = self._remnant_count
+            logger.warning(
+                "clean_regex: unclassified remnant emitted verbatim "
+                f"(count={count}): {query!r}"
+            )
+            return query
 
-        # Split by the actual separator
-        parts = query.split(delimiter)
-
-        results = []
-
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-
-            # Skip if the part is exactly the separator
-            if part == separator:
-                continue
-
-            # Check if part is already quoted
-            if part.startswith('"') and part.endswith('"'):
-                results.append(part)
-                continue
-
-            # Check if part matches pattern [a-zA-Z]+:.*\S.*
-            if re.match(r"^[a-zA-Z]+:.*\S.*$", part):
-                results.append(part)
-                continue
-
-            # Check if part is a regex pattern (starts and ends with /)
-            is_regex = part.startswith("/") and part.endswith("/")
-
-            if is_regex:
-                # Extract pattern without slashes
-                pattern = part[1:-1]
-
-                try:
-                    # Parse the pattern
-                    segments = self.parser.parse(pattern)
-
-                    # Extract fixed strings from FixedSegment
-                    fixed = []
-                    self._extract_fixed_strings(segments, fixed)
-
-                    # Process fixed strings
-                    processed = []
-                    for text in fixed:
-                        # Remove escape characters if original part was wrapped in slashes
-                        if is_regex:
-                            # Remove backslash escapes
-                            text = text.replace("\\/", "/").replace("\\\\", "\\")
-
-                        # Skip if same as separator or length < 3
-                        if text == separator or len(text) < 3:
-                            continue
-
-                        # Add quotes if not already quoted and doesn't match search syntax pattern
-                        # Pattern should match things like content:"value" but not URLs like https://
-                        if not (text.startswith('"') and text.endswith('"')) and not re.match(
-                            r'^[a-zA-Z]+:[\"\'"].*[\"\'"]$', text
-                        ):
-                            text = f'"{text}"'
-
-                        processed.append(text)
-
-                    # Add processed strings to cleaned parts
-                    results.extend(processed)
-
-                except Exception as e:
-                    logger.warning(f"Failed to parse regex pattern '{pattern}': {e}")
-                    # If parsing fails, skip this part
+        results: List[str] = []
+        operators = ("AND", "OR", "NOT")
+        # A /regex/ token that yields no fixed strings disappears from the
+        # output; drop the operator it would have bound to so the wire query
+        # stays well-formed (design D1) instead of leaving a dangling
+        # "AND"/"OR"/"NOT" (e.g. '/ab/ AND filename:.env' -> 'filename:.env').
+        drop_next_operator = False
+        for kind, text in tokens:
+            if kind == "operator":
+                if drop_next_operator:
+                    drop_next_operator = False
                     continue
+                results.append(text)
+            elif kind == "regex":
+                cleaned = self._clean_regex_token(text, separator)
+                if cleaned:
+                    drop_next_operator = False
+                    results.append(cleaned)
+                elif results and results[-1] in operators:
+                    while results and results[-1] in operators:
+                        results.pop()
+                    drop_next_operator = False
+                else:
+                    drop_next_operator = True
+            elif kind == "bare":
+                drop_next_operator = False
+                results.append(f'"{text}"')
+            else:  # quoted, qualifier
+                drop_next_operator = False
+                results.append(text)
+
+        # Single-space assembly keeps operators/spacing one well-formed query.
+        return " ".join(results)
+
+    def _tokenize_query(self, query: str) -> Optional[List[tuple]]:
+        """Tokenize a query into search-syntax tokens.
+
+        Returns a list of ``(kind, text)`` tuples with ``kind`` one of
+        ``"operator"``, ``"quoted"``, ``"qualifier"``, ``"regex"`` or
+        ``"bare"``, or ``None`` when a remnant cannot be classified (fail-open
+        signal for the caller).  ``/regex/`` spans are escape-aware.
+        """
+        tokens: List[tuple] = []
+        i, n = 0, len(query)
+
+        while i < n:
+            char = query[i]
+
+            if char.isspace():
+                i += 1
+                continue
+
+            # Double-quoted literal (escape-aware).
+            if char == '"':
+                end = self._scan_quoted(query, i)
+                if end is None:
+                    return None
+                tokens.append(("quoted", query[i:end]))
+                i = end
+                continue
+
+            # Escape-aware /regex/ span; only a slash-delimited span that ends
+            # at a token boundary counts, otherwise it is a bare word.
+            if char == "/":
+                end = self._scan_regex_span(query, i)
+                if end is not None and (end == n or query[end].isspace()):
+                    tokens.append(("regex", query[i:end]))
+                    i = end
+                    continue
+
+            # qualifier:value (name [a-zA-Z][A-Za-z0-9_-]*:, value bare/quoted).
+            # Compiled match at an absolute position: no per-token substring.
+            name_match = _QUALIFIER_NAME_RE.match(query, i)
+            if name_match:
+                value_start = name_match.end()
+                if value_start < n and query[value_start] == '"':
+                    end = self._scan_quoted(query, value_start)
+                    if end is None:
+                        return None
+                    tokens.append(("qualifier", query[i:end]))
+                    i = end
+                else:
+                    end = value_start
+                    while end < n and not query[end].isspace():
+                        end += 1
+                    tokens.append(("qualifier", query[i:end]))
+                    i = end
+                continue
+
+            # Bare word / boolean operator.
+            end = i
+            while end < n and not query[end].isspace():
+                end += 1
+            word = query[i:end]
+            if word in ("AND", "OR", "NOT"):
+                tokens.append(("operator", word))
             else:
-                # For non-regex parts, try to parse anyway to extract fixed strings
-                try:
-                    segments = self.parser.parse(part)
-                    fixed = []
-                    self._extract_fixed_strings(segments, fixed)
+                tokens.append(("bare", word))
+            i = end
 
-                    processed = []
-                    for text in fixed:
-                        # Skip if same as separator or length < 3
-                        if text == separator or len(text) < 3:
-                            continue
+        return tokens
 
-                        # Add quotes if not already quoted and doesn't match search syntax pattern
-                        # Pattern should match things like content:"value" but not URLs like https://
-                        if not (text.startswith('"') and text.endswith('"')) and not re.match(
-                            r'^[a-zA-Z]+:[\"\'"].*[\"\'"]$', text
-                        ):
-                            text = f'"{text}"'
+    def _scan_quoted(self, query: str, start: int) -> Optional[int]:
+        """Return the index just past a closing unescaped ``"``, or ``None``."""
+        i, n = start + 1, len(query)
+        while i < n:
+            if query[i] == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if query[i] == '"':
+                return i + 1
+            i += 1
+        return None
 
-                        processed.append(text)
+    def _scan_regex_span(self, query: str, start: int) -> Optional[int]:
+        """Return the index just past a closing unescaped ``/``, or ``None``."""
+        i, n = start + 1, len(query)
+        while i < n:
+            if query[i] == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if query[i] == "/":
+                return i + 1
+            i += 1
+        return None
 
-                    if processed:
-                        results.extend(processed)
-                    else:
-                        # If no fixed strings found, treat as regular string
-                        if not re.match(r"^[a-zA-Z]+:.*\S.*$", part):
-                            part = f'"{part}"'
-                        results.append(part)
+    def _clean_regex_token(self, token: str, separator: str) -> str:
+        """Extract fixed strings from one slash-delimited ``/regex/`` token."""
+        delimiter = f" {separator} "
+        pattern = token[1:-1]
 
-                except Exception:
-                    # If parsing fails, treat as regular string
-                    if not re.match(r"^[a-zA-Z]+:.*\S.*$", part):
-                        part = f'"{part}"'
-                    results.append(part)
+        try:
+            segments = self.parser.parse(pattern)
+            fixed: List[str] = []
+            self._extract_fixed_strings(segments, fixed)
 
-        # Return result
-        if not results:
+            processed: List[str] = []
+            for text in fixed:
+                # Remove backslash escapes from slash-wrapped patterns.
+                text = text.replace("\\/", "/").replace("\\\\", "\\")
+
+                # Skip if same as separator or length < 3
+                if text == separator or len(text) < 3:
+                    continue
+
+                # Add quotes if not already quoted and doesn't match search syntax
+                # pattern (things like content:"value" but not URLs like https://).
+                if not (text.startswith('"') and text.endswith('"')) and not re.match(
+                    r'^[a-zA-Z]+:[\"\'"].*[\"\'"]$', text
+                ):
+                    text = f'"{text}"'
+
+                processed.append(text)
+
+            return delimiter.join(processed)
+        except Exception as e:
+            logger.warning(f"Failed to parse regex pattern '{pattern}': {e}")
+            # If parsing fails, skip this token
             return ""
-        elif len(results) == 1:
-            return results[0]
-        else:
-            return delimiter.join(results)
 
     def _extract_fixed_strings(self, segments: List, fixed: List[str]) -> None:
         """

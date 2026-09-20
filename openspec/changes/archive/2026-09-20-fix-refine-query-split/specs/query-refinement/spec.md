@@ -20,3 +20,18 @@ Guarantees that API-mode query cleaning (`RefineEngine.clean_regex`) is search-s
 #### Scenario: Already-correct queries stay stable
 - **WHEN** `clean_regex` receives `'"sk-"'` or a qualifier-only query such as `'filename:.env'`
 - **THEN** the output equals the input (regression pin for existing behavior)
+
+#### Scenario: Mixed regex and qualifier compose
+- **WHEN** `clean_regex` receives `'/sk-[a-zA-Z0-9]{32}/ AND filename:.env'`
+- **THEN** the output is `'"sk-" AND filename:.env'` — the regex part is reduced to its quoted fixed string while the qualifier token is preserved verbatim (this form is already correct today; the fix MUST NOT alter it)
+
+### Requirement: Composition with wire-query identity
+API wire-form derivation SHALL delegate to `clean_regex` as the single source of truth, so this cleaning fix propagates automatically to wire queries, fingerprints, cache keys and queue locality with no code change outside the refine engine. Fingerprints are ephemeral (in-memory cache, per-run locality), so changed wire forms require no migration or invalidation. Outputs for the already-correct query class SHALL remain byte-identical across the fix, keeping the shared stability pins (search-aggregation golden vectors and the `_preprocess_query == wire_query` aux pin) green.
+
+#### Scenario: Fingerprint follows cleaning automatically
+- **WHEN** `clean_regex` output for a query changes as a result of this fix
+- **THEN** the API wire form and its fingerprint reflect the new cleaning with no code change in the wire-identity module, and the web-transport wire form remains the raw query verbatim
+
+#### Scenario: Shared stability pins survive the fix
+- **WHEN** the tokenizer fix lands
+- **THEN** previously pinned conversions remain byte-identical (`'/sk-[a-zA-Z0-9]{32}/'` → `'"sk-"'`, `'"sk-"'` → `'"sk-"'`), and the search-aggregation golden-vector tests plus the `_preprocess_query == wire_query` aux pin pass unchanged

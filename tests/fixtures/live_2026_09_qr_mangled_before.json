@@ -1,0 +1,30 @@
+{
+  "provenance": {
+    "endpoint": "GET https://api.github.com/search/code",
+    "query": "\"\"sk-\" filename:\" AND \"env\"",
+    "label": "mangled_wire_form_before",
+    "captured_at": "2026-09-20T20:09:35.286409+00:00",
+    "auth_mode": "bearer token (redacted)",
+    "api_version": "2022-11-28",
+    "accept": "application/vnd.github+json",
+    "sort": "indexed",
+    "order": "desc",
+    "per_page": 1,
+    "page": 1,
+    "note": "live probe for fix-refine-query-split; total_count captured from real GitHub code-search API"
+  },
+  "status": 200,
+  "headers": {
+    "content-type": "application/json",
+    "x-ratelimit-limit": "10",
+    "x-ratelimit-remaining": "9",
+    "x-ratelimit-reset": "1789935036",
+    "x-ratelimit-used": "1",
+    "x-ratelimit-resource": "code_search"
+  },
+  "body": {
+    "total_count": 0,
+    "incomplete_results": false,
+    "items": []
+  }
+}
