@@ -218,7 +218,11 @@ class ConfigLoader:
         Returns:
             PipelineConfig: Parsed pipeline configuration
         """
-        return PipelineConfig(threads=data.get("threads", {}), queue_sizes=data.get("queue_sizes", {}))
+        return PipelineConfig(
+            threads=data.get("threads", {}),
+            queue_sizes=data.get("queue_sizes", {}),
+            failure_handling=data.get("failure_handling", "shadow"),
+        )
 
     def _parse_monitoring_config(self, data: Dict[str, Any]) -> MonitoringConfig:
         """Parse system monitoring configuration section

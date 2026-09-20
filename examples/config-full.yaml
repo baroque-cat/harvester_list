@@ -40,6 +40,13 @@ pipeline:
     gather: 200000 # Acquisition tasks queue
     check: 500000 # Validation tasks queue
     inspect: 1000000 # API capability inspection tasks queue
+  # Failure-handling contract for transient fetch failures (empty-result taxonomy).
+  #   legacy: byte-for-byte pre-change behavior (typed failures swallowed; counters inert)
+  #   shadow: detect + count + log failure-empties, but keep legacy outcomes   (default)
+  #   strict: propagate failures into the bounded-requeue path; failed gathers record
+  #           visit_status='failed' (no false gathered_ok); exhausted retries drop loudly
+  # Promotion shadow -> strict is a config flip; rollback is a flip back to legacy.
+  failure_handling: "shadow" # legacy | shadow | strict
 
 # System monitoring configuration
 monitoring:

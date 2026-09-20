@@ -1,0 +1,22 @@
+{
+  "provenance": {
+    "endpoint": "GET https://api.github.com/search/code",
+    "query": "\"sk-\" AND content:\"llm\"",
+    "captured_at": "2026-09-20T18:03:15.915133+00:00",
+    "auth_mode": "bearer token (redacted)",
+    "api_version": "2022-11-28",
+    "accept": "application/vnd.github+json",
+    "note": "web-only qualifier under API transport returns HTTP 200 with zero matches"
+  },
+  "status": 200,
+  "headers": {
+    "x-ratelimit-limit": "10",
+    "x-ratelimit-remaining": "9",
+    "x-ratelimit-reset": "1789927455"
+  },
+  "body": {
+    "total_count": 0,
+    "incomplete_results": false,
+    "items": []
+  }
+}

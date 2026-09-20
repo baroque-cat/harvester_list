@@ -225,7 +225,7 @@ from constant.system import (
     SERVICE_TYPE_GITHUB_API,
     SERVICE_TYPE_GITHUB_WEB,
 )
-from core.exceptions import NetworkError, ValidationError
+from core.exceptions import NetworkError, TransientFetchError, ValidationError
 from core.models import RateLimitConfig
 from core.types import IAuthProvider
 from tools.coordinator import get_user_agent
@@ -968,15 +968,23 @@ def search_github_api(
     }
 
     client = get_github_client()
-    content = client.get(
-        url=url,
-        headers=headers,
-        interval=GITHUB_API_INTERVAL,
-        timeout=GITHUB_API_TIMEOUT,
-        credential=token,
-    )
+    try:
+        content = client.get(
+            url=url,
+            headers=headers,
+            interval=GITHUB_API_INTERVAL,
+            timeout=GITHUB_API_TIMEOUT,
+            credential=token,
+        )
+    except GithubCredentialLimited:
+        raise
+    except TransientFetchError:
+        raise
+    except Exception as e:
+        raise TransientFetchError(f"search API request failed: {e}") from e
     if isblank(content):
-        return []
+        # Failure-empty: limiter suppression or blank payload, never a zero-result answer.
+        raise TransientFetchError("empty search API response (limiter suppression or blank payload)")
     try:
         items = json.loads(content).get("items", [])
         links: set[str] = set()
@@ -1012,9 +1020,17 @@ def search_web_with_count(
         return [], 0, ""
 
     # Get results from web search
-    content = search_github_web(query, session, page)
+    try:
+        content = search_github_web(query, session, page)
+    except GithubCredentialLimited:
+        raise
+    except TransientFetchError:
+        raise
+    except Exception as e:
+        raise TransientFetchError(f"web search request failed: {e}") from e
     if isblank(content):
-        return [], 0, ""
+        # Failure-empty: blank/undecodable payload, never a zero-result answer.
+        raise TransientFetchError("empty web search response (blank payload)")
 
     # Extract links from content
     try:
@@ -1083,16 +1099,27 @@ def search_api_with_count(
     }
 
     client = get_github_client()
-    content = client.get(
-        url=url,
-        headers=headers,
-        interval=GITHUB_API_INTERVAL,
-        timeout=GITHUB_API_TIMEOUT,
-        credential=token,
-    )
+    try:
+        content = client.get(
+            url=url,
+            headers=headers,
+            interval=GITHUB_API_INTERVAL,
+            timeout=GITHUB_API_TIMEOUT,
+            credential=token,
+        )
+    except GithubCredentialLimited:
+        raise
+    except TransientFetchError:
+        raise
+    except Exception as e:
+        raise TransientFetchError(f"search API request failed: {e}") from e
     if isblank(content):
-        return [], 0, ""
+        # Failure-empty: limiter suppression (``""`` from ``get_with_headers``)
+        # or a blank payload, never a zero-result answer (design D2).
+        raise TransientFetchError("empty search API response (limiter suppression or blank payload)")
 
+    # Parsing of a successfully fetched payload stays fail-open: malformed JSON
+    # degrades to an empty result (counted elsewhere), never raises.
     try:
         data = json.loads(content)
         items = data.get("items", [])
@@ -1282,9 +1309,17 @@ def search_code(
         results = search_github_api(query=keyword, token=session, page=page, peer_page=peer_page, metadata=metadata)
         return results, ""  # API doesn't provide page content
 
-    content = search_github_web(query=keyword, session=session, page=page)
+    try:
+        content = search_github_web(query=keyword, session=session, page=page)
+    except GithubCredentialLimited:
+        raise
+    except TransientFetchError:
+        raise
+    except Exception as e:
+        raise TransientFetchError(f"web search request failed: {e}") from e
     if isblank(content):
-        return [], ""
+        # Failure-empty: blank/undecodable payload, never a zero-result answer.
+        raise TransientFetchError("empty web search response (blank payload)")
 
     try:
         regex = r'href="(/[^\s"]+/blob/(?:[^"]+)?)#L\d+"'
@@ -1309,7 +1344,7 @@ def search_code(
         return [], ""
 
 
-@handle_exceptions(default_result=[], log_level="error")
+@handle_exceptions(default_result=[], log_level="error", exclude=(TransientFetchError,))
 def collect(
     key_pattern: str,
     url: str = "",
@@ -1342,8 +1377,20 @@ def collect(
     if text:
         content = text
     else:
-        content = http_get(url=url, retries=retries, interval=COLLECT_RETRY_INTERVAL)
+        # Fetch phase: a failure here is a failure-empty and must surface as a
+        # typed transient failure instead of collapsing into an empty success
+        # (design D4, gather-outcome fidelity).  Extraction below stays fail-open.
+        try:
+            content = http_get(url=url, retries=retries, interval=COLLECT_RETRY_INTERVAL)
+        except TransientFetchError:
+            raise
+        except Exception as e:
+            raise TransientFetchError(f"gather fetch failed for url: {url}: {e}") from e
+        if not content:
+            raise TransientFetchError(f"empty gather payload for url: {url}")
 
+    # Defensive: only reachable with an explicitly empty ``text`` argument (the
+    # URL path raises on blank above); no fetch failure is silently swallowed.
     if not content:
         return []
 

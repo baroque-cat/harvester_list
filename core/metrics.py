@@ -94,6 +94,13 @@ class StageMetrics(BaseMetrics):
     last_activity: float = 0.0
     workers: int = 0
 
+    # Failure-handling counters (failure-handling spec): failure-empties
+    # detected (shadow/strict), tasks requeued after a transient failure, and
+    # tasks dropped after exceeding the bounded requeue limit.
+    failure_empties_detected: int = 0
+    tasks_requeued: int = 0
+    tasks_dropped_max_retries: int = 0
+
     @property
     def total_processed(self) -> int:
         return self.tasks.completed

@@ -133,6 +133,9 @@ class PipelineConfig:
 
     threads: Dict[str, int] = field(default_factory=_get_default_threads)
     queue_sizes: Dict[str, int] = field(default_factory=_get_default_queue_sizes)
+    # Failure-handling contract: "legacy" | "shadow" | "strict" (project
+    # paradigm: ship risky behavior behind a flag, default shadow at release).
+    failure_handling: str = "shadow"
 
     def __post_init__(self):
         if not self.threads:

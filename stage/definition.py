@@ -19,6 +19,7 @@ from constant.search import (
 )
 from constant.system import SERVICE_TYPE_GITHUB_API, SERVICE_TYPE_GITHUB_WEB
 from core.enums import ErrorReason, PipelineStage, ResultType
+from core.exceptions import TransientFetchError
 from core.models import (
     AcquisitionTask,
     CheckTask,
@@ -187,6 +188,12 @@ class SearchStage(BasePipelineStage):
             )
 
             return output
+
+        except TransientFetchError as e:
+            # Typed transient failure: keep the pre-change log, then let
+            # ``process_task`` apply the failure_handling mode policy.
+            logger.error(f"[{self.name}] error, provider: {task.provider}, task: {task}, message: {e}")
+            raise
 
         except Exception as e:
             logger.error(f"[{self.name}] error, provider: {task.provider}, task: {task}, message: {e}")
@@ -513,18 +520,31 @@ class AcquisitionStage(BasePipelineStage):
 
     def _acquisition_worker(self, task: AcquisitionTask) -> Optional[StageOutput]:
         """Pure functional acquisition worker implementation"""
+        mode = self._failure_handling_mode()
         try:
             # Execute acquisition using global collect function
             metadata: Dict[str, Any] = {}
-            services = client.collect(
-                key_pattern=task.key_pattern,
-                url=task.url,
-                retries=task.retries,
-                address_pattern=task.address_pattern,
-                endpoint_pattern=task.endpoint_pattern,
-                model_pattern=task.model_pattern,
-                metadata=metadata,
-            )
+            try:
+                services = client.collect(
+                    key_pattern=task.key_pattern,
+                    url=task.url,
+                    retries=task.retries,
+                    address_pattern=task.address_pattern,
+                    endpoint_pattern=task.endpoint_pattern,
+                    model_pattern=task.model_pattern,
+                    metadata=metadata,
+                )
+            except TransientFetchError as e:
+                if mode == "strict":
+                    # The blob fetch never happened: record a failed gather (no
+                    # coverage row) and propagate for bounded requeue (design D4).
+                    self._record_gathered(task, success=False)
+                    raise
+                # legacy/shadow preserve the pre-change outcome (empty success);
+                # shadow additionally counts and logs the failure-empty.
+                if mode == "shadow":
+                    self._detect_failure_empty(task, e)
+                services = []
 
             # Lazily enrich the gathered repository's metadata (cache-first;
             # fail-open) so link rows carry repository push evidence.
@@ -561,6 +581,11 @@ class AcquisitionStage(BasePipelineStage):
             self._record_gathered(task, success=True)
 
             return output
+
+        except TransientFetchError:
+            # Strict mode: propagate to ``process_task`` for mode-policy handling
+            # (the failed gather was already recorded above).
+            raise
 
         except Exception as e:
             # Write-only hook: record failed gather
@@ -664,7 +689,11 @@ class CheckStage(BasePipelineStage):
                         logger.info(
                             f"[{self.name}] rate limit exceeded for provider: {task.provider}, max: {max_value}"
                         )
-                        return None
+                        # Limiter starvation is a failure-empty: requeue instead
+                        # of silently dropping the key's validation (design D5).
+                        raise TransientFetchError(
+                            f"provider limiter starved for provider: {task.provider}"
+                        )
 
             # Execute check
             result = provider.check(
@@ -708,6 +737,11 @@ class CheckStage(BasePipelineStage):
                     output.add_result(task.provider, ResultType.INVALID.value, [task.service])
 
             return output
+
+        except TransientFetchError:
+            # Limiter starvation: propagate so ``process_task`` applies the mode
+            # policy (strict requeues).  No provider result to report.
+            raise
 
         except Exception as e:
             # Report rate limit failure
@@ -848,6 +882,11 @@ class InspectStage(BasePipelineStage):
                 output.add_models(task.provider, task.service.key, models)
 
             return output
+
+        except TransientFetchError:
+            # Uniform contract (design D8): typed transient failures are handled
+            # by the process_task mode policy, not swallowed here.
+            raise
 
         except Exception as e:
             logger.error(f"[{self.name}] inspect models error, provider: {task.provider}, task: {task}, message: {e}")

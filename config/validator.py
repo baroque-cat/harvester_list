@@ -15,6 +15,8 @@ Key Features:
 
 from typing import List
 
+from constant import search as search_constants
+
 from .schemas import Config, LoadBalanceStrategy, TaskConfig
 
 
@@ -43,6 +45,9 @@ class ConfigValidator:
 
         # Validate pipeline configuration
         self._validate_pipeline_config(config)
+
+        # Validate query syntax against the chosen transport (advisory lint)
+        self._validate_query_transport_compat(config)
 
         # Validate monitoring configuration
         self._validate_monitoring_config(config)
@@ -132,6 +137,9 @@ class ConfigValidator:
         """
         pipeline = config.pipeline
 
+        if pipeline.failure_handling not in ("legacy", "shadow", "strict"):
+            self.errors.append("Pipeline failure_handling must be one of: legacy, shadow, strict")
+
         required_stages = {"search", "gather", "check", "inspect"}
         for stage in required_stages:
             # Validate thread counts
@@ -145,6 +153,34 @@ class ConfigValidator:
                 self.errors.append(f"Missing queue size for stage: {stage}")
             elif pipeline.queue_sizes[stage] <= 0:
                 self.errors.append(f"Queue size for {stage} must be positive")
+
+    def _validate_query_transport_compat(self, config: Config) -> None:
+        """Warn about web-only qualifiers under API transport (advisory lint).
+
+        The GitHub code-search REST API silently treats web-only qualifiers as
+        zero matches (live probe recorded in ``constant/search.py``).  This is a
+        warning, never an error: wire behavior is a moving target, so the config
+        stays loadable and the warning merely goes stale if the API changes.
+        The qualifier list is read dynamically from ``constant.search`` so it
+        can be extended without touching this logic (config-query-lint S4).
+        """
+        qualifiers = getattr(search_constants, "WEB_ONLY_QUALIFIERS", ())
+        if not qualifiers:
+            return
+
+        for task in config.tasks:
+            if not getattr(task, "enabled", False) or not getattr(task, "use_api", False):
+                continue
+            for index, condition in enumerate(task.conditions or []):
+                query = (getattr(condition, "query", "") or "").lower()
+                for qualifier in qualifiers:
+                    if qualifier.lower() in query:
+                        self.warnings.append(
+                            f"Task '{task.name}' condition {index + 1}: query contains web-only "
+                            f"qualifier '{qualifier}', which the GitHub code-search API ignores "
+                            f"(transport: api) and returns zero matches for. Use an API-compatible "
+                            f"query, or a web provider (use_api: false)."
+                        )
 
     def _validate_monitoring_config(self, config: Config) -> None:
         """Validate monitoring configuration section

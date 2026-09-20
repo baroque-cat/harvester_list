@@ -1,0 +1,15 @@
+{
+  "provenance": {
+    "endpoint": "GET https://github.com/octocat/Hello-World/blob/master/THIS-FILE-DOES-NOT-EXIST-xyz123.py",
+    "captured_at": "2026-09-20T18:03:17.331718+00:00",
+    "auth_mode": "session cookie (redacted)",
+    "note": "absent/deleted blob path; body excerpt only (HTML page)"
+  },
+  "status": 404,
+  "final_url": "https://github.com/octocat/Hello-World/blob/master/THIS-FILE-DOES-NOT-EXIST-xyz123.py",
+  "headers": {
+    "content-type": "text/html; charset=utf-8"
+  },
+  "body_excerpt": "\n\n\n\n  \n\n<!DOCTYPE html>\n<html\n  lang=\"en\"\n  \n  data-color-mode=\"auto\" data-light-theme=\"light\" data-dark-theme=\"dark\"\n  data-a11y-animated-images=\"system\" data-a11y-link-underlines=\"true\"\n  \n  >\n\n    <style>\n:root {\n  --fontStack-monospace: \"Monaspace Neon\", ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace !important;\n}\n</style>\n\n\n\n\n  <head>\n    <meta charset=\"utf-8\">\n  <link rel=\"dns-prefetch\" href=\"https://github.githubassets.com\">\n  <link rel=\"dns-prefetch\" href=\"https://avatars.githubusercontent.com\">\n  <link rel=\"dns-prefetch\" href=\"https://github-cloud.s",
+  "body_truncated": true
+}

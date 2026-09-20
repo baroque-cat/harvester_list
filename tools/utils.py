@@ -18,7 +18,11 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 def handle_exceptions(
-    default_result: Any = None, log_level: str = "error", reraise: bool = False, exception_types: tuple = (Exception,)
+    default_result: Any = None,
+    log_level: str = "error",
+    reraise: bool = False,
+    exception_types: tuple = (Exception,),
+    exclude: tuple = (),
 ) -> Callable[[F], F]:
     """Decorator for consistent exception handling.
 
@@ -27,6 +31,8 @@ def handle_exceptions(
         log_level: Logging level (debug, info, warning, error, critical)
         reraise: Whether to reraise the exception after logging
         exception_types: Tuple of exception types to catch
+        exclude: Exception types that must propagate even though they match
+            ``exception_types`` (used to narrow a catch-all fail-open contract)
 
     Returns:
         Decorated function with exception handling
@@ -37,6 +43,8 @@ def handle_exceptions(
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
+            except exclude:
+                raise
             except exception_types as e:
                 # Extract context information
                 context = {

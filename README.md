@@ -855,6 +855,48 @@ feature below is the first read path.
   SQLite WAL is not safe over network filesystems (NFS/SMB).
 - **Disk estimate:** roughly 200 bytes per link row — about 200 MB for 1M links.
 
+### Two storage layers: shards + registry
+
+Link discovery is recorded twice, by design:
+
+1. **NDJSON shards (audit log, per provider).**
+   `<workspace>/providers/<folder>/shards/links/links_<YYYYMMDD_HHMMSS_mmm>.ndjson`
+   — append-only, one JSON record per line in a `{"value": "<url>"}` envelope,
+   each shard accompanied by an atomic `.index.json` sidecar. Old shards are
+   never deleted; on restart `recover_tasks()` replays them into acquisition
+   tasks. This layer is the immutable discovery trail.
+2. **SQLite registry (global ledger).** The single `<workspace>/registry.sqlite`
+   outside `providers/`, which deduplicates and enriches everything the shards
+   record. Tables: `links` (one row per canonical URL — hash, owner/repo/path,
+   first-seen/last-seen/gathered timestamps, `visit_status`, transport,
+   freshness columns, priority), `link_coverage` (which provider + pattern set
+   already gathered the link), `keys` (provider-scoped key ledger), `repos`
+   (metadata cache), `runs` (run journal with config digests), `meta`.
+
+The registry upserts on every encounter (`last_seen_ts` advances, history is
+preserved), survives process restarts and abrupt kills via WAL, and drains its
+writer queue on graceful shutdown.
+
+### Provider switches
+
+Links are provider-independent artifacts, so the registry is global while
+provider attribution lives in columns and tables — switching the provider set
+between runs loses nothing:
+
+- Run under **provider A**: the link is recorded (`provider=A` as discoverer);
+  a successful gather writes `visit_status='gathered_ok'` plus a coverage row
+  `(url, A, patterns_hash_A)`.
+- Later run under **provider B**: the same URL is upserted — dates, timestamps
+  and history preserved — but gather-skip condition 4 finds no coverage row for
+  `(B, patterns_hash_B)`, so the link is gathered **once** under B's patterns
+  (`regathered_coverage_gap`). The re-gather is necessary, not wasteful:
+  extraction runs per-provider regexes, so A's pass never saw B's keys. After
+  success, both coverage rows coexist and either provider skips the link within
+  its TTL.
+- Keys never collide across providers: `key_hash = sha256(provider|key|address|endpoint)`.
+- The `runs` journal keeps which run used which providers/patterns
+  (`config_digest`), so cross-provider history stays auditable.
+
 ### Configuration
 
 ```yaml
@@ -1258,6 +1300,65 @@ Because every raw input is in the record, consumers can re-rank offline with
 their own weights without touching the database. See
 `docs/specs/candidates_export.md` for the frozen field dictionary, the
 `schema_version` policy and advanced direct-SQLite guidance.
+
+### Failure handling (`pipeline.failure_handling`)
+
+Transient fetch failures used to be indistinguishable from legitimate empty
+results: a network error after retries, a limiter suppression or a blank payload
+collapsed into an empty search page (counted as a processed task and deduplicated
+away for the rest of the run) or into a `gathered_ok` registry row (suppressing
+re-gather until TTL expiry). `pipeline.failure_handling` governs the fix, which
+classifies every empty outcome as either a **legitimate zero** (the remote
+answered successfully with zero matches) or a **failure-empty** (no usable answer
+was obtained) and routes the latter into the existing bounded-requeue machinery.
+
+```yaml
+pipeline:
+  failure_handling: "shadow"   # legacy | shadow | strict
+```
+
+**Modes**
+
+- `legacy` — byte-for-byte pre-change behavior: typed failures are swallowed and
+  the new counters stay inert. The pure rollback / kill-switch state.
+- `shadow` (default at release) — every failure-empty is detected, counted in
+  `failure_empties_detected` and logged with stage/provider/task context, while
+  task outcomes and harvest output remain exactly as in `legacy`. This measures
+  real-world frequency without changing behavior.
+- `strict` — full enforcement: a failed task is re-enqueued with its attempt
+  counter incremented and counted as an error (never as a success); a gather
+  whose blob fetch failed is recorded `visit_status='failed'` with no coverage
+  row, making the existing `regathered_failed_retry` path reachable; a
+  provider-limiter-starved check requeues instead of vanishing. After
+  `global.max_retries_requeued` attempts the task is dropped loudly (warning log
+  + counter).
+
+**Counters** (per stage, in `StageMetrics` and the status surface):
+`failure_empties_detected`, `tasks_requeued`, `tasks_dropped_max_retries`.
+`failure_empties_detected` operates in `shadow` and `strict`; the requeue/drop
+counters tick only when `strict` actually propagates a failure. Search failures
+also now increment `total_errors` (they previously did not).
+
+**Config lint.** The validator emits an advisory warning (never an error) when a
+`use_api: true` provider carries a web-only qualifier such as `content:` in a
+condition query, because the code-search REST API silently returns zero matches
+for it (live probe 2026-09-20). The qualifier list is data-driven
+(`constant/search.py`, `WEB_ONLY_QUALIFIERS`), so extending it needs no validator
+change.
+
+**Promotion & rollback (project paradigm).** Ship `shadow`, run one
+representative cycle (including a rate-limit storm), review
+`failure_empties_detected` per stage and the dead-qualifier warnings, then
+promote to `strict` with a config flip and watch `tasks_requeued` /
+`tasks_dropped_max_retries` and registry `visit_status='failed'` inflow. Rollback
+is a config flip back to `legacy` — no code removal and no data migration;
+historical false `gathered_ok` rows age out via `skip.gather_ttl_hours`.
+
+**Unchanged:** credential cooldown/rotation (60→900s escalation, blocking
+`_get_available`), NDJSON shard formats, `recover_tasks()` replay, registry
+schema/SQL, dedup-id structure and wire-query construction. Parsing of a
+successfully fetched payload stays fail-open: malformed data degrades to
+empty/NULL with a counted warning, never an exception.
 
 ## Troubleshooting
 

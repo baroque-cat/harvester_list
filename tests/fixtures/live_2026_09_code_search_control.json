@@ -1,0 +1,30 @@
+{
+  "provenance": {
+    "endpoint": "GET https://api.github.com/search/code",
+    "query": "\"sk-\"",
+    "captured_at": "2026-09-20T18:03:16.673957+00:00",
+    "auth_mode": "bearer token (redacted)",
+    "api_version": "2022-11-28",
+    "accept": "application/vnd.github+json",
+    "note": "control for the content: probe; item list sampled to one entry"
+  },
+  "status": 200,
+  "headers": {
+    "x-ratelimit-limit": "10",
+    "x-ratelimit-remaining": "8",
+    "x-ratelimit-reset": "1789927455"
+  },
+  "body": {
+    "total_count": 46006272,
+    "incomplete_results": false,
+    "items_sampled": 1,
+    "items": [
+      {
+        "html_url": "https://github.com/tsuyopon/memo/blob/973fb02c875677b3da654d5c3e83fe08c2342d33/ss.md",
+        "repository": {
+          "full_name": "tsuyopon/memo"
+        }
+      }
+    ]
+  }
+}

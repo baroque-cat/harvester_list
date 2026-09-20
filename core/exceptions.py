@@ -37,6 +37,21 @@ class NetworkError(BaseError):
         super().__init__(message=message, reason=reason, **kwargs)
 
 
+class TransientFetchError(NetworkError, ConnectionError):
+    """No usable answer was obtained for a fetch request.
+
+    Raised by the client boundary (``search.client``) when an empty outcome is
+    a *failure-empty* rather than a legitimate zero: transport exception after
+    retries exhausted, local limiter suppression, or a blank payload.  It also
+    subclasses the builtin :class:`ConnectionError` so the existing stage retry
+    policy (which retries ``ConnectionError``/``TimeoutError``) treats it as a
+    retryable transient failure.
+    """
+
+    def __init__(self, message: str, reason: ErrorReason = ErrorReason.NETWORK_ERROR, **kwargs):
+        super().__init__(message=message, reason=reason, **kwargs)
+
+
 class ValidationError(BaseError):
     """Input validation errors"""
 

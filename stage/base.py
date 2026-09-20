@@ -26,6 +26,7 @@ from typing import (
 from config.schemas import Config, StageConfig, TaskConfig
 from constant.system import DEFAULT_SHUTDOWN_TIMEOUT
 from core.enums import PipelineStage
+from core.exceptions import TransientFetchError
 from core.metrics import StageMetrics
 from core.models import LinkMetadata, ProviderTask
 from core.types import IAuthProvider, IProvider
@@ -166,14 +167,24 @@ class BasePipelineStage(ABC, WorkerManageable):
         # Maximum number of retries
         self.max_retries = max(max_retries, 0)
 
-        # Retry policy
-        self.retry_policy = retry_policy or ExponentialBackoff(max_retries=self.max_retries)
+        # Retry policy.  The dedup gate in ``put_task`` enforces the real bound
+        # (it rejects requeues once ``attempts > max_retries``); the policy is
+        # given one extra step so the boundary attempt reaches the gate and is
+        # dropped loudly (counted) instead of being abandoned in the loop.
+        self.retry_policy = retry_policy or ExponentialBackoff(max_retries=self.max_retries + 1)
 
         # Statistics
         self.total_processed = 0
         self.total_errors = 0
         self.last_activity = time.time()
         self.start_time = time.time()
+
+        # Failure-handling observability (failure-handling spec).  In legacy
+        # mode the detection counter stays inert; requeue/drop counters reflect
+        # the worker loop only when a typed failure actually propagates.
+        self.failure_empties_detected = 0
+        self.tasks_requeued = 0
+        self.tasks_dropped_max_retries = 0
 
         # Work state tracking
         self.active_workers = 0
@@ -251,6 +262,8 @@ class BasePipelineStage(ABC, WorkerManageable):
             # Logic: attempts == 0 means new task, but same task already queued
             if task_id in self.processed and (task.attempts == 0 or task.attempts > self.max_retries):
                 if task.attempts > self.max_retries:
+                    with self.stats_lock:
+                        self.tasks_dropped_max_retries += 1
                     logger.warning(
                         f"[{self.name}] task=[{task_id}] discarded, max retries=[{self.max_retries}] reached"
                     )
@@ -296,6 +309,11 @@ class BasePipelineStage(ABC, WorkerManageable):
             # Set task metrics
             metrics.tasks.completed = self.total_processed
             metrics.tasks.failed = self.total_errors
+
+            # Failure-handling observability counters (failure-handling spec).
+            metrics.failure_empties_detected = self.failure_empties_detected
+            metrics.tasks_requeued = self.tasks_requeued
+            metrics.tasks_dropped_max_retries = self.tasks_dropped_max_retries
 
             return metrics
 
@@ -375,6 +393,24 @@ class BasePipelineStage(ABC, WorkerManageable):
         """
         return self.adjust_workers(count)
 
+    def _failure_handling_mode(self) -> str:
+        """Return the configured ``failure_handling`` mode (design D3)."""
+        config = getattr(self.resources, "config", None)
+        pipeline = getattr(config, "pipeline", None)
+        mode = getattr(pipeline, "failure_handling", "shadow")
+        return mode if mode in ("legacy", "shadow", "strict") else "shadow"
+
+    def _detect_failure_empty(self, task: ProviderTask, error: Exception) -> None:
+        """Count and log a detected failure-empty (shadow and strict only)."""
+        if self._failure_handling_mode() == "legacy":
+            return
+        with self.stats_lock:
+            self.failure_empties_detected += 1
+        logger.warning(
+            f"[{self.name}] failure-empty detected, provider: {getattr(task, 'provider', '')}, "
+            f"task: {task}, error: {error}"
+        )
+
     def process_task(self, task: ProviderTask) -> Optional[StageOutput]:
         """Template method for task processing with common workflow."""
         # Step 1: Validate task type
@@ -395,6 +431,15 @@ class BasePipelineStage(ABC, WorkerManageable):
                 result = self._post_process(task, result)
 
             return result
+
+        except TransientFetchError as e:
+            # Typed transient failure: shadow counts/logs then swallows (same
+            # outcome as legacy); strict lets it escape so the worker loop's
+            # existing retry branch fires (design D3).
+            self._detect_failure_empty(task, e)
+            if self._failure_handling_mode() == "strict":
+                raise
+            return None
 
         except Exception as e:
             logger.error(f"[{self.name}] task processing failed: {e}")
@@ -466,6 +511,9 @@ class BasePipelineStage(ABC, WorkerManageable):
 
                         task.attempts += 1
                         success = self.put_task(task)
+                        if success:
+                            with self.stats_lock:
+                                self.tasks_requeued += 1
                         status = "successfully" if success else "failed"
                         logger.warning(f"[{self.name}] requeued {status} after {delay:.1f}s delay, task: {task}")
 
