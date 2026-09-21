@@ -592,6 +592,39 @@ class RefineGovernorConfig:
 
 
 @dataclass
+class TaskQueueConfig:
+    """Durable task-queue backend configuration (fix-queue-persistence-under-load).
+
+    ``backend`` selects the queue implementation per stage: ``memory`` keeps the
+    historical in-RAM ``queue.Queue`` behavior byte-identically, ``sqlite``
+    enables a durable per-stage store.  ``visibility_timeout_s`` bounds how long
+    a claimed-but-unacknowledged task stays invisible before the periodic sweep
+    returns it to pending; ``max_age_hours`` is the startup/import age gate
+    (parity with the legacy snapshot gate).
+    """
+
+    backend: str = "memory"
+    visibility_timeout_s: float = 300.0
+    max_age_hours: float = 24.0
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_task_queue_config on purpose: this
+        # guards direct (non-loader) construction in tests and embedding.
+        backend = str(self.backend).strip().lower()
+        if backend not in ("memory", "sqlite"):
+            raise ValueError("queue.backend must be one of: memory, sqlite")
+        self.backend = backend
+
+        self.visibility_timeout_s = float(self.visibility_timeout_s)
+        if self.visibility_timeout_s <= 0:
+            raise ValueError("queue.visibility_timeout_s must be positive")
+
+        self.max_age_hours = float(self.max_age_hours)
+        if self.max_age_hours <= 0:
+            raise ValueError("queue.max_age_hours must be positive")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
     base_url: str = ""
@@ -722,6 +755,7 @@ class Config:
     prioritization: PrioritizationConfig = field(default_factory=PrioritizationConfig)
     aggregation: AggregationConfig = field(default_factory=AggregationConfig)
     refine_governor: RefineGovernorConfig = field(default_factory=RefineGovernorConfig)
+    queue: TaskQueueConfig = field(default_factory=TaskQueueConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -755,6 +789,7 @@ class Config:
             "prioritization": self._dataclass_to_dict(self.prioritization),
             "aggregation": self._dataclass_to_dict(self.aggregation),
             "refine_governor": self._dataclass_to_dict(self.refine_governor),
+            "queue": self._dataclass_to_dict(self.queue),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

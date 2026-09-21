@@ -100,6 +100,9 @@ class StageMetrics(BaseMetrics):
     failure_empties_detected: int = 0
     tasks_requeued: int = 0
     tasks_dropped_max_retries: int = 0
+    # Durable-backend write failures (parallels tasks_dropped_max_retries):
+    # a task dropped because the storage write failed is always counted.
+    tasks_dropped_backend_errors: int = 0
 
     @property
     def total_processed(self) -> int:

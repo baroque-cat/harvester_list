@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
@@ -126,12 +126,28 @@ class QueueStateInfo:
 class QueueManager(PeriodicTaskManager):
     """Type-safe queue manager with enum-based stage management"""
 
-    def __init__(self, workspace: str, save_interval: float = 60.0, shutdown_timeout: float = 5.0):
+    def __init__(
+        self,
+        workspace: str,
+        save_interval: float = 60.0,
+        shutdown_timeout: float = 5.0,
+        backend: str = "memory",
+        visibility_timeout_s: float = 300.0,
+        max_age_hours: float = 24.0,
+    ):
         # Initialize base class
         super().__init__("QueueManager", save_interval, shutdown_timeout)
 
+        # Durable backend selection (fix-queue-persistence-under-load).  Under
+        # ``sqlite`` the JSON snapshot paths stay untouched for the memory
+        # backend, and are replaced by maintenance/import for durable stages.
+        self.backend = str(backend).strip().lower()
+        self.visibility_timeout_s = float(visibility_timeout_s)
+
         # Create configuration
-        self.config = QueueConfig.from_workspace(workspace, save_interval=save_interval)
+        self.config = QueueConfig.from_workspace(
+            workspace, save_interval=save_interval, max_age_hours=max_age_hours
+        )
 
         # Type-safe stage file mapping
         self.stage_files = self.config.get_all_stage_files()
@@ -139,10 +155,26 @@ class QueueManager(PeriodicTaskManager):
         # Thread safety
         self.lock = threading.Lock()
 
-        # Stages to save (set by start_periodic_save)
+        # Stages to save (set by start_periodic_save/attach_stages)
         self.stages = None
 
         logger.info(f"Initialized type-safe queue manager at: {self.config.persistence_dir}")
+
+    def attach_stages(self, stages: Dict[str, BasePipelineStage]) -> None:
+        """Attach created stages so durable maintenance can reach their queues.
+
+        Called by ``Pipeline`` right after ``_create_stages`` (design D11/D12);
+        the facade never opens a durable db file itself.
+        """
+        self.stages = stages
+
+    @staticmethod
+    def _durable_queue(stage: BasePipelineStage):
+        """Return the stage's durable queue, or None for the memory backend."""
+        queue_obj = getattr(stage, "queue", None)
+        if queue_obj is not None and hasattr(queue_obj, "checkpoint") and hasattr(queue_obj, "counts"):
+            return queue_obj
+        return None
 
     def _get_queue_filepath(self, stage: Union[PipelineStage, str]) -> Path:
         """Get filepath for a stage with type-safe enum support"""
@@ -284,8 +316,24 @@ class QueueManager(PeriodicTaskManager):
             return []
 
     def save_all_queues(self, stages: Dict[str, BasePipelineStage]) -> None:
-        """Save state for all queues with type-safe stage handling"""
+        """Save state for all queues with type-safe stage handling.
+
+        Durable stages are maintained in place (expired-claim sweep + passive
+        checkpoint) with no drain and no JSON serialization (design D12); the
+        memory backend keeps the historical snapshot path verbatim.
+        """
         for stage_name, stage in stages.items():
+            durable = self._durable_queue(stage)
+            if durable is not None:
+                try:
+                    swept = durable.sweep_expired_claims()
+                    if swept:
+                        logger.info(f"Swept {swept} expired claim(s) for {stage_name}")
+                    durable.checkpoint()
+                except Exception as e:
+                    logger.error(f"Durable queue maintenance failed for {stage_name}: {e}")
+                continue
+
             try:
                 # Convert to enum for type safety
                 stage_enum = PipelineStage(stage_name)
@@ -297,7 +345,30 @@ class QueueManager(PeriodicTaskManager):
                 continue
 
     def load_all_queues(self) -> Dict[str, List[ProviderTask]]:
-        """Load state for all queues with type-safe stage enumeration"""
+        """Load state for all queues with type-safe stage enumeration.
+
+        Under ``sqlite`` the one-shot legacy importer runs and every durable
+        stage recovers in place (constructor reclaim + age purge), so no
+        re-``put_task`` list is returned for it (design D12/D14).  A stage that
+        failed open to the memory backend still recovers through the legacy
+        snapshot path.
+        """
+        if self.backend == "sqlite":
+            self._import_legacy_snapshots()
+            all_tasks = {}
+            for stage_enum in PipelineStage:
+                stage = (self.stages or {}).get(stage_enum.value)
+                if self._durable_queue(stage) is not None:
+                    continue  # already recovered in place
+                task_list = self.load_queue_state(stage_enum)
+                if task_list:
+                    all_tasks[stage_enum.value] = task_list
+
+            total_tasks = sum(len(task_list) for task_list in all_tasks.values())
+            if total_tasks > 0:
+                logger.info(f"Loaded {total_tasks} total tasks from previous session")
+            return all_tasks
+
         all_tasks = {}
 
         for stage_enum in PipelineStage:
@@ -310,6 +381,124 @@ class QueueManager(PeriodicTaskManager):
             logger.info(f"Loaded {total_tasks} total tasks from previous session")
 
         return all_tasks
+
+    # ------------------------------------------------------------------
+    # One-shot legacy importer (design D13)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _utc_stamp() -> str:
+        return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+
+    def _parse_snapshot_payload(self, data: Dict[str, Any]) -> "tuple[List[ProviderTask], float]":
+        """Parse both known envelope shapes, returning (tasks, age_hours).
+
+        Mirrors ``load_queue_state`` exactly: current typed envelope first, the
+        legacy fallback (numeric ``saved_at`` + bare ``tasks``) second.  Per-task
+        deserialization failures are skipped loudly, never fatal.
+        """
+        try:
+            state = QueueStateInfo.from_dict(data)
+            task_list = []
+            for task_data in state.tasks:
+                try:
+                    task_list.append(TaskFactory.from_dict(task_data))
+                except Exception as e:
+                    logger.warning(f"Failed to deserialize task: {e}")
+                    continue
+            age_hours = (datetime.now() - state.saved_at).total_seconds() / 3600
+            return task_list, age_hours
+        except (KeyError, ValueError, TypeError):
+            task_list = []
+            for task_data in data.get(QueueStateField.TASKS.value, []):
+                try:
+                    task_list.append(TaskFactory.from_dict(task_data))
+                except Exception as e:
+                    logger.warning(f"Failed to deserialize task: {e}")
+                    continue
+
+            saved_at = data.get(QueueStateField.SAVED_AT.value, 0)
+            if isinstance(saved_at, str):
+                try:
+                    saved_at = datetime.fromisoformat(saved_at).timestamp()
+                except ValueError:
+                    saved_at = float(saved_at) if saved_at else 0
+            elif not isinstance(saved_at, (int, float)):
+                saved_at = 0
+            age_hours = (time.time() - saved_at) / 3600
+            return task_list, age_hours
+
+    def _import_legacy_snapshots(self) -> None:
+        """Import legacy ``{stage}_queue.json`` snapshots once, then neutralize.
+
+        Idempotent by two guards: the durable store must be empty, and the file
+        is renamed on success.  Aged snapshots are parked ``.expired-``; corrupt
+        files are skipped loudly and left in place.
+        """
+        for stage_name, stage in (self.stages or {}).items():
+            durable = self._durable_queue(stage)
+            if durable is None:
+                continue
+            try:
+                stage_enum = PipelineStage(stage_name)
+            except ValueError:
+                continue
+
+            json_path = self._get_queue_filepath(stage_enum)
+            if not json_path.exists():
+                continue
+
+            # Zero-rows guard: never double-import into a non-empty store.
+            try:
+                counts = durable.counts()
+            except Exception as e:
+                logger.error(f"Failed to inspect durable queue for {stage_name}: {e}")
+                continue
+            if counts.get("pending", 0) or counts.get("claimed", 0):
+                continue
+
+            try:
+                with open(json_path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to parse legacy queue snapshot for {stage_name}: {e}; leaving file in place"
+                )
+                continue
+
+            if not isinstance(data, dict):
+                logger.warning(f"Legacy queue snapshot for {stage_name} is not an object; skipped")
+                continue
+
+            tasks, age_hours = self._parse_snapshot_payload(data)
+            if age_hours > float(self.config.max_age_hours):
+                dest = json_path.with_name(f"{json_path.name}.expired-{self._utc_stamp()}")
+                try:
+                    json_path.rename(dest)
+                except OSError as e:
+                    logger.error(f"Failed to park aged snapshot for {stage_name}: {e}")
+                    continue
+                logger.warning(
+                    f"Legacy queue snapshot for {stage_name} is {age_hours:.1f}h old "
+                    f"(> {self.config.max_age_hours}h); parked as {dest.name}, not imported"
+                )
+                continue
+
+            if not tasks:
+                continue
+
+            try:
+                durable.bulk_insert(tasks)
+            except Exception as e:
+                logger.error(f"Failed to import legacy snapshot for {stage_name}: {e}")
+                continue
+
+            dest = json_path.with_name(f"{json_path.name}.imported-{self._utc_stamp()}")
+            try:
+                json_path.rename(dest)
+            except OSError as e:
+                logger.error(f"Imported snapshot for {stage_name} but failed to rename it: {e}")
+                continue
+            logger.info(f"Imported {len(tasks)} task(s) from legacy snapshot for {stage_name} as {dest.name}")
 
     def clear_queue_state(self, stage: Union[PipelineStage, str]) -> None:
         """Clear saved state for a stage with type-safe enum support"""
@@ -340,6 +529,36 @@ class QueueManager(PeriodicTaskManager):
         info = {}
 
         for stage_enum in PipelineStage:
+            # Durable stages report live counts + db file size, not JSON lists.
+            stage = (self.stages or {}).get(stage_enum.value)
+            durable = self._durable_queue(stage) if stage is not None else None
+            if durable is not None:
+                try:
+                    counts = durable.counts()
+                    pending = int(counts.get("pending", 0))
+                    db_path = self.config.persistence_dir / f"{stage_enum.value}_queue.sqlite"
+                    size = db_path.stat().st_size if db_path.exists() else 0
+                    status_enum = QueueStateStatus.ACTIVE if pending else QueueStateStatus.EMPTY
+                    metrics = QueueStateMetrics(
+                        stage=stage_enum.value,
+                        tasks=pending,
+                        saved_at=datetime.now(),
+                        file_size=size,
+                        status=status_enum,
+                    )
+                    metrics.calculate_age()
+                    info[stage_enum.value] = metrics
+                except Exception as e:
+                    info[stage_enum.value] = QueueStateMetrics(
+                        stage=stage_enum.value,
+                        tasks=0,
+                        saved_at=datetime.now(),
+                        file_size=0,
+                        status=QueueStateStatus.ERROR,
+                        error_message=str(e),
+                    )
+                continue
+
             filepath = self._get_queue_filepath(stage_enum)
 
             if filepath.exists():

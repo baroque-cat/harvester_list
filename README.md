@@ -1506,6 +1506,71 @@ with bounded inflow — and a force multiplier for R3.
 > silent-drop path under any unforeseen inflow. Rollback of the governor itself
 > is `mode: off`.
 
+### Durable task queues (`queue.backend`)
+
+All pipeline work used to live in RAM `queue.Queue`s that reached disk only via a
+periodic JSON snapshot which **drained** each queue and put the tasks back
+(`stage/base.py`). Under load that lost work three ways: the drain/put-back race
+with workers (the incident's thousands of `lost task during persistence`), the
+silent drop on `queue.Full`, and an OOM kill losing everything queued since the
+last snapshot. `queue.backend` selects an opt-in durable store that makes
+enqueue loss structurally impossible.
+
+```yaml
+queue:
+  backend: "memory"          # memory | sqlite
+  visibility_timeout_s: 300  # sqlite: reclaim a claim after this many seconds
+  max_age_hours: 24          # startup/import age gate
+```
+
+**Flag semantics.** A two-position switch; flips require a restart.
+
+- `memory` — **default**, byte-identical to the pre-change system: bounded
+  `queue.Queue`, periodic JSON snapshots, drop-on-`Full` after a 1 s put. This is
+  the rollback state and is unchanged by this feature.
+- `sqlite` — each stage owns a durable WAL-mode store at
+  `<workspace>/queue_state/{stage}_queue.sqlite`. `put` is a **committed INSERT**
+  (so returning success means the task is durable), there is no capacity bound
+  (`queue.Full` is unreachable), periodic saving becomes a non-destructive
+  query plus a WAL checkpoint, and the drain race disappears. RAM holds only the
+  transient task being handed to a worker.
+
+**Durability doctrine.** The store is **at-least-once**: a claim is invisible to
+other consumers for `visibility_timeout_s`; an unacknowledged claim (crash,
+SIGKILL, OOM) is reclaimed to pending on the next startup, and a claim stuck
+longer than the visibility timeout is returned by the periodic sweep. Note the
+consequence: if a worker stalls *past* `visibility_timeout_s` but is still alive,
+its row becomes claimable again and a second worker may process the same task —
+the stalled worker's late acknowledgement then deletes the row the second worker
+holds (a no-op DELETE for that worker, never an error). Duplicate execution is
+therefore possible whenever a single task outlives the visibility timeout; keep
+`visibility_timeout_s` comfortably above your slowest legitimate task. Downstream
+work is idempotent (in-memory dedup gate, registry upserts, shard recovery), so a
+post-crash replay is safe. Under `synchronous=NORMAL`, a **machine** crash/power
+loss can lose the last committed transactions — matching `registry.sqlite`;
+process-kill classes (OOM/SIGTERM/SIGKILL) lose nothing acknowledged. A task
+dropped by a runtime storage write error is always logged and counted in
+`StageMetrics.tasks_dropped_backend_errors` — never silent.
+
+**Operations.** `max_age_hours` purges rows older than the gate at startup with a
+loud WARNING stating the count; `visibility_timeout_s` bounds how long a stuck
+worker's claim stays invisible. On a first `sqlite` start any legacy
+`{stage}_queue.json` snapshot is imported **once** (both envelope formats, within
+the age gate) into the store and renamed `*.imported-<ts>`; an aged snapshot is
+parked `*.expired-<ts>` (never deleted) and a corrupt file is skipped loudly and
+left in place. Under `sqlite`, `pipeline.queue_sizes` is ignored (disk is the
+bound; the refine governor bounds inflow) and a startup WARNING says so.
+
+**Fail-open.** If the store cannot be opened or bootstrapped, the stage logs an
+ERROR naming the stage, sets a degraded marker and falls back to a functional
+in-memory queue — harvest availability first, never a silent failure.
+
+**Promotion / rollback.** Ship dark: the default stays `memory`. After the live
+verification gate (SIGKILL/restart resume, RSS flat, importer replay) promotion
+is a one-line config flip to `backend: sqlite`; rollback is flipping back —
+imported `.imported-<ts>` files can be renamed back and the sqlite files are
+inert leftovers.
+
 ### Failure handling (`pipeline.failure_handling`)
 
 Transient fetch failures used to be indistinguishable from legitimate empty

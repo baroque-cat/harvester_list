@@ -85,6 +85,9 @@ class ConfigValidator:
         # Validate search-work fan-out governor configuration
         self._validate_refine_governor_config(config)
 
+        # Validate durable task-queue backend configuration
+        self._validate_task_queue_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -505,6 +508,24 @@ class ConfigValidator:
 
         if int(governor.max_refine_depth) > 5:
             self.errors.append("RefineGovernor max_refine_depth must be at most 5")
+
+    def _validate_task_queue_config(self, config: Config) -> None:
+        """Validate the durable task-queue backend configuration section.
+
+        Misconfiguration here is loud: an unknown backend would silently fall
+        back to a different durability story, and a non-positive timeout/age
+        would make claims unrescuable or purge everything on startup.
+        """
+        queue_config = config.queue
+
+        if queue_config.backend not in ("memory", "sqlite"):
+            self.errors.append("Queue backend must be one of: memory, sqlite")
+
+        if float(queue_config.visibility_timeout_s) <= 0:
+            self.errors.append("Queue visibility_timeout_s must be positive")
+
+        if float(queue_config.max_age_hours) <= 0:
+            self.errors.append("Queue max_age_hours must be positive")
 
     def _validate_rate_limits(self, config: Config) -> None:
         """Validate rate limits configuration

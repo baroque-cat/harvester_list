@@ -334,6 +334,23 @@ refine_governor:
   # 10000 ~= one daily cycle at the configured rate)
   max_search_tasks_per_run: 10000
 
+# Durable task-queue backend (fix-queue-persistence-under-load)
+# Selects the per-stage queue implementation. memory is the byte-identical
+# rollback default; sqlite makes enqueue loss structurally impossible (no
+# capacity drops, no snapshot drain race). Enqueue is at-least-once: crashed
+# claims are reclaimed at startup and downstream work is idempotent.
+queue:
+  # memory | sqlite (default memory; flips need a restart)
+  backend: "memory"
+  # sqlite only: seconds a claimed-but-unacknowledged task stays invisible
+  # before the periodic sweep returns it to pending (> 0)
+  visibility_timeout_s: 300
+  # Startup/legacy-import age gate in hours; older rows are purged loudly at
+  # startup and aged snapshots are parked, never imported (> 0)
+  max_age_hours: 24
+  # NOTE: pipeline.queue_sizes is ignored when backend is sqlite (disk is the
+  # bound; the refine governor bounds inflow) -- a startup WARNING says so.
+
 # Global rate limiting configuration
 ratelimits:
   # GitHub API rate limits

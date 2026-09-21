@@ -5,7 +5,10 @@ Base classes for pipeline stages.
 Hybrid architecture with dependency injection and pure functional processing.
 """
 
+import json
+import os
 import queue
+import sqlite3
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -30,6 +33,7 @@ from core.exceptions import TransientFetchError
 from core.metrics import StageMetrics
 from core.models import LinkMetadata, ProviderTask
 from core.types import IAuthProvider, IProvider
+from storage.task_queue import SqliteTaskQueue
 from tools.logger import get_logger
 from tools.ratelimit import RateLimiter
 from tools.retry import ExponentialBackoff, RetryPolicy
@@ -145,14 +149,28 @@ class BasePipelineStage(ABC, WorkerManageable):
         max_retries: int = 0,
         dedup_max_size: int = 100_000,
         retry_policy: Optional[RetryPolicy] = None,
+        queue_backend: str = "memory",
+        queue_dir: Optional[str] = None,
+        queue_visibility_timeout_s: float = 300.0,
+        queue_max_age_hours: float = 24.0,
     ) -> None:
         self.name = name
         self.resources = resources
         self.handler = handler
         self.thread_count = thread_count
 
-        # Task queue
-        self.queue = queue.Queue(maxsize=queue_size)
+        # Task queue.  Default backend stays the historical in-memory FIFO so
+        # behavior is byte-identical unless ``queue.backend: sqlite`` is set
+        # (fix-queue-persistence-under-load, design D8).
+        self.queue_degraded = False
+        self._durable_queue = False
+        self.queue = self._build_queue(
+            queue_backend,
+            queue_dir,
+            queue_size,
+            queue_visibility_timeout_s,
+            queue_max_age_hours,
+        )
 
         # Task deduplication (bounded)
         self.processed: set = set()
@@ -186,6 +204,8 @@ class BasePipelineStage(ABC, WorkerManageable):
         self.failure_empties_detected = 0
         self.tasks_requeued = 0
         self.tasks_dropped_max_retries = 0
+        # Durable-backend write failures (a dropped task is always counted).
+        self.tasks_dropped_backend_errors = 0
 
         # Work state tracking
         self.active_workers = 0
@@ -198,6 +218,49 @@ class BasePipelineStage(ABC, WorkerManageable):
         self.zombie_threads = []
 
         logger.info(f"Created stage: {name}, threads: {thread_count}, queue: {queue_size}")
+
+    def _build_queue(
+        self,
+        queue_backend: str,
+        queue_dir: Optional[str],
+        queue_size: int,
+        visibility_timeout_s: float,
+        max_age_hours: float,
+    ) -> Any:
+        """Build the stage queue for the selected backend (design D7/D11).
+
+        The memory branch is untouched.  The sqlite branch is fail-open: any
+        open/bootstrap failure logs an ERROR naming the stage, marks the stage
+        degraded and falls back to a functional in-memory queue so a disk
+        problem never zeroes the run.
+        """
+        if str(queue_backend).strip().lower() != "sqlite":
+            return queue.Queue(maxsize=queue_size)
+
+        try:
+            if not queue_dir:
+                raise ValueError("queue_dir is required for the sqlite backend")
+
+            # Lazily imported: only the durable path needs the task serializers.
+            from stage.factory import TaskFactory
+
+            path = os.path.join(str(queue_dir), f"{self.name}_queue.sqlite")
+            durable = SqliteTaskQueue(
+                path,
+                serializer=lambda task: json.dumps(task.to_dict(), ensure_ascii=False),
+                deserializer=TaskFactory.from_dict,
+                name=self.name,
+                visibility_timeout_s=visibility_timeout_s,
+                max_age_hours=max_age_hours,
+            )
+            self._durable_queue = True
+            return durable
+        except (OSError, sqlite3.Error, ValueError) as e:
+            logger.error(
+                f"[{self.name}] failed to open durable task queue, falling back to memory backend: {e}"
+            )
+            self.queue_degraded = True
+            return queue.Queue(maxsize=queue_size)
 
     def start(self) -> None:
         """Start worker threads"""
@@ -272,21 +335,42 @@ class BasePipelineStage(ABC, WorkerManageable):
 
         # Try to add to queue
         try:
-            self.queue.put(task, timeout=1.0)
-            with self.dedup_lock:
-                if task_id not in self.processed:
-                    self.processed.add(task_id)
-                    self.processed_order.append(task_id)
-                    # Evict oldest when exceeding cap to avoid unbounded growth
-                    if len(self.processed) > self.dedup_max_size and self.processed_order:
-                        oldest = self.processed_order.popleft()
-                        if oldest != task_id:
-                            self.processed.discard(oldest)
-
-            return True
+            if self._durable_queue:
+                # Commit-per-put: returning normally means the task is durable
+                # (design D6).  There is no capacity bound, so queue.Full is
+                # unreachable on this branch.
+                self.queue.put(
+                    task,
+                    timeout=1.0,
+                    dedup_id=task_id,
+                    created_at=getattr(task, "created_at", None),
+                    attempts=getattr(task, "attempts", 0),
+                )
+            else:
+                self.queue.put(task, timeout=1.0)
         except queue.Full:
             logger.warning(f"[{self.name}] queue is full")
             return False
+        except Exception as e:
+            if self._durable_queue:
+                # Runtime storage failure: loud + counted, never silent (S6).
+                with self.stats_lock:
+                    self.tasks_dropped_backend_errors += 1
+                logger.warning(f"[{self.name}] dropped task, durable queue write failed: {e}")
+                return False
+            raise
+
+        with self.dedup_lock:
+            if task_id not in self.processed:
+                self.processed.add(task_id)
+                self.processed_order.append(task_id)
+                # Evict oldest when exceeding cap to avoid unbounded growth
+                if len(self.processed) > self.dedup_max_size and self.processed_order:
+                    oldest = self.processed_order.popleft()
+                    if oldest != task_id:
+                        self.processed.discard(oldest)
+
+        return True
 
     def is_finished(self) -> bool:
         """Check if stage is finished processing"""
@@ -315,6 +399,7 @@ class BasePipelineStage(ABC, WorkerManageable):
             metrics.failure_empties_detected = self.failure_empties_detected
             metrics.tasks_requeued = self.tasks_requeued
             metrics.tasks_dropped_max_retries = self.tasks_dropped_max_retries
+            metrics.tasks_dropped_backend_errors = self.tasks_dropped_backend_errors
 
             return metrics
 
@@ -327,7 +412,15 @@ class BasePipelineStage(ABC, WorkerManageable):
         return len(self.zombie_threads)
 
     def get_pending_tasks(self) -> List[ProviderTask]:
-        """Get all pending tasks (for persistence)"""
+        """Get all pending tasks (for persistence).
+
+        The durable backend answers with a non-destructive query (S14); the
+        memory backend keeps the historical drain-and-put-back path verbatim.
+        """
+        snapshot = getattr(self.queue, "snapshot_pending", None)
+        if callable(snapshot):
+            return snapshot()
+
         tasks = []
         temp_tasks = []
 

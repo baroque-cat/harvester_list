@@ -44,6 +44,7 @@ from .schemas import (
     StageConfig,
     StorageConfig,
     TaskConfig,
+    TaskQueueConfig,
     WorkerManagerConfig,
 )
 from .validator import ConfigValidator
@@ -151,6 +152,10 @@ class ConfigLoader:
         # Parse search-work fan-out governor configuration
         if "refine_governor" in data:
             config.refine_governor = self._parse_refine_governor_config(data["refine_governor"])
+
+        # Parse durable task-queue backend configuration
+        if "queue" in data:
+            config.queue = self._parse_task_queue_config(data["queue"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -459,6 +464,21 @@ class ConfigLoader:
             max_refine_depth=data.get("max_refine_depth", 2),
             max_partitions_per_refine=data.get("max_partitions_per_refine", 128),
             max_search_tasks_per_run=data.get("max_search_tasks_per_run", 10000),
+        )
+
+    def _parse_task_queue_config(self, data: Dict[str, Any]) -> TaskQueueConfig:
+        """Parse the durable task-queue backend configuration section.
+
+        Args:
+            data: Task-queue configuration data
+
+        Returns:
+            TaskQueueConfig: Parsed task-queue configuration
+        """
+        return TaskQueueConfig(
+            backend=data.get("backend", "memory"),
+            visibility_timeout_s=data.get("visibility_timeout_s", 300.0),
+            max_age_hours=data.get("max_age_hours", 24.0),
         )
 
     def _parse_rate_limits(self, data: Dict[str, Any]) -> Dict[str, RateLimitConfig]:

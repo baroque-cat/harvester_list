@@ -5,6 +5,7 @@ Dynamic pipeline system for asynchronous multi-provider task processing.
 Implements producer-consumer pattern with configurable worker threads and dynamic stage management.
 """
 
+import os
 import time
 from typing import Dict, List, Optional
 
@@ -159,6 +160,9 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             workspace=config.global_config.workspace,
             save_interval=config.persistence.queue_interval,
             shutdown_timeout=float(config.persistence.shutdown_timeout),
+            backend=config.queue.backend,
+            visibility_timeout_s=config.queue.visibility_timeout_s,
+            max_age_hours=config.queue.max_age_hours,
         )
 
         # Start periodic snapshots for results
@@ -179,6 +183,9 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
 
         # Create pipeline stages dynamically
         self._create_stages()
+
+        # Give the queue manager stage handles for durable maintenance/import
+        self.queue_manager.attach_stages(self.stages)
 
         # Cache dependency resolution results
         self._order_cache = None
@@ -309,6 +316,16 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         thread_config = self.config.pipeline.threads
         queue_config = self.config.pipeline.queue_sizes
 
+        # Durable task-queue backend (fix-queue-persistence-under-load).  Under
+        # sqlite, per-stage store files live beside the legacy JSON snapshots.
+        queue_backend = self.config.queue.backend
+        queue_dir = os.path.join(self.config.global_config.workspace, "queue_state")
+        if queue_backend == "sqlite" and queue_config:
+            logger.warning(
+                "queue.backend=sqlite ignores pipeline.queue_sizes (disk is the bound); "
+                f"configured sizes: {queue_config}"
+            )
+
         for name in ordered_stages:
             definition = self.get_stage_def(name)
             if not definition:
@@ -323,6 +340,10 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
                     thread_count=max(thread_config.get(name, 1), 1),
                     queue_size=max(queue_config.get(name, 1000), 1),
                     max_retries=self.config.global_config.max_retries_requeued,
+                    queue_backend=queue_backend,
+                    queue_dir=queue_dir,
+                    queue_visibility_timeout_s=self.config.queue.visibility_timeout_s,
+                    queue_max_age_hours=self.config.queue.max_age_hours,
                 )
 
                 self.stages[name] = stage
@@ -380,6 +401,14 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         self.early_stop.close()
         self.key_ledger.close()
         self.recheck.close()
+
+        # Persist final queue state before the queue manager stops (both
+        # backends).  Stages are already stopped, so this observes a quiescent
+        # system; a failure is logged and never aborts shutdown (design D10).
+        try:
+            self.queue_manager.save_all_queues(self.stages)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.error(f"Final queue save failed: {e}")
 
         # Stop managers
         self.queue_manager.stop()
