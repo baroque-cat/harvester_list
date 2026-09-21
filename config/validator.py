@@ -82,6 +82,9 @@ class ConfigValidator:
         # Validate shared search-response aggregation configuration
         self._validate_aggregation_config(config)
 
+        # Validate search-work fan-out governor configuration
+        self._validate_refine_governor_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -475,6 +478,33 @@ class ConfigValidator:
         join_timeout = float(aggregation.join_timeout_s)
         if not (1 <= join_timeout <= 600):
             self.errors.append("Aggregation join_timeout_s must be between 1 and 600")
+
+    def _validate_refine_governor_config(self, config: Config) -> None:
+        """Validate the search-work fan-out governor configuration section.
+
+        Misconfiguration here is loud: an unknown mode can silently disable
+        enforcement (the ungoverned state is the recorded OOM incident), and a
+        non-positive cap would make the governor refuse every child.
+        """
+        governor = config.refine_governor
+
+        if governor.mode not in ("off", "shadow", "on"):
+            self.errors.append("RefineGovernor mode must be one of: off, shadow, on")
+
+        for name in ("max_refine_depth", "max_partitions_per_refine"):
+            value = int(getattr(governor, name))
+            if value <= 0:
+                self.errors.append(f"RefineGovernor {name} must be positive")
+
+        # The run budget is a cap like the others: spec requirement 5 fails
+        # non-positive caps loudly.  (``RefineGovernorConfig.__post_init__``
+        # raises first for loader-built configs; this keeps direct construction
+        # honest too.)
+        if int(governor.max_search_tasks_per_run) <= 0:
+            self.errors.append("RefineGovernor max_search_tasks_per_run must be positive")
+
+        if int(governor.max_refine_depth) > 5:
+            self.errors.append("RefineGovernor max_refine_depth must be at most 5")
 
     def _validate_rate_limits(self, config: Config) -> None:
         """Validate rate limits configuration

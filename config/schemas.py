@@ -548,6 +548,50 @@ class AggregationConfig:
 
 
 @dataclass
+class RefineGovernorConfig:
+    """Search-work fan-out governor configuration (add-refine-fanout-governor).
+
+    ``mode`` is the project tri-mode rollout flag: ``off`` reproduces the
+    pre-change (unbounded) behavior byte-equivalently, ``shadow`` enqueues every
+    child while counting/logging would-be refusals, ``on`` enforces.  The caps
+    bound refinement recursion depth, per-refine partition width and the total
+    number of admitted refined children per process run (roots and pagination
+    tasks exempt).  Defaults are grounded in the 2026-09-21 measurements
+    (see design D7).
+    """
+
+    mode: str = "on"
+    max_refine_depth: int = 2
+    max_partitions_per_refine: int = 128
+    max_search_tasks_per_run: int = 10000
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_refine_governor_config on purpose:
+        # this guards direct (non-loader) construction in tests and embedding.
+        mode = str(self.mode).strip().lower()
+        if mode not in ("off", "shadow", "on"):
+            raise ValueError("refine_governor.mode must be one of: off, shadow, on")
+        self.mode = mode
+
+        for name in ("max_refine_depth", "max_partitions_per_refine"):
+            value = int(getattr(self, name))
+            if value <= 0:
+                raise ValueError(f"refine_governor.{name} must be positive")
+            setattr(self, name, value)
+
+        # The run budget is a cap, so non-positive values fail validation loudly
+        # (spec requirement 5).  ``RefineGovernor`` itself stays tolerant of 0 so
+        # tests/embedders can construct an already-exhausted budget directly;
+        # that state is simply not reachable through configuration.
+        self.max_search_tasks_per_run = int(self.max_search_tasks_per_run)
+        if self.max_search_tasks_per_run <= 0:
+            raise ValueError("refine_governor.max_search_tasks_per_run must be positive")
+
+        if self.max_refine_depth > 5:
+            raise ValueError("refine_governor.max_refine_depth must be at most 5")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
     base_url: str = ""
@@ -677,6 +721,7 @@ class Config:
     recheck: RecheckConfig = field(default_factory=RecheckConfig)
     prioritization: PrioritizationConfig = field(default_factory=PrioritizationConfig)
     aggregation: AggregationConfig = field(default_factory=AggregationConfig)
+    refine_governor: RefineGovernorConfig = field(default_factory=RefineGovernorConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -709,6 +754,7 @@ class Config:
             "recheck": self._dataclass_to_dict(self.recheck),
             "prioritization": self._dataclass_to_dict(self.prioritization),
             "aggregation": self._dataclass_to_dict(self.aggregation),
+            "refine_governor": self._dataclass_to_dict(self.refine_governor),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

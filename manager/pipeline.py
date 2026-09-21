@@ -135,6 +135,9 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         # Shared search-response aggregation (off by default; config-only rollback)
         self._configure_aggregation(config)
 
+        # Search-work fan-out governor (on by default; see design D1/D6)
+        self._configure_refine_governor(config)
+
         # Repo-metadata enrichment (off by default).  The cache is the registry
         # and the enricher rides the shared github_api client/buckets.
         self.repo_meta_store = RepoMetaStore(
@@ -217,6 +220,42 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             logger.error(f"Failed to configure aggregation, falling back to off: {e}")
             configure_aggregator(None)
 
+    def _configure_refine_governor(self, config: Config) -> None:
+        """Install the search-work fan-out governor from config.
+
+        Read once at wiring time (mode flips require a restart, consistent with
+        the other tri-mode features).  Deviation from the aggregation precedent
+        (design D1): a construction failure falls back to a governor with the
+        built-in safe defaults in ``on`` mode, never to the unbounded state --
+        the ungoverned state is the recorded OOM incident.
+        """
+        from search.refine_governor import RefineGovernor
+
+        cfg = config.refine_governor
+        try:
+            governor = RefineGovernor(
+                mode=cfg.mode,
+                max_refine_depth=cfg.max_refine_depth,
+                max_partitions_per_refine=cfg.max_partitions_per_refine,
+                max_search_tasks_per_run=cfg.max_search_tasks_per_run,
+            )
+            logger.info(
+                f"Refine governor configured: mode={cfg.mode} "
+                f"depth={cfg.max_refine_depth} partitions={cfg.max_partitions_per_refine} "
+                f"budget={cfg.max_search_tasks_per_run}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to configure refine governor, using safe defaults (mode=on): {e}")
+            governor = RefineGovernor()
+        self.refine_governor = governor
+
+    def get_refine_metrics(self) -> Dict[str, Any]:
+        """Refinement governance metrics for ``PipelineStatus.refine_metrics``."""
+        governor = getattr(self, "refine_governor", None)
+        if governor is None:
+            return {}
+        return governor.metrics
+
     def _aggregate_stages(self) -> List[str]:
         """Aggregate stage requirements from all enabled tasks"""
         requested = set()
@@ -263,6 +302,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             enrichment=self.enrichment,
             early_stop=self.early_stop,
             key_ledger=self.key_ledger,
+            refine_governor=self.refine_governor,
         )
 
         # Create stages in dependency order
@@ -420,6 +460,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             recheck_metrics=self.recheck.to_stats(),
             prioritization_metrics=self._prioritization_metrics(),
             aggregation_metrics=get_aggregation_metrics(),
+            refine_metrics=self.get_refine_metrics(),
         )
 
         return pipeline_status

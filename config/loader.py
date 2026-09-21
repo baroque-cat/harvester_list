@@ -38,6 +38,7 @@ from .schemas import (
     PipelineConfig,
     PrioritizationConfig,
     RecheckConfig,
+    RefineGovernorConfig,
     RegistryConfig,
     SkipConfig,
     StageConfig,
@@ -146,6 +147,10 @@ class ConfigLoader:
         # Parse shared search-response aggregation configuration
         if "aggregation" in data:
             config.aggregation = self._parse_aggregation_config(data["aggregation"])
+
+        # Parse search-work fan-out governor configuration
+        if "refine_governor" in data:
+            config.refine_governor = self._parse_refine_governor_config(data["refine_governor"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -438,6 +443,22 @@ class ConfigLoader:
             ttl_api_s=data.get("ttl_api_s", 300.0),
             max_bytes=data.get("max_bytes", 64 * 1024 * 1024),
             join_timeout_s=data.get("join_timeout_s", 60.0),
+        )
+
+    def _parse_refine_governor_config(self, data: Dict[str, Any]) -> RefineGovernorConfig:
+        """Parse the search-work fan-out governor configuration section.
+
+        Args:
+            data: Refine-governor configuration data
+
+        Returns:
+            RefineGovernorConfig: Parsed refine-governor configuration
+        """
+        return RefineGovernorConfig(
+            mode=data.get("mode", "on"),
+            max_refine_depth=data.get("max_refine_depth", 2),
+            max_partitions_per_refine=data.get("max_partitions_per_refine", 128),
+            max_search_tasks_per_run=data.get("max_search_tasks_per_run", 10000),
         )
 
     def _parse_rate_limits(self, data: Dict[str, Any]) -> Dict[str, RateLimitConfig]:

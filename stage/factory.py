@@ -34,6 +34,7 @@ class TaskFactory:
         address_pattern: str = "",
         endpoint_pattern: str = "",
         model_pattern: str = "",
+        refine_depth: int = 0,
     ) -> SearchTask:
         """Create a search task"""
         return SearchTask(
@@ -45,6 +46,7 @@ class TaskFactory:
             address_pattern=address_pattern,
             endpoint_pattern=endpoint_pattern,
             model_pattern=model_pattern,
+            refine_depth=refine_depth,
         )
 
     @staticmethod

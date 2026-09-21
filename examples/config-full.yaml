@@ -308,6 +308,32 @@ aggregation:
   # issues its own real request (worst case equals pre-change behavior)
   join_timeout_s: 60
 
+# Search-work fan-out governor (add-refine-fanout-governor)
+# Bounds refinement recursion and queue inflow: at most max_search_tasks_per_run
+# refined children per process run, each refine clamped to max_partitions_per_refine
+# partitions and recursion stopped at max_refine_depth. Roots and page tasks are
+# exempt. Never rewrites wire queries; engine internals untouched.
+refine_governor:
+  # Rollout policy: off | shadow | on
+  #   off    - byte-equivalent pre-change behavior (unclamped, no depth stop)
+  #   shadow - enqueue everything as in off, count/log every would-be refusal
+  #   on     - enforce the caps below (default; the ungoverned state OOM-killed
+  #            production on 2026-09-21)
+  mode: "on"
+  # Refinement recursion cap: roots start at 0, children +1, at the cap the task
+  # paginates instead of refining (1..5)
+  max_refine_depth: 2
+  # Partitions handed to the query generator per refine, bounding engine-side
+  # materialization; the generator's output is sorted by ascending wire
+  # fingerprint (search/querykey.py) then truncated to this cap -- deterministic
+  # across processes and without a permanently excluded keyspace region
+  # (positive; 128 ~= 15 min of fetches per parent at 0.15 req/s)
+  max_partitions_per_refine: 128
+  # Admitted refined children per process run; roots and pagination tasks do not
+  # consume it (> 0 -- non-positive caps fail validation loudly;
+  # 10000 ~= one daily cycle at the configured rate)
+  max_search_tasks_per_run: 10000
+
 # Global rate limiting configuration
 ratelimits:
   # GitHub API rate limits

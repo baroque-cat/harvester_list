@@ -112,6 +112,7 @@ class SearchTask(ProviderTask):
     address_pattern: str = ""
     endpoint_pattern: str = ""
     model_pattern: str = ""
+    refine_depth: int = 0  # additive governance metadata; absent -> 0 (legacy)
 
     def _serialize_data(self) -> Dict[str, Any]:
         return {
@@ -132,6 +133,22 @@ class SearchTask(ProviderTask):
         self.address_pattern = data.get("address_pattern", "")
         self.endpoint_pattern = data.get("endpoint_pattern", "")
         self.model_pattern = data.get("model_pattern", "")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize task, carrying refine_depth as additive top-level metadata.
+
+        Kept outside ``data`` so a pre-change queue entry (key simply absent)
+        is unambiguous; ``from_dict`` defaults the missing key to 0.
+        """
+        payload = super().to_dict()
+        payload["refine_depth"] = self.refine_depth
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SearchTask":
+        instance = super().from_dict(data)
+        instance.refine_depth = int(data.get("refine_depth", 0))
+        return instance
 
     def get_search_term(self) -> str:
         """Get the primary search term"""

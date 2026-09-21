@@ -1400,6 +1400,112 @@ data migration.
 > its rollback is simply reverting the commit, and it never changes
 > `aggregation_decisions.jsonl` Jaccards for the already-correct query class.
 
+### Search-work fan-out governor (`refine_governor`)
+
+When a search's reported `total_count` exceeds the transport limit, the refine
+engine splits the query and the search stage used to materialize **every**
+resulting child, with no depth counter, no per-refine partition cap and no run
+budget — and each child whose own total still exceeded the limit refined again.
+On a broad seed this recursed without bound. The 2026-09-21 production incident
+(systemd host, 4 API providers sharing `/sk-[a-zA-Z0-9]{32}/`, total ≈ 46 M)
+reached a 3 999 992 / 4 000 000 search queue with ≈ 95 tasks processed,
+**6.9 GB RSS + 7.4 GB swap**, OOM-killed after ~4 minutes, with thousands of
+tasks lost to the persistence drain race. Historically the blow-up was masked by
+silent `queue.Full` truncation at the default 100 000-slot queue; the incident
+config raised the queue to 4 M and removed that brake.
+
+The governor converts the de-facto ceiling into a **declared, deterministic,
+observable, config-tunable** policy. It sits strictly between "the engine
+produced candidate children" and "children enter the queue": it never rewrites
+wire queries, fingerprints, baskets, dedup ids, early-stop or the failure
+contract.
+
+```yaml
+refine_governor:
+  mode: "on"                    # off | shadow | on
+  max_refine_depth: 2           # refinement recursion cap (1..5)
+  max_partitions_per_refine: 128  # per-refine partition clamp (positive)
+  max_search_tasks_per_run: 10000 # admitted refined children per process run (> 0)
+```
+
+**Modes.** A three-position flag; flips require a restart.
+
+- `off` — byte-equivalent pre-change behavior: unclamped partitions, no depth
+  stop, budget inert, all counters silent. Rollback state.
+- `shadow` — every child is enqueued exactly as in `off`, while every would-be
+  clamp/truncation/depth/budget refusal is computed, counted and logged
+  (WARNING). Measures the coverage price before enforcement.
+- `on` — decisions enforced. **Default `on`** is a deliberate deviation from
+  shadow-first shipping: the ungoverned state is an active, recorded OOM defect,
+  and the historical de-facto ceiling was already stricter than these caps for
+  any broad seed. Operators wanting measurement first flip to `shadow` in one
+  line.
+
+**What is enforced.**
+
+- *Depth:* roots are depth 0; children get `parent + 1`; page tasks keep the
+  parent's depth. At `max_refine_depth` a task that still exceeds the limit does
+  **not** refine again — it falls through to ordinary pagination within the
+  existing transport page cap (`API_MAX_PAGES`/`WEB_MAX_PAGES`), and
+  `parents_at_depth_cap_paginated` increments.
+- *Width:* the partition count handed to the generator is clamped to
+  `max_partitions_per_refine`, so the uncapped candidate list is never
+  materialized; the returned list is then sorted by ascending
+  `search/querykey.fingerprint` (sha256 of `"<api|web>|<wire query>"`) and
+  truncated to the cap. Sorting makes admission reproducible across processes
+  regardless of the engine's set-based ordering. Fingerprint order — rather than
+  lexicographic — also spreads the truncation gaps pseudo-randomly over the key
+  space, so no fixed region is systematically excluded run after run: measured on
+  the incident seed at cap 128 (144 candidates), lexicographic order dropped
+  **every** `w x y z` child on every run (~11 % permanent blind spot) while
+  fingerprint order drops a scattered few that differ per parent.
+- *Volume:* refined children are admitted in that same fingerprint order until
+  `max_search_tasks_per_run` is exhausted; the remainder is refused with a
+  per-child WARNING naming provider, parent query and reason (`budget`). Root
+  tasks (configured conditions) and page tasks are **exempt** — the configured
+  conditions always run. The budget resets each process run.
+
+**Default basis (2026-09-21 measurements).** The offline generator emits 72 /
+1 296 / **46 656** children for partitions 64 / 1 000 / 46 007 — the last in
+0.13 s (4 providers ⇒ 186 624 first-level tasks instantly, before recursion). A
+live `api.github.com/search/code` calibration shows heavy skew: `"sk-000"` →
+75 136 (refines again), `"sk-i00"` → 24, `"sk-z00"` → 9. Covering the 47.4 M root
+through a 1 000-per-query API needs ≥ 47 449 fetches ≈ **88 h per provider** at
+0.15 req/s, so full enumeration is economically impossible — coverage must be
+traded loudly, not silently. `max_partitions_per_refine=128` ≈ 15 min of fetches
+per parent and absorbs the engine's ~1.35× partition overshoot;
+`max_search_tasks_per_run=10 000` ≈ 18.5 h ≈ one daily cycle at the configured
+rate, ~10× below the old silent-truncation queue ceiling.
+
+**Coverage trade-off.** Broad seeds are covered **partially by design**. The
+coverage estimate per refined parent is `min(1.0, admitted × limit / max(total,
+1))` — the fraction of the reported space reachable if every admitted child fills
+a page window. It ignores child-total skew and is an approximation; `shadow` mode
+calibrates expectations before relying on `on`. Raising the caps is a config
+edit; lowering is a one-flip rollback.
+
+**Metrics.** Exposed in `PipelineStatus.refine_metrics`: `mode`,
+`children_generated`, `children_admitted`, `refused_depth`, `refused_budget`,
+`truncated_to_cap`, `parents_refined`, `parents_at_depth_cap_paginated`,
+`budget_remaining`, `coverage_estimate_min` / `coverage_estimate_avg`. Each
+refined parent also logs an INFO line (`generated` / `admitted` / `truncated` /
+`refused_budget` / `coverage`).
+
+**Relationships.** The env seatbelts `REGEX_MAX_QUERIES` / `REGEX_MAX_DEPTH`
+(`search/github/refine/config.py`) remain as engine-level defense in depth but are
+**superseded as policy** by this section. This change is step R1 of the
+remediation roadmap (`plan.md`): it is the safety precondition for R2
+(`fix-queue-persistence-under-load`) — durable-queue backpressure is only safe
+with bounded inflow — and a force multiplier for R3.
+
+> **Operations: `queue_sizes.search`.** With the governor bounding inflow (budget
+> ≪ queue), the incident-sized `queue_sizes.search: 4000000` no longer serves a
+> purpose and MAY be lowered back to a sane value (e.g. `100000`). Do this **only
+> together with R2** (`fix-queue-persistence-under-load`): until the
+> put-on-`Full` semantics are fixed, a smaller queue still risks the historical
+> silent-drop path under any unforeseen inflow. Rollback of the governor itself
+> is `mode: off`.
+
 ### Failure handling (`pipeline.failure_handling`)
 
 Transient fetch failures used to be indistinguishable from legitimate empty

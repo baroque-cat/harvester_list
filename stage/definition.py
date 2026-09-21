@@ -337,13 +337,36 @@ class SearchStage(BasePipelineStage):
         limit = API_LIMIT if task.use_api else WEB_LIMIT
         per_page = API_RESULTS_PER_PAGE if task.use_api else WEB_RESULTS_PER_PAGE
 
+        governor = getattr(self.resources, "refine_governor", None)
+
+        # Governor depth gate: at the configured cap refinement is replaced by
+        # the ordinary pagination branch below (partial coverage, counted).
+        refine = total > limit
+        if refine and governor is not None and not governor.may_refine(task.refine_depth):
+            governor.record_depth_cap_pagination()
+            logger.info(
+                f"[{self.name}] depth cap reached (depth {task.refine_depth}), paginating "
+                f"instead of refining for provider: {task.provider}, query: {task.query}"
+            )
+            refine = False
+
         # If needs refine query
-        if total > limit:
+        if refine:
             # Regenerate the query with less data
             partitions = int(math.ceil(total / limit))
+            if governor is not None:
+                # Bound engine-side materialization at the source.
+                partitions = governor.clamp_partitions(partitions)
             queries = RefineEngine.get_instance().generate_queries(query=task.query, partitions=partitions)
+            generated = len(queries)
+            if governor is not None:
+                # Deterministic clamp/sort/truncate + per-run budget admission.
+                queries = governor.select_children(
+                    task.provider, task.query, queries, limit, total, use_api=task.use_api
+                )
 
             # Add new query tasks to output
+            enqueued = 0
             for query in queries:
                 if not query:
                     logger.warning(
@@ -365,12 +388,15 @@ class SearchStage(BasePipelineStage):
                     address_pattern=task.address_pattern,
                     endpoint_pattern=task.endpoint_pattern,
                     model_pattern=task.model_pattern,
+                    refine_depth=task.refine_depth + 1,
                 )
 
                 output.add_task(refined_task, PipelineStage.SEARCH.value)
+                enqueued += 1
 
             logger.info(
-                f"[{self.name}] generated {len(queries)} refined tasks for provider: {task.provider}, query: {task.query}"
+                f"[{self.name}] generated {generated} refined tasks, enqueued {enqueued} "
+                f"for provider: {task.provider}, query: {task.query}"
             )
 
         # If needs pagination and not refining
@@ -467,6 +493,7 @@ class SearchStage(BasePipelineStage):
             address_pattern=task.address_pattern,
             endpoint_pattern=task.endpoint_pattern,
             model_pattern=task.model_pattern,
+            refine_depth=task.refine_depth,  # pagination is not refinement
         )
 
     def _generate_page_tasks(self, task: SearchTask, total: int, per_page: int) -> List[SearchTask]:

@@ -209,6 +209,9 @@ class PipelineStatus:
     # Shared search-response aggregation counters (empty while off/unconfigured).
     aggregation_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Search-work fan-out governor counters (empty while off/unconfigured).
+    refine_metrics: Dict[str, Any] = field(default_factory=dict)
+
     # Periodic re-check driver counters (empty while disabled).
     recheck_metrics: Dict[str, Any] = field(default_factory=dict)
 
