@@ -536,6 +536,15 @@ Examples:
             status = app.get_status()
             logger.info(f"Summary: Runtime {status.runtime:.1f}s")
 
+            try:
+                # Credential-liveness counters (design D20): the acceptance rows
+                # of the live gate must be readable from a real run's output.
+                from tools.state import credential_metrics_summary
+
+                logger.info(f"Credential liveness: {credential_metrics_summary()}")
+            except Exception:
+                pass
+
             if status.monitoring_status:
                 monitoring_stats = status.monitoring_status
                 if isinstance(monitoring_stats, dict):

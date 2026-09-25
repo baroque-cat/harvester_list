@@ -17,13 +17,13 @@ Key Features:
 import threading
 from typing import Optional
 
-from config import get_config
 from config.schemas import Config
 from core.types import IAuthProvider
 
 from .agent import Agents
 from .credential import Credentials
 from .logger import get_logger
+from .state import CredentialsExhausted
 
 logger = get_logger("manager")
 
@@ -41,6 +41,11 @@ class ResourceManager(IAuthProvider):
             config: Configuration object, loads from global config if None
         """
         if config is None:
+            # Lazy import: config/__init__ imports config.loader at module level,
+            # which may import tools.logger; a module-level ``from config import
+            # get_config`` here would close that cycle at package init.
+            from config import get_config
+
             config = get_config()
 
         self._config = config
@@ -130,9 +135,17 @@ class ResourceManager(IAuthProvider):
 
         Returns:
             Optional[str]: Session token or None if not available
+
+        Raises:
+            CredentialsExhausted: when the bounded selector spent its budget.
+                Typed pool exhaustion must reach callers so stages DEFER the
+                task; collapsing it to ``None`` would silently complete work
+                empty (fix-credential-liveness design D18).
         """
         try:
             return self.get_credentials().get_session()
+        except CredentialsExhausted:
+            raise
         except Exception as e:
             logger.error(f"Failed to get session: {e}")
             return None
@@ -142,9 +155,15 @@ class ResourceManager(IAuthProvider):
 
         Returns:
             Optional[str]: API token or None if not available
+
+        Raises:
+            CredentialsExhausted: when the bounded selector spent its budget
+                (design D18 - never flatten a typed exhaustion into ``None``).
         """
         try:
             return self.get_credentials().get_token()
+        except CredentialsExhausted:
+            raise
         except Exception as e:
             logger.error(f"Failed to get token: {e}")
             return None

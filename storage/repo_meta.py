@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from constant.system import GITHUB_API_TIMEOUT, SERVICE_TYPE_GITHUB_API
 from storage.registry import REGISTRY_FILENAME, parse_github_url
 from tools.logger import get_logger
-from tools.state import GithubCredentialLimited, github_credential_state
+from tools.state import CredentialsExhausted, GithubCredentialLimited, github_credential_state
 
 logger = get_logger("storage")
 
@@ -485,12 +485,20 @@ class RepoMetaEnricher:
         if self._credential_provider is not None:
             try:
                 return self._credential_provider()
+            except CredentialsExhausted:
+                # Exhaustion is transient: yield silently like all-cooling and
+                # never trip the permanent tokenless latch (design D8).
+                self._note_cooling()
+                return None
             except Exception:  # pragma: no cover - defensive
                 return None
         if self._auth is None:
             return None
         try:
             return self._auth.get_token()
+        except CredentialsExhausted:
+            self._note_cooling()
+            return None
         except Exception:  # pragma: no cover - defensive
             return None
 

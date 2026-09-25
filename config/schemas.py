@@ -659,6 +659,45 @@ class GatherConfig:
 
 
 @dataclass
+class CredentialLivenessConfig:
+    """Credential-liveness / bounded-wait configuration (fix-credential-liveness).
+
+    ``wait_mode`` selects the credential selector behavior: ``bounded`` (the
+    default, design D2) computes a deadline before every sleep and raises a
+    typed exhaustion when the budget is spent; ``blocking`` restores the
+    pre-change unbounded waiter byte-for-byte (config-flip rollback, no code
+    removal).  ``max_wait_s`` is that budget; ``early_release`` frees a
+    proven-working credential from cooldown immediately (design D4);
+    ``emergency_threshold`` is the number of consecutive exhaustion episodes on
+    one service that trips the loud emergency state (design D7).
+    """
+
+    wait_mode: str = "bounded"
+    max_wait_s: float = 60.0
+    early_release: bool = True
+    emergency_threshold: int = 3
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_credential_liveness_config on
+        # purpose: this guards direct (non-loader) construction in tests and
+        # embedding.  Loud rejection, GatherConfig precedent.
+        wait_mode = str(self.wait_mode).strip().lower()
+        if wait_mode not in ("bounded", "blocking"):
+            raise ValueError(f"credential_liveness.wait_mode must be one of: bounded, blocking (got: {self.wait_mode!r})")
+        self.wait_mode = wait_mode
+
+        self.max_wait_s = float(self.max_wait_s)
+        if self.max_wait_s <= 0:
+            raise ValueError("credential_liveness.max_wait_s must be positive")
+
+        self.early_release = bool(self.early_release)
+
+        self.emergency_threshold = int(self.emergency_threshold)
+        if self.emergency_threshold <= 0:
+            raise ValueError("credential_liveness.emergency_threshold must be positive")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
     base_url: str = ""
@@ -791,6 +830,7 @@ class Config:
     refine_governor: RefineGovernorConfig = field(default_factory=RefineGovernorConfig)
     queue: TaskQueueConfig = field(default_factory=TaskQueueConfig)
     gather: GatherConfig = field(default_factory=GatherConfig)
+    credential_liveness: CredentialLivenessConfig = field(default_factory=CredentialLivenessConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -827,6 +867,7 @@ class Config:
             "refine_governor": self._dataclass_to_dict(self.refine_governor),
             "queue": self._dataclass_to_dict(self.queue),
             "gather": self._dataclass_to_dict(self.gather),
+            "credential_liveness": self._dataclass_to_dict(self.credential_liveness),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

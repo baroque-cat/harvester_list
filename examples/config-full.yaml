@@ -374,8 +374,31 @@ gather:
   # twice. The validator rejects a contradictory pair loudly.
   max_refusal_wait_s: 60.0
 
+# Credential liveness (fix-credential-liveness)
+# Bounds every wait for a pooled GitHub credential and routes exhaustion to the
+# durable task-deferral seam (bounded pause, attempts preserved, never dropped)
+# instead of sleeping inside a claimed task. Under queue.backend: sqlite,
+# max_wait_s MUST be strictly below queue.visibility_timeout_s.
+credential_liveness:
+  # bounded = deadline computed before every sleep; raises typed exhaustion when
+  #           the budget is spent (new safe default). blocking = pre-change
+  #           unbounded waiter (config-flip rollback; loudly warns under sqlite).
+  wait_mode: "bounded"
+  # Wait budget in seconds (> 0). Below queue.visibility_timeout_s under sqlite.
+  max_wait_s: 60.0
+  # A successful request frees a cooling credential immediately (rollback flag;
+  # false restores the expired-only release byte-for-byte).
+  early_release: true
+  # Consecutive exhaustion episodes on one service before one loud ERROR.
+  emergency_threshold: 3
+
 # Global rate limiting configuration
 ratelimits:
+  # NOTE: adaptive behavior is governed by TokenBucket.adjust_rate: a bucket's
+  # rate is halved after 3 consecutive failures (floor 0.1x base) and stepped up
+  # x1.1 after 10 consecutive successes (cap 2x base). The legacy coefficients
+  # (backoff_factor/recovery_factor/max_rate_multiplier/min_rate_multiplier) were
+  # removed and are ignored with a one-time WARNING if still present.
   # GitHub API rate limits
   github_api:
     # Base rate in requests per second
@@ -433,10 +456,10 @@ tasks:
       base_rate: 1.0
       burst_limit: 5
       adaptive: true
-      backoff_factor: 0.5
-      recovery_factor: 1.1
-      max_rate_multiplier: 2.0
-      min_rate_multiplier: 0.1
+      # Adaptive behavior = TokenBucket.adjust_rate: x0.5 after 3 consecutive
+      # failures (floor 0.1x base), x1.1 after 10 consecutive successes (cap 2x
+      # base). The removed backoff_factor/recovery_factor/max_rate_multiplier/
+      # min_rate_multiplier keys no longer exist and are warned-and-ignored.
     storage:
       directory: ""
       plan: ""

@@ -17,7 +17,15 @@ from typing import List
 
 from constant import search as search_constants
 
+# Module-level logger: created at import so non-propagating capture (pytest
+# caplog / live logging) sees the category before the first message.  Safe now
+# that tools.coordinator no longer imports config at module level (the former
+# cycle blocked any config/* -> tools.logger import).
+from tools.logger import get_logger
+
 from .schemas import Config, LoadBalanceStrategy, TaskConfig
+
+logger = get_logger("config")
 
 
 class ConfigValidator:
@@ -91,6 +99,9 @@ class ConfigValidator:
         # Validate gather transport configuration
         self._validate_gather_config(config)
 
+        # Validate credential-liveness / bounded-wait configuration
+        self._validate_credential_liveness_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -98,12 +109,7 @@ class ConfigValidator:
         self._validate_display_config(config)
 
         # Surface non-fatal configuration warnings.
-        # Lazy import: config/* must not import tools at module level —
-        # tools.coordinator imports config back (circular at package init).
         if self.warnings:
-            from tools.logger import get_logger
-
-            logger = get_logger("config")
             for warning in self.warnings:
                 logger.warning(f"Configuration warning: {warning}")
 
@@ -563,6 +569,47 @@ class ConfigValidator:
                     f"so no worker sleeps inside a claimed durable row past its visibility window"
                 )
 
+    def _validate_credential_liveness_config(self, config: Config) -> None:
+        """Validate the credential-liveness / bounded-wait configuration section.
+
+        Re-checks the enum/positivity constraints enforced by the dataclass (they
+        can be bypassed by attribute mutation) and adds the cross-section
+        durability invariant from design D2: under the durable sqlite backend a
+        bounded credential wait at or beyond the queue visibility timeout
+        guarantees a duplicate execution because the queue exposes no claim
+        renewal.  ``wait_mode=blocking`` deliberately re-accepts that hazard for
+        rollback, so it is surfaced as a loud WARNING instead of an error.
+        """
+        liveness = config.credential_liveness
+
+        wait_mode = str(liveness.wait_mode).strip().lower()
+        if wait_mode not in ("bounded", "blocking"):
+            self.errors.append("credential_liveness.wait_mode must be one of: bounded, blocking")
+
+        max_wait = float(liveness.max_wait_s)
+        if max_wait <= 0:
+            self.errors.append("credential_liveness.max_wait_s must be positive")
+
+        if int(liveness.emergency_threshold) <= 0:
+            self.errors.append("credential_liveness.emergency_threshold must be positive")
+
+        # Cross-section durability invariant (only meaningful for the durable
+        # backend; the in-memory queue has no visibility window).
+        if config.queue.backend == "sqlite":
+            visibility = float(config.queue.visibility_timeout_s)
+            if wait_mode == "blocking":
+                self.warnings.append(
+                    "credential_liveness.wait_mode=blocking under queue.backend=sqlite "
+                    "deliberately re-accepts the duplicate-execution hazard: an in-task wait may "
+                    "outlive the visibility window because the queue exposes no claim renewal"
+                )
+            elif max_wait >= visibility:
+                self.errors.append(
+                    f"credential_liveness.max_wait_s ({liveness.max_wait_s}) must be strictly less "
+                    f"than queue.visibility_timeout_s ({config.queue.visibility_timeout_s}) "
+                    f"so no in-task credential wait outlives its durable claim window"
+                )
+
     def _validate_rate_limits(self, config: Config) -> None:
         """Validate rate limits configuration
 
@@ -575,9 +622,6 @@ class ConfigValidator:
 
             if rate_limit.burst_limit <= 0:
                 self.errors.append(f"Burst limit must be positive for rate limit: {name}")
-
-            if not (0 < rate_limit.backoff_factor < 1):
-                self.errors.append(f"Backoff factor must be between 0 and 1 for rate limit: {name}")
 
     def _validate_display_config(self, config: Config) -> None:
         """Validate display configuration

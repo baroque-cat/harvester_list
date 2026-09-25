@@ -37,7 +37,7 @@ from search.querykey import wire_query
 from storage.key_ledger import KeyCheckRequest, key_hash, mask_key
 from storage.registry import patterns_hash, url_hash
 from tools.logger import get_logger
-from tools.state import GithubCredentialLimited
+from tools.state import CredentialsExhausted, GithubCredentialLimited, bump_credential_metric
 from tools.utils import get_service_name, handle_exceptions
 
 from .base import BasePipelineStage, OutputHandler, StageOutput, StageResources
@@ -190,6 +190,13 @@ class SearchStage(BasePipelineStage):
 
             return output
 
+        except RateLimitDeferral:
+            # Credential exhaustion deferral (design D7): not a search fault.
+            # Propagate to ``process_task``/the worker loop for the durable DEFER
+            # seam; never collapse into the catch-all (which would yield None and
+            # silently complete the task empty).
+            raise
+
         except TransientFetchError as e:
             # Typed transient failure: keep the pre-change log, then let
             # ``process_task`` apply the failure_handling mode policy.
@@ -247,16 +254,17 @@ class SearchStage(BasePipelineStage):
     ) -> Tuple[List[str], str, int]:
         """Execute first page search and get total count in single request"""
         while True:
-            # Get auth via injected provider
-            if task.use_api:
-                auth_token = self.resources.auth.get_token()
-            else:
-                auth_token = self.resources.auth.get_session()
-
-            if not auth_token:
-                return [], "", 0
-
             try:
+                # Get auth via injected provider (the selector raises typed
+                # exhaustion here when the bounded budget is spent).
+                if task.use_api:
+                    auth_token = self.resources.auth.get_token()
+                else:
+                    auth_token = self.resources.auth.get_session()
+
+                if not auth_token:
+                    return [], "", 0
+
                 # Execute search with count - now returns content as well
                 results, total, content = client.search_with_count(
                     query=self._preprocess_query(task.query, task.use_api),
@@ -267,6 +275,11 @@ class SearchStage(BasePipelineStage):
                     metadata=metadata,
                 )
                 return results, content, total
+            except CredentialsExhausted as e:
+                bump_credential_metric("deferred_by_credentials")
+                raise RateLimitDeferral(
+                    f"credentials exhausted ({e.reason}), service={e.service}"
+                ) from e
             except GithubCredentialLimited as e:
                 logger.warning(
                     f"[{self.name}] GitHub credential cooling during first-page search, "
@@ -288,16 +301,17 @@ class SearchStage(BasePipelineStage):
     ) -> Tuple[List[str], str]:
         """Execute subsequent page search in single request"""
         while True:
-            # Get auth via injected provider
-            if task.use_api:
-                auth_token = self.resources.auth.get_token()
-            else:
-                auth_token = self.resources.auth.get_session()
-
-            if not auth_token:
-                return [], ""
-
             try:
+                # Get auth via injected provider (the selector raises typed
+                # exhaustion here when the bounded budget is spent).
+                if task.use_api:
+                    auth_token = self.resources.auth.get_token()
+                else:
+                    auth_token = self.resources.auth.get_session()
+
+                if not auth_token:
+                    return [], ""
+
                 # Execute search - now returns content as well
                 results, content = client.search_code(
                     query=self._preprocess_query(task.query, task.use_api),
@@ -308,6 +322,11 @@ class SearchStage(BasePipelineStage):
                     metadata=metadata,
                 )
                 return results, content
+            except CredentialsExhausted as e:
+                bump_credential_metric("deferred_by_credentials")
+                raise RateLimitDeferral(
+                    f"credentials exhausted ({e.reason}), service={e.service}"
+                ) from e
             except GithubCredentialLimited as e:
                 logger.warning(
                     f"[{self.name}] GitHub credential cooling during page search, "

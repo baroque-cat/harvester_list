@@ -26,6 +26,7 @@ from .schemas import (
     ApiConfig,
     CheckSkipConfig,
     Config,
+    CredentialLivenessConfig,
     CredentialsConfig,
     DisplayConfig,
     DisplayContextConfig,
@@ -49,6 +50,9 @@ from .schemas import (
     WorkerManagerConfig,
 )
 from .validator import ConfigValidator
+from tools.logger import get_logger
+
+logger = get_logger("config")
 
 
 class ConfigLoader:
@@ -62,6 +66,11 @@ class ConfigLoader:
         """
         self.config_file = config_file
         self.validator = ConfigValidator()
+        # Acceptance-period WARNING dedupe (design D21): spec S21 promises exactly
+        # one loud WARNING per removed key **per load**, not per occurrence - a
+        # stale operator config can carry the same key in the global ratelimits
+        # block and in every task-level rate_limit block.
+        self._warned_dead_keys: set = set()
 
     def load(self) -> Config:
         """Load configuration from YAML file
@@ -71,6 +80,8 @@ class ConfigLoader:
         """
         if not os.path.exists(self.config_file):
             self._create_default_config()
+
+        self._warned_dead_keys = set()  # "per load" semantics (design D21)
 
         try:
             with open(self.config_file, encoding="utf-8") as f:
@@ -161,6 +172,10 @@ class ConfigLoader:
         # Parse gather transport configuration
         if "gather" in data:
             config.gather = self._parse_gather_config(data["gather"])
+
+        # Parse credential-liveness / bounded-wait configuration
+        if "credential_liveness" in data:
+            config.credential_liveness = self._parse_credential_liveness_config(data["credential_liveness"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -504,6 +519,35 @@ class ConfigLoader:
             max_refusal_wait_s=data.get("max_refusal_wait_s", 60.0),
         )
 
+    def _parse_credential_liveness_config(self, data: Dict[str, Any]) -> CredentialLivenessConfig:
+        """Parse the credential-liveness / bounded-wait configuration section.
+
+        Unknown keys are ignored like the sibling parse methods; validation is
+        delegated to the dataclass ``__post_init__`` (design D2).
+
+        Args:
+            data: Credential-liveness configuration data
+
+        Returns:
+            CredentialLivenessConfig: Parsed configuration
+        """
+        return CredentialLivenessConfig(
+            wait_mode=data.get("wait_mode", "bounded"),
+            max_wait_s=data.get("max_wait_s", 60.0),
+            early_release=data.get("early_release", True),
+            emergency_threshold=data.get("emergency_threshold", 3),
+        )
+
+    # Dead adaptive coefficients removed by fix-credential-liveness (design D9).
+    # They never influenced behavior; a one-time loud WARNING per key per load
+    # keeps live operator configs loading while naming the ignored key.
+    _DEAD_RATE_LIMIT_KEYS = (
+        "backoff_factor",
+        "recovery_factor",
+        "max_rate_multiplier",
+        "min_rate_multiplier",
+    )
+
     def _parse_rate_limits(self, data: Dict[str, Any]) -> Dict[str, RateLimitConfig]:
         """Parse rate limits configuration section
 
@@ -515,16 +559,29 @@ class ConfigLoader:
         """
         rate_limits = {}
         for name, limit_data in data.items():
+            self._warn_dead_rate_limit_keys(limit_data)
             rate_limits[name] = RateLimitConfig(
                 base_rate=limit_data.get("base_rate", 1.0),
                 burst_limit=limit_data.get("burst_limit", 5),
                 adaptive=limit_data.get("adaptive", True),
-                backoff_factor=limit_data.get("backoff_factor", 0.5),
-                recovery_factor=limit_data.get("recovery_factor", 1.1),
-                max_rate_multiplier=limit_data.get("max_rate_multiplier", 2.0),
-                min_rate_multiplier=limit_data.get("min_rate_multiplier", 0.1),
             )
         return rate_limits
+
+    def _warn_dead_rate_limit_keys(self, limit_data: Dict[str, Any]) -> None:
+        """Warn once per removed adaptive coefficient present in a rate_limit block.
+
+        Graceful acceptance period (design D9): live operator configs must not
+        crash, but each ignored key is named loudly exactly once per load
+        (design D21 - deduped across the global ``ratelimits`` block and every
+        task-level ``rate_limit`` block, per spec S21).
+        """
+        for dead in self._DEAD_RATE_LIMIT_KEYS:
+            if dead in limit_data and dead not in self._warned_dead_keys:
+                self._warned_dead_keys.add(dead)
+                logger.warning(
+                    f"rate_limit.{dead} is ignored (removed key; adaptive behavior is "
+                    f"governed by TokenBucket.adjust_rate)"
+                )
 
     def _parse_task_config(self, data: Dict[str, Any]) -> TaskConfig:
         """Parse task configuration
@@ -578,6 +635,7 @@ class ConfigLoader:
 
         # Parse rate limit
         rate_limit_data = data.get("rate_limit", {})
+        self._warn_dead_rate_limit_keys(rate_limit_data)
         rate_limit = RateLimitConfig(
             base_rate=rate_limit_data.get("base_rate", 1.0),
             burst_limit=rate_limit_data.get("burst_limit", 5),

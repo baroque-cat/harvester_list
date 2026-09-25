@@ -30,6 +30,7 @@ from storage.repo_meta import RepoMetaEnricher, RepoMetaStore, tokens_cooling_do
 from tools.coordinator import get_session, get_token, get_user_agent
 from tools.logger import get_logger
 from tools.ratelimit import RateLimiter
+from tools.state import credential_liveness_metrics
 
 from .base import LifecycleManager
 from .queue import QueueManager
@@ -491,6 +492,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             aggregation_metrics=get_aggregation_metrics(),
             refine_metrics=self.get_refine_metrics(),
             gather_transport_metrics=client.get_gather_transport_stats(),
+            credential_metrics=credential_liveness_metrics(),
         )
 
         return pipeline_status

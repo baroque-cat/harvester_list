@@ -9,7 +9,7 @@ import copy
 import threading
 import time
 import traceback
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import constant
 from config import load_config
@@ -26,7 +26,9 @@ from state.builder import StatusBuilder
 from state.models import ProviderStatus, SystemState, SystemStatus
 from state.types import TaskDataProvider
 from tools.coordinator import get_session, get_token
+from tools.credential import fail_fast_liveness
 from tools.logger import get_logger
+from tools.state import CredentialsExhausted
 from tools.utils import get_service_name, handle_exceptions, trim
 
 from .base import LifecycleManager
@@ -34,6 +36,36 @@ from .pipeline import Pipeline
 from .recovery import TaskRecoveryManager
 
 logger = get_logger("manager")
+
+
+def _probe_github_credentials() -> Tuple[bool, bool]:
+    """Startup capability probe: ``(has_token, has_session)``; never sleeps/raises.
+
+    Asks "is a credential available NOW" - it must never wait a cooldown out, so
+    the selector runs under a zero-budget fail-fast override (design D19, spec
+    S24: "no startup sleep occurs").  Typed pool exhaustion is a transient
+    degraded state, not a fatal one: report "no usable credential" with one loud
+    WARNING and let the pipeline continue (design D8).
+    """
+    try:
+        with fail_fast_liveness():
+            has_token = get_token() is not None
+            has_session = get_session() is not None
+        return has_token, has_session
+    except CredentialsExhausted as e:
+        logger.warning(
+            f"GitHub credential capability probe degraded ({e}); continuing without assuming "
+            f"a usable credential"
+        )
+        return False, False
+    except Exception as e:
+        # Preserve the pre-change robustness: an unexpected probe error must not
+        # abort startup task creation.
+        logger.warning(
+            f"GitHub credential capability probe failed ({e}); continuing without assuming "
+            f"a usable credential"
+        )
+        return False, False
 
 
 def _search_identity(task: SearchTask) -> tuple:
@@ -401,6 +433,10 @@ class TaskManager(LifecycleManager, TaskDataProvider):
         """Create initial search tasks for all providers"""
         tasks = []
 
+        # Probe once: exhaustion degrades to "no usable credential" loudly and
+        # never blocks startup (design D8).
+        has_token, has_session = _probe_github_credentials()
+
         for task_config in self.config.tasks:
             if not task_config.enabled:
                 continue
@@ -412,21 +448,12 @@ class TaskManager(LifecycleManager, TaskDataProvider):
                 continue
 
             # Check if we have GitHub credentials
-            try:
-                # Try to get either token or session to verify availability
-                has_token = get_token() is not None
-                has_session = get_session() is not None
-                if (
-                    not has_token
-                    and not has_session
-                    or (task_config.use_api and not has_token)
-                    or (not task_config.use_api and not has_session)
-                ):
-                    logger.warning(
-                        f"Skipping search for provider {task_config.name} as no github token or session is provided"
-                    )
-                    continue
-            except Exception:
+            if (
+                not has_token
+                and not has_session
+                or (task_config.use_api and not has_token)
+                or (not task_config.use_api and not has_session)
+            ):
                 logger.warning(
                     f"Skipping search for provider {task_config.name} as no github token or session is provided"
                 )

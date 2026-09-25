@@ -235,7 +235,9 @@ from tools.ratelimit import RateLimiter
 from tools.resources import managed_network
 from tools.retry import network_retry
 from tools.state import (
+    CredentialsExhausted,
     GithubCredentialLimited,
+    bump_credential_metric,
     credential_bucket_key,
     github_credential_state,
     mask_credential,
@@ -516,13 +518,72 @@ class GitHubClient:
         content: str = "",
         reason: str = "",
     ) -> None:
-        """Mark a credential as rate limited and raise a retry signal"""
+        """Mark credential(s) rate limited per the derived limit KIND and raise.
+
+        Classification (design D5), using only signals already read off the wire:
+        secondary markers cool the WHOLE service pool (subject-scoped), primary
+        exhaustion cools ONLY the credential in use until the indicated reset,
+        and an ambiguous refusal (no usable header, no marker) cools nothing and
+        returns so the caller routes it to the transient-failure path.
+        """
+        kind = self._classify_credential_limit(headers, content, reason)
+
+        if kind == "ambiguous":
+            logger.warning(
+                f"[GithubCrawl] GitHub refusal without usable limit headers or secondary marker "
+                f"on {service}: treating as a transient failure, no credential cooled"
+            )
+            return
+
+        if kind == "secondary":
+            wait = self._extract_wait(headers, content)
+            pool = self._service_pool(service)
+            if credential:
+                pool = sorted(set(pool) | {credential})
+            applied = wait
+            for item in pool:
+                applied = github_credential_state.mark_limited(service, item, wait, kind="secondary")
+            applied = applied or 0.0
+            bump_credential_metric("secondary_limit_incidents")
+            logger.error(
+                f"[GithubCrawl] GitHub secondary/abuse limit on {service}: cooling the whole "
+                f"service pool ({len(pool)} credentials), wait {applied:.1f}s"
+            )
+            raise GithubCredentialLimited(service=service, credential=credential, wait=applied, reason=reason)
+
         wait = self._extract_wait(headers, content)
-        wait = github_credential_state.mark_limited(service, credential, wait)
+        wait = github_credential_state.mark_limited(service, credential, wait, kind="primary")
         label = "API token" if service == SERVICE_TYPE_GITHUB_API else "Web session"
         masked = mask_credential(credential)
         logger.warning(f"[GithubCrawl] GitHub {label} rate limited: {masked}, cooling down {wait:.1f}s")
         raise GithubCredentialLimited(service=service, credential=credential, wait=wait, reason=reason)
+
+    def _classify_credential_limit(
+        self, headers: Optional[Dict[str, str]], content: str, reason: str
+    ) -> str:
+        """Classify a refusal as ``secondary``, ``primary``, or ``ambiguous`` (design D5)."""
+        text = f"{reason or ''} {content or ''}"
+        if re.search(r"secondary rate limit|abuse detection", text, re.I):
+            return "secondary"
+
+        normalized = {str(key).lower(): str(value) for key, value in (headers or {}).items()}
+        remaining = normalized.get("x-ratelimit-remaining", "").strip()
+        reset = normalized.get("x-ratelimit-reset", "").strip()
+        retry_after = normalized.get("retry-after", "").strip()
+        if (remaining == "0" and reset.isdigit()) or retry_after:
+            return "primary"
+        return "ambiguous"
+
+    def _service_pool(self, service: str) -> List[str]:
+        """Enumerate this service's pooled credential values (design D5)."""
+        provider = self.resource_provider
+        if provider is None:
+            return []
+        if service == SERVICE_TYPE_GITHUB_WEB:
+            items = getattr(provider, "sessions", None)
+        else:
+            items = getattr(provider, "tokens", None)
+        return [item for item in (items or []) if item]
 
     def is_rate_limited_content(self, service: str, content: str) -> bool:
         """Detect GitHub rate-limit responses from response content"""
@@ -544,8 +605,6 @@ class GitHubClient:
             r"rate limit",
             r"secondary rate limit",
             r"abuse detection",
-            r"please wait",
-            r"try again later",
         ]
         return any(re.search(pattern, text, flags=re.I) for pattern in patterns)
 
@@ -631,7 +690,7 @@ class GitHubClient:
 
     def _is_http_rate_limited(self, code: int, message: str) -> bool:
         text = message or ""
-        return code == 429 or (code == 403 and re.search(r"rate limit|abuse detection|please wait", text, re.I))
+        return code == 429 or (code == 403 and bool(re.search(r"rate limit|abuse detection", text, re.I)))
 
     def _credential_from_headers(self, headers: Dict, service: Optional[str]) -> str:
         if service == SERVICE_TYPE_GITHUB_API:
@@ -693,8 +752,10 @@ class GitHubClient:
         return None
 
 
-# Global GitHub client instance
-_github_client: Optional[GitHubClient] = None
+# Global GitHub client instance.  A credential-less default keeps the gather
+# rest-transport seam addressable (and injectable) even before the pipeline
+# calls ``init_github_client``; callers that need rate limiting replace it.
+_github_client: Optional[GitHubClient] = GitHubClient()
 
 
 def init_github_client(limits: Dict[str, RateLimitConfig]) -> None:
@@ -1103,7 +1164,7 @@ def _gather_is_rate_limit_signal(status: int, reason: str) -> bool:
     """
     if status == 429:
         return True
-    if status == 403 and re.search(r"rate limit|abuse detection|please wait|try again later", reason or "", re.I):
+    if status == 403 and re.search(r"rate limit|abuse detection|secondary rate limit", reason or "", re.I):
         return True
     return False
 
@@ -1190,6 +1251,10 @@ def _gather_credential() -> Optional[str]:
             token = provider.get_token()
             if token:
                 return token
+        except CredentialsExhausted:
+            # Typed exhaustion must NOT be swallowed into a None (which would
+            # downgrade the rest fetch to a guaranteed-failing anonymous call).
+            raise
         except Exception:
             pass
     return None
@@ -1225,7 +1290,22 @@ def fetch_gather_content(
     credential: Optional[str] = None
     headers = DEFAULT_HEADERS.copy()
     if kind == "rest":
-        credential = _gather_credential()
+        try:
+            credential = _gather_credential()
+        except CredentialsExhausted as e:
+            # Translate pool exhaustion into the existing refusal taxonomy: a
+            # deferral, never a credential-less REST request that is guaranteed
+            # to fail (design D8).
+            estimate = e.wait_estimate_s if (e.wait_estimate_s or 0) > 0 else max_refusal_wait_s
+            wait = min(float(estimate), float(max_refusal_wait_s))
+            _gather_stat_inc("deferred_credentials")
+            logger.warning(
+                f"[gather-transport] credentials exhausted ({e.reason}); deferring rest fetch "
+                f"for {wait:.0f}s, url: {target}"
+            )
+            raise RateLimitDeferral(
+                f"credentials exhausted ({e.reason}) for url: {target}", wait_s=wait
+            )
         if credential:
             headers["Authorization"] = f"Bearer {credential}"
 

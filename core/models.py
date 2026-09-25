@@ -239,10 +239,6 @@ class RateLimitConfig:
     base_rate: float = 1.0
     burst_limit: int = 5
     adaptive: bool = True
-    backoff_factor: float = 0.5
-    recovery_factor: float = 1.1
-    max_rate_multiplier: float = 2.0
-    min_rate_multiplier: float = 0.1
 
     def __post_init__(self):
         """Validate rate limit configuration"""
@@ -250,24 +246,6 @@ class RateLimitConfig:
             raise ValueError("base_rate must be positive")
         if self.burst_limit <= 0:
             raise ValueError("burst_limit must be positive")
-        if not (0 < self.backoff_factor < 1):
-            raise ValueError("backoff_factor must be between 0 and 1")
-        if self.recovery_factor <= 1:
-            raise ValueError("recovery_factor must be > 1")
-
-    def calculate_adjusted_rate(self, success_ratio: float) -> float:
-        """Calculate adjusted rate based on success ratio"""
-        if not self.adaptive:
-            return self.base_rate
-
-        if success_ratio > 0.9:
-            multiplier = min(self.max_rate_multiplier, self.recovery_factor)
-        elif success_ratio < 0.5:
-            multiplier = max(self.min_rate_multiplier, self.backoff_factor)
-        else:
-            multiplier = 1.0
-
-        return self.base_rate * multiplier
 
 
 # Task recovery and logging models

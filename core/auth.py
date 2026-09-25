@@ -13,6 +13,20 @@ from typing import Callable, Optional
 from .types import IAuthProvider
 
 
+def _is_typed_exhaustion(exc: BaseException) -> bool:
+    """True for the credential layer's typed pool-exhaustion signal.
+
+    Lazy import on purpose: ``core`` must not depend on ``tools`` at module
+    import time (``core/__init__`` -> ``core.auth`` -> ``tools.state`` ->
+    ``tools/__init__`` -> ``config`` -> ``core.models`` would close a cycle).
+    """
+    try:
+        from tools.state import CredentialsExhausted
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return isinstance(exc, CredentialsExhausted)
+
+
 class GithubAuthProvider(IAuthProvider):
     """Centralized GitHub authentication service with dependency injection."""
 
@@ -61,20 +75,33 @@ class GithubAuthProvider(IAuthProvider):
         cls._user_agent_provider = user_agent_provider
 
     def get_session(self) -> Optional[str]:
-        """Get GitHub web session token."""
+        """Get GitHub web session token.
+
+        A typed credential exhaustion is re-raised rather than flattened to
+        ``None`` (design D18): ``None`` means "no credential configured" and
+        callers would silently complete work empty.
+        """
         if self.__class__._session_provider:
             try:
                 return self.__class__._session_provider()
-            except Exception:
+            except Exception as exc:
+                if _is_typed_exhaustion(exc):
+                    raise
                 return None
         return None
 
     def get_token(self) -> Optional[str]:
-        """Get GitHub API token."""
+        """Get GitHub API token.
+
+        A typed credential exhaustion is re-raised rather than flattened to
+        ``None`` (design D18).
+        """
         if self.__class__._token_provider:
             try:
                 return self.__class__._token_provider()
-            except Exception:
+            except Exception as exc:
+                if _is_typed_exhaustion(exc):
+                    raise
                 return None
         return None
 

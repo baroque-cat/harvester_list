@@ -1720,6 +1720,68 @@ detector. Under `raw`/`rest` there is no rendered markup, so `file_commit_date`
 is NULL by construction with no parse attempt (current GitHub serves no
 `datetime=` attributes anyway).
 
+### Credential liveness (`credential_liveness`)
+
+Every wait for a pooled GitHub credential is bounded, accounted, and — when the
+budget is spent — converted into a durable task deferral instead of an in-claim
+sleep (design `fix-credential-liveness`).
+
+```yaml
+credential_liveness:
+  wait_mode: "bounded"       # bounded (default) | blocking (rollback)
+  max_wait_s: 60.0           # wait budget; must be < queue.visibility_timeout_s under sqlite
+  early_release: true        # a success frees a cooling credential immediately
+  emergency_threshold: 3     # consecutive exhaustion episodes before one loud ERROR
+```
+
+**Bounded waits.** The selector computes a deadline before every sleep. If a
+credential frees within `max_wait_s` the task proceeds; otherwise it raises a
+typed `CredentialsExhausted` and the search stage re-queues the task through the
+existing DEFER seam (`attempts`/`created_at`/dedup identity preserved, counted
+in `tasks_deferred`, nothing written to the registry — never dropped, never
+completed-empty). The former two infinite paths (the blocking cooldown loop and
+the 0.1 s hot spin) are gone. Under `queue.backend: sqlite` the validator rejects
+`max_wait_s >= queue.visibility_timeout_s` loudly, because the durable queue has
+no claim renewal.
+
+**Early release.** `mark_success` clears a cooling credential's cooldown entry
+immediately (a success is proof the credential works), so a false positive can no
+longer bench a healthy key for its full escalated term. A subsequent limit on a
+released credential restarts the ladder at its minimum; the escalation schedule
+for repeated limits without an intervening success is unchanged
+(60 → 120 → 240 → 480 → 900 s).
+
+**Primary vs secondary.** Reactions use only signals already read off the wire.
+A header-anchored primary exhaustion (`X-RateLimit-Remaining: 0` with a usable
+`X-RateLimit-Reset`, or `Retry-After`) cools **only** the credential that hit it.
+A secondary-limit marker (`secondary rate limit`, `abuse detection`) cools the
+**whole service pool** (subject-scoped: continued pressure worsens it), logs one
+ERROR per episode, and counts a secondary incident. A 403/429 with no usable
+headers and no secondary marker is treated as a transient failure — no credential
+is benched on a guess. Pools of different services are never cooled jointly.
+
+**Narrowed detectors.** Content detection matches only verifiable GitHub markers
+(`rate limit`, `secondary rate limit`, `abuse detection`, plus the exact web
+sentence `Search failed. Please try again later.`). The broad fragments
+`please wait` / `try again later` no longer classify a response as rate-limited.
+
+**Observability.** `PipelineStatus.credential_metrics` exposes monotonic counters:
+`exhausted_episodes`, `deferred_by_credentials`, `secondary_limit_incidents`,
+`early_releases`, `emergency_trips`, and the `blocking_mode_active` flag.
+
+**Rollback is a flag flip.** `wait_mode: blocking` restores the pre-change
+unbounded waiter byte-for-byte (under sqlite it emits a loud WARNING that the
+duplicate-execution hazard is deliberately re-accepted); `early_release: false`
+restores the expired-only cooldown release. Detector narrowing and the removal of
+the dead rate-limit coefficients are not flag-gated.
+
+**Adaptive rate limiting (corrected).** The live model is `TokenBucket.adjust_rate`:
+a named bucket's rate is **halved after 3 consecutive failures** (floor `0.1×`
+base) and **stepped up `×1.1` after 10 consecutive successes** (cap `2×` base).
+The former `backoff_factor`, `recovery_factor`, `max_rate_multiplier`, and
+`min_rate_multiplier` keys never influenced behavior and were removed; if still
+present in an operator config they are ignored with a one-time WARNING per key.
+
 ## Troubleshooting
 
 ### **Common Issues**

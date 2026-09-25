@@ -225,6 +225,11 @@ class PipelineStatus:
     # Periodic re-check driver counters (empty while disabled).
     recheck_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Credential-liveness counters (exhaustion episodes, deferrals by
+    # credentials, secondary-limit incidents, early releases, emergency trips,
+    # blocking-mode flag); empty until first populated.
+    credential_metrics: Dict[str, Any] = field(default_factory=dict)
+
     # Optional top-N priority candidates (empty while display_top_n == 0).
     prioritization_metrics: Dict[str, Any] = field(default_factory=dict)
 
