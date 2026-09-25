@@ -625,6 +625,40 @@ class TaskQueueConfig:
 
 
 @dataclass
+class GatherConfig:
+    """Gather-stage content transport configuration (fix-gather-transport).
+
+    ``transport`` selects how the gather stage obtains file content:
+    ``html`` reproduces the pre-change anonymous rendered-page fetch,
+    ``raw`` (the default) addresses the plain-content host derived from the
+    discovered blob link, and ``rest`` uses the authenticated REST contents
+    endpoint.  ``max_payload_bytes`` bounds a streamed plain-content read
+    (design D8); ``max_refusal_wait_s`` bounds any refusal sleep so it can
+    never exceed the durable queue visibility window (design D5).
+    """
+
+    transport: str = "raw"
+    max_payload_bytes: int = 8 * 1024 * 1024
+    max_refusal_wait_s: float = 60.0
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_gather_config on purpose: this
+        # guards direct (non-loader) construction in tests and embedding.
+        transport = str(self.transport).strip().lower()
+        if transport not in ("html", "raw", "rest"):
+            raise ValueError(f"gather.transport must be one of: html, raw, rest (got: {self.transport!r})")
+        self.transport = transport
+
+        self.max_payload_bytes = int(self.max_payload_bytes)
+        if self.max_payload_bytes <= 0:
+            raise ValueError("gather.max_payload_bytes must be positive")
+
+        self.max_refusal_wait_s = float(self.max_refusal_wait_s)
+        if self.max_refusal_wait_s <= 0:
+            raise ValueError("gather.max_refusal_wait_s must be positive")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
     base_url: str = ""
@@ -756,6 +790,7 @@ class Config:
     aggregation: AggregationConfig = field(default_factory=AggregationConfig)
     refine_governor: RefineGovernorConfig = field(default_factory=RefineGovernorConfig)
     queue: TaskQueueConfig = field(default_factory=TaskQueueConfig)
+    gather: GatherConfig = field(default_factory=GatherConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -765,6 +800,7 @@ class Config:
             self.ratelimits = {
                 "github_api": RateLimitConfig(base_rate=0.15, burst_limit=3, adaptive=True),
                 "github_web": RateLimitConfig(base_rate=0.5, burst_limit=2, adaptive=True),
+                "github_raw": RateLimitConfig(base_rate=2.0, burst_limit=4, adaptive=True),
             }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -790,6 +826,7 @@ class Config:
             "aggregation": self._dataclass_to_dict(self.aggregation),
             "refine_governor": self._dataclass_to_dict(self.refine_governor),
             "queue": self._dataclass_to_dict(self.queue),
+            "gather": self._dataclass_to_dict(self.gather),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

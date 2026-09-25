@@ -88,6 +88,9 @@ class ConfigValidator:
         # Validate durable task-queue backend configuration
         self._validate_task_queue_config(config)
 
+        # Validate gather transport configuration
+        self._validate_gather_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -526,6 +529,39 @@ class ConfigValidator:
 
         if float(queue_config.max_age_hours) <= 0:
             self.errors.append("Queue max_age_hours must be positive")
+
+    def _validate_gather_config(self, config: Config) -> None:
+        """Validate the gather transport configuration section.
+
+        Re-checks the enum and positivity constraints enforced by the dataclass
+        (they can be bypassed by attribute mutation) and adds the cross-section
+        durability invariant from design D5: a refusal wait at or beyond the
+        durable queue's visibility timeout guarantees a duplicate execution
+        because the queue exposes no claim renewal.
+        """
+        gather_config = config.gather
+
+        transport = str(gather_config.transport).strip().lower()
+        if transport not in ("html", "raw", "rest"):
+            self.errors.append(f"gather.transport must be one of: html, raw, rest (got: {gather_config.transport!r})")
+
+        if int(gather_config.max_payload_bytes) <= 0:
+            self.errors.append("Gather max_payload_bytes must be positive")
+
+        wait_cap = float(gather_config.max_refusal_wait_s)
+        if wait_cap <= 0:
+            self.errors.append("Gather max_refusal_wait_s must be positive")
+
+        # Cross-section durability invariant (only meaningful for the durable
+        # backend; the in-memory queue has no visibility window).
+        if config.queue.backend == "sqlite":
+            visibility = float(config.queue.visibility_timeout_s)
+            if wait_cap >= visibility:
+                self.errors.append(
+                    f"Gather max_refusal_wait_s ({gather_config.max_refusal_wait_s}) must be "
+                    f"strictly less than queue.visibility_timeout_s ({config.queue.visibility_timeout_s}) "
+                    f"so no worker sleeps inside a claimed durable row past its visibility window"
+                )
 
     def _validate_rate_limits(self, config: Config) -> None:
         """Validate rate limits configuration

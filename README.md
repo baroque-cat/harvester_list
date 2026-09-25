@@ -1630,6 +1630,96 @@ schema/SQL, dedup-id structure and wire-query construction. Parsing of a
 successfully fetched payload stays fail-open: malformed data degrades to
 empty/NULL with a counted warning, never an exception.
 
+### Gather content transport (`gather.transport`)
+
+The gather stage fetches the content of a discovered file to extract keys. It
+supports three transports, selected per run; the default is `raw` (see below
+for why).
+
+```yaml
+gather:
+  transport: "raw"                # html | raw | rest
+  max_payload_bytes: 8388608      # 8 MiB streaming cap (raw/rest)
+  max_refusal_wait_s: 60.0        # bounded refusal sleep; must be < queue.visibility_timeout_s
+```
+
+> **Do not confuse the two `gather` keys.** The per-provider stage *enable* flag
+> (`StageConfig.gather`, nested under `tasks[].stages`) decides whether the gather
+> stage runs for that provider; the top-level `gather:` block (`GatherConfig`)
+> decides *how* it fetches. They live in different sections of `config.yaml` and
+> both may appear in the same file:
+>
+> ```yaml
+> tasks:
+>   - name: openai
+>     stages:
+>       gather: true        # run the gather stage for this provider
+> gather:
+>   transport: "raw"        # ...over the plain-content surface
+> ```
+
+**The measured three-surface comparison** (same five real files, 2026-09-25):
+
+| surface | auth | latency | bytes/file | limit headers | `core` cost |
+|---|---|---|---|---|---|
+| `github.com` blob HTML (`html`) | none | 738–1085 ms | 282 KB – 1.27 MB | **none at all** | 0 |
+| `raw.githubusercontent.com` (`raw`) | none | 327–634 ms | 1.9 – 108 KB | none (`x-cache` only) | **0** |
+| `api.github.com` contents (`rest`) | token | 398–591 ms | 3.8 – 150 KB (base64) | full `x-ratelimit-*` | **1 per call** |
+
+An 80-URL anonymous `raw` burst completed 80/80 with zero refusals at
+3.03 req/s (latency-bound); a 12-URL `html` control managed 1.23 req/s and
+**523 KiB/file** against `raw`'s **17.1 KiB/file** — the **30.6×** ratio that
+motivates the `raw` default. `raw` consumes no `core` quota; the authenticated
+code-search budget (`code_search`, exactly **10/min** per token) is isolated
+under its own resource class, so gather traffic can never starve search.
+
+**How an address is derived.** Persisted acquisition tasks keep the discovered
+`https://github.com/<owner>/<repo>/blob/<ref>/<path>` link unchanged; the
+transform happens at fetch time. A 40-hex commit ref is used verbatim
+(immutable, CDN-safe); any other ref falls back to `HEAD`, is counted and
+logged. The `item['sha']` from `/search/code` is a **blob** hash and returns
+HTTP 404 if used as a ref — it is never used.
+
+**Refusal outcomes.** A refusal is classified by what the remote signalled:
+a published finite wait (`Retry-After` / `X-RateLimit-Reset`) → **DEFER** (row
+back to `pending`, `attempts` unchanged); an actor-scoped secondary/abuse limit
+with no resumption time → **DEFER** plus a bounded stage-wide pause, a loud
+ERROR and the `deferred_secondary` counter; a genuine auth failure or 404 →
+**loud counted drop**; timeout/5xx → the existing **bounded requeue**. A 403
+carrying rate-limit markers is a deferral, not an authentication failure.
+
+**Rollback is a flag flip — the only mechanism.** Set `gather.transport: html`
+to reproduce the pre-change anonymous rendered-page fetch byte-for-byte; set it
+back to `raw` to resume. No code removal and **no data migration** are needed in
+either direction, because persisted tasks and legacy snapshots still carry blob
+URLs (design D2). `pipeline.threads.gather` is a *politeness* parameter
+(concurrency, not rate — the limiter owns rate): the honest cost is that fewer
+threads means a slower harvest. Recommended `8 → 2–4` while on `html`; `raw`
+absorbed an 80-URL no-sleep burst, so it can stay relaxed there.
+
+**Durability invariant `WAIT_CAP < queue.visibility_timeout_s`.** The durable
+queue exposes no claim-renewal API, so a worker sleeping inside a claimed row
+past the visibility window would have the row re-delivered to another worker and
+executed twice. `max_refusal_wait_s` is therefore validated as strictly below
+`queue.visibility_timeout_s` (when `queue.backend: sqlite`) and every runtime
+sleep is clamped to the cap; the remainder becomes a DEFER rather than a longer
+sleep. A deferred task circulates bounded by the queue's `max_age_hours` age
+gate, never by the retry budget.
+
+**Observability.** `get_gather_transport_stats()` (also on the `PipelineStatus`
+surface as `gather_transport_metrics`) exposes flat integer counters:
+`requests_{raw,html,rest}`, `bytes_{raw,html,rest}`, `deferred_rate_limit`,
+`deferred_secondary`, `dropped_auth`, `dropped_not_found`, `head_fallback`,
+`unparseable_link`, `truncated`. An oversized payload is truncated at
+`max_payload_bytes`, counted, and its retained prefix is still searched.
+
+**Unchanged:** authenticated search and `repo_meta` behavior, wire-query
+construction, registry schema, the existing bounded-requeue and loud-drop
+outcomes for genuinely faulty work, and the `date_metrics` fill-rate drift
+detector. Under `raw`/`rest` there is no rendered markup, so `file_commit_date`
+is NULL by construction with no parse attempt (current GitHub serves no
+`datetime=` attributes anyway).
+
 ## Troubleshooting
 
 ### **Common Issues**

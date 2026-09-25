@@ -351,6 +351,29 @@ queue:
   # NOTE: pipeline.queue_sizes is ignored when backend is sqlite (disk is the
   # bound; the refine governor bounds inflow) -- a startup WARNING says so.
 
+# Gather content transport (fix-gather-transport)
+# Selects how the gather stage fetches discovered file content. Absent section
+# resolves to raw (the measured-cheapest transport: ~30x less traffic per file).
+# Rollback is a flag flip to html -- no code removal, no data migration, because
+# persisted tasks keep their original github.com blob URLs.
+# NOTE: this top-level `gather:` block (GatherConfig, HOW the stage fetches) is
+# NOT the per-provider enable flag `tasks[].stages.gather` (StageConfig, WHETHER
+# the stage runs) further below; both keys legitimately coexist in one file.
+gather:
+  # html = legacy anonymous rendered blob page (rollback value)
+  # raw  = plain-content host derived from the blob link (default)
+  # rest = authenticated REST contents endpoint (full x-ratelimit-* headers,
+  #        costs 1 core unit per file; ~5000 files/h ceiling)
+  transport: "raw"
+  # Streaming byte cap for plain-content payloads (> 0). An oversized payload is
+  # truncated, counted, and its retained prefix is still searched.
+  max_payload_bytes: 8388608
+  # Bounded refusal sleep in seconds (> 0). MUST be strictly below
+  # queue.visibility_timeout_s when backend is sqlite: the durable queue has no
+  # claim renewal, so a longer sleep would let the row be re-delivered and run
+  # twice. The validator rejects a contradictory pair loudly.
+  max_refusal_wait_s: 60.0
+
 # Global rate limiting configuration
 ratelimits:
   # GitHub API rate limits
@@ -367,6 +390,14 @@ ratelimits:
     base_rate: 0.5
     # Maximum burst size
     burst_limit: 2
+    # Enable adaptive rate limiting
+    adaptive: true
+  # Plain-content gather transport rate limits (gather.transport: raw)
+  github_raw:
+    # Base rate in requests per second
+    base_rate: 2.0
+    # Maximum burst size
+    burst_limit: 4
     # Enable adaptive rate limiting
     adaptive: true
 

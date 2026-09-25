@@ -100,6 +100,9 @@ class StageMetrics(BaseMetrics):
     failure_empties_detected: int = 0
     tasks_requeued: int = 0
     tasks_dropped_max_retries: int = 0
+    # Tasks deferred on a published rate limit (attempt counter unchanged; the
+    # refusal is a property of the remote budget, not of the task).
+    tasks_deferred: int = 0
     # Durable-backend write failures (parallels tasks_dropped_max_retries):
     # a task dropped because the storage write failed is always counted.
     tasks_dropped_backend_errors: int = 0
@@ -214,6 +217,10 @@ class PipelineStatus:
 
     # Search-work fan-out governor counters (empty while off/unconfigured).
     refine_metrics: Dict[str, Any] = field(default_factory=dict)
+
+    # Gather-transport economics: per-transport bytes/requests, refusals by
+    # class, deferrals, HEAD fallbacks and truncations (fix-gather-transport S21).
+    gather_transport_metrics: Dict[str, Any] = field(default_factory=dict)
 
     # Periodic re-check driver counters (empty while disabled).
     recheck_metrics: Dict[str, Any] = field(default_factory=dict)

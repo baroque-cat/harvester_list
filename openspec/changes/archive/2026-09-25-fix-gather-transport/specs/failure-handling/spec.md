@@ -1,10 +1,6 @@
-# failure-handling Specification
+# Delta Spec: failure-handling
 
-## Purpose
-
-Guarantees that transient fetch failures are never accounted as successful completions: empties are classified (legitimate zero vs failure-empty vs rate-limit deferral), failures propagate into the existing bounded-retry machinery while deferrals bypass it without burning budget, gather outcomes stay truthful in the persistent registry, and the whole contract rolls out behind a tri-mode flag with shadow measurement before enforcement.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Empty-result taxonomy at the fetch boundary
 The system SHALL classify every empty search/gather fetch outcome as either a **legitimate zero** (the remote answered successfully with zero matching items) or a **failure-empty** (no usable answer was obtained: transport exception after retries exhausted, local limiter suppression, blank or undecodable payload). Failure-empties MUST NOT be returned to callers as zero-result answers. A fetch that was **refused before completion** on a published rate limit is a third category — a *deferral* — and SHALL NOT be collapsed into either of the other two: it is not an answer, and it is not a task-level fault. Parsing/extraction of a successfully fetched payload remains fail-open: malformed or absent fields degrade to empty/NULL with a counted warning, never an exception.
@@ -62,51 +58,3 @@ A gather outcome SHALL be recorded as successful in the persistent registry only
 #### Scenario: Deferred gather writes no registry outcome
 - **WHEN** an acquisition task's fetch is deferred on a published rate limit
 - **THEN** no `visit_status` transition and no `link_coverage` row are written for that attempt, and the link remains eligible for a future gather decision exactly as if it had not been attempted
-
-### Requirement: Check tasks survive limiter starvation
-When the provider-side rate-limit bucket cannot be acquired even after the scheduled wait, the check task SHALL be re-enqueued through the bounded-retry path instead of being dropped, so no harvested key silently loses its validation.
-
-#### Scenario: Starved check requeues
-- **WHEN** a check task finds its provider limiter bucket unavailable after waiting
-- **THEN** the task is re-enqueued with attempts incremented (bounded), and no silent completion is recorded
-
-### Requirement: Tri-mode rollout flag
-The failure-handling contract SHALL be governed by a configuration flag with three modes: `legacy` (behavior byte-equivalent to the pre-change system, with the new detection counters inert — present but zero, never incremented — the pure rollback state), `shadow` (failure-empties detected, counted and logged with stage/provider/task context, while task outcomes remain exactly as in legacy), and `strict` (full enforcement of propagation, requeue and fidelity requirements above). Default at release: `shadow`. Switching modes SHALL require only a configuration change, never code removal.
-
-#### Scenario: Legacy mode is indistinguishable from pre-change behavior
-- **WHEN** the pipeline runs under `failure_handling: legacy` against injected transient failures
-- **THEN** task outcomes, statistics and logs match the pre-change behavior, and the new detection counters do not operate
-
-#### Scenario: Shadow mode measures without enforcing
-- **WHEN** the pipeline runs under `failure_handling: shadow` against injected transient failures
-- **THEN** every failure-empty increments `failure_empties_detected` for its stage and emits a contextual log line, while the affected tasks complete exactly as they would in legacy mode
-
-#### Scenario: Strict mode enforces
-- **WHEN** the pipeline runs under `failure_handling: strict` against injected transient failures
-- **THEN** the propagation, bounded-requeue and gather-fidelity requirements take effect
-
-#### Scenario: Rollback is a config flip
-- **WHEN** an operator switches the flag from `strict` to `legacy` and restarts
-- **THEN** the system exhibits legacy behavior with no code change and no data migration
-
-### Requirement: Failure observability counters
-The system SHALL expose per-stage counters: `failure_empties_detected` (shadow and strict modes), `tasks_requeued`, and `tasks_dropped_max_retries`, surfaced through the existing status/metrics structures without registry-schema or shard-format changes.
-
-#### Scenario: Counters visible in status
-- **WHEN** transient failures occur under shadow or strict mode
-- **THEN** the corresponding counters are readable from the pipeline status/metrics surface alongside existing stage metrics
-
-### Requirement: Existing protections are preserved
-Credential-cooldown mechanics SHALL remain untouched: rate-limit signals (HTTP 429/403 and soft-block content) keep rotating credentials through the existing bounded-backoff channel (60→900s escalation) and MUST NOT be double-handled as generic transient failures; an all-credentials-cooling pool keeps blocking (waiting) rather than dropping tasks; NDJSON shard formats and `recover_tasks()` replay semantics remain unchanged.
-
-#### Scenario: Cooldown rotation unchanged under the new contract
-- **WHEN** a credential hits a rate limit during search in strict mode
-- **THEN** the rotation loop exchanges the credential and proceeds exactly as before this change, with backoff escalating per the existing schedule, and the event is not counted as a failure-empty requeue
-
-#### Scenario: Full-pool cooldown waits, never drops
-- **WHEN** every pooled credential is cooling down while a search task needs one
-- **THEN** the task blocks until the earliest cooldown release and then proceeds; it is never dropped or completed-empty by this mechanism
-
-#### Scenario: Restart recovery unaffected
-- **WHEN** the process restarts after runs that included transient failures
-- **THEN** queue-file and shard-based recovery replays the same task sets as before this change (formats untouched)

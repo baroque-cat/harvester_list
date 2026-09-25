@@ -6,6 +6,7 @@ Hybrid architecture with dependency injection and pure functional processing.
 """
 
 import json
+import math
 import os
 import queue
 import sqlite3
@@ -29,7 +30,7 @@ from typing import (
 from config.schemas import Config, StageConfig, TaskConfig
 from constant.system import DEFAULT_SHUTDOWN_TIMEOUT
 from core.enums import PipelineStage
-from core.exceptions import TransientFetchError
+from core.exceptions import RateLimitDeferral, TransientFetchError
 from core.metrics import StageMetrics
 from core.models import LinkMetadata, ProviderTask
 from core.types import IAuthProvider, IProvider
@@ -204,6 +205,11 @@ class BasePipelineStage(ABC, WorkerManageable):
         self.failure_empties_detected = 0
         self.tasks_requeued = 0
         self.tasks_dropped_max_retries = 0
+        # Tasks deferred on a published rate limit (design D4): DEFER is a third
+        # outcome distinct from requeue and drop.
+        self.tasks_deferred = 0
+        # Bounded stage-wide pause gate for actor-scoped secondary/abuse limits.
+        self._defer_pause_until = 0.0
         # Durable-backend write failures (a dropped task is always counted).
         self.tasks_dropped_backend_errors = 0
 
@@ -372,6 +378,75 @@ class BasePipelineStage(ABC, WorkerManageable):
 
         return True
 
+    def defer_task(self, task: ProviderTask, wait_s: Optional[float] = None) -> bool:
+        """Return a rate-limit-deferred task to pending WITHOUT consuming budget.
+
+        The third outcome seam (design D4).  A deferral is not a duplicate, so
+        the dedup gate is bypassed entirely; ``attempts`` is preserved unchanged,
+        as are the original ``created_at`` and ``dedup_id`` so the durable queue's
+        ``max_age_hours`` age gate stays anchored to first creation (the natural
+        ceiling that stops a deferred task circulating forever).
+
+        ``wait_s`` is the BOUNDED wait already clamped by ``_effective_defer_wait``
+        (design D5).  It is optional so plain re-queue callers stay valid, but when
+        supplied it is named in the WARNING: the effective deferral duration is the
+        one number an operator needs during a soak, and it is otherwise invisible.
+        """
+        task_id = self._generate_id(task)
+        try:
+            if self._durable_queue:
+                self.queue.put(
+                    task,
+                    timeout=1.0,
+                    dedup_id=task_id,
+                    created_at=getattr(task, "created_at", None),
+                    attempts=getattr(task, "attempts", 0),
+                )
+            else:
+                self.queue.put(task, timeout=1.0)
+        except queue.Full:
+            with self.stats_lock:
+                self.tasks_dropped_backend_errors += 1
+            logger.warning(f"[{self.name}] queue is full, deferred task dropped: {task}")
+            return False
+        except Exception as e:
+            if self._durable_queue:
+                with self.stats_lock:
+                    self.tasks_dropped_backend_errors += 1
+                logger.warning(f"[{self.name}] dropped deferred task, durable queue write failed: {e}")
+                return False
+            raise
+
+        with self.stats_lock:
+            self.tasks_deferred += 1
+        cap = self._defer_wait_cap()
+        if wait_s is None:
+            wait_detail = "bounded wait: n/a"
+        elif math.isinf(cap):
+            wait_detail = f"bounded wait: {float(wait_s):.1f}s (no configured cap)"
+        else:
+            wait_detail = f"bounded wait: {float(wait_s):.1f}s (cap {cap:.1f}s)"
+        logger.warning(
+            f"[{self.name}] deferred task on rate limit, provider: {getattr(task, 'provider', '')}, "
+            f"{wait_detail}, task: {task}"
+        )
+        return True
+
+    def _defer_wait_cap(self) -> float:
+        """Configured refusal-wait ceiling in seconds (design D5).
+
+        Returns ``inf`` when the gather config is unreachable so the caller
+        degrades to the published wait instead of inventing a tighter bound.
+        """
+        try:
+            return float(self.resources.config.gather.max_refusal_wait_s)
+        except Exception:
+            return float("inf")
+
+    def _effective_defer_wait(self, wait_s: float) -> float:
+        """Clamp a deferral wait to the configured refusal cap (design D5)."""
+        return max(0.0, min(float(wait_s), self._defer_wait_cap()))
+
     def is_finished(self) -> bool:
         """Check if stage is finished processing"""
         # Stage is finished if:
@@ -400,6 +475,7 @@ class BasePipelineStage(ABC, WorkerManageable):
             metrics.tasks_requeued = self.tasks_requeued
             metrics.tasks_dropped_max_retries = self.tasks_dropped_max_retries
             metrics.tasks_dropped_backend_errors = self.tasks_dropped_backend_errors
+            metrics.tasks_deferred = self.tasks_deferred
 
             return metrics
 
@@ -526,6 +602,12 @@ class BasePipelineStage(ABC, WorkerManageable):
 
             return result
 
+        except RateLimitDeferral:
+            # A deferral is neither an answer nor a task fault: it must never be
+            # swallowed by the failure-empty handler or mode-collapsed in ANY
+            # failure_handling mode (failure-handling S18/S21).
+            raise
+
         except TransientFetchError as e:
             # Typed transient failure: shadow counts/logs then swallows (same
             # outcome as legacy); strict lets it escape so the worker loop's
@@ -569,6 +651,14 @@ class BasePipelineStage(ABC, WorkerManageable):
     def _worker_loop(self) -> None:
         """Main worker thread loop with pure functional processing"""
         while self.running:
+            # Actor-scoped secondary/abuse refusals pause the whole stage for a
+            # bounded interval so sibling workers stop claiming new rows (S16).
+            with self.stats_lock:
+                pause_remaining = self._defer_pause_until - time.time()
+            if pause_remaining > 0:
+                time.sleep(min(pause_remaining, 1.0))
+                continue
+
             try:
                 # Get task with timeout
                 task = self.queue.get(timeout=1.0)
@@ -592,6 +682,20 @@ class BasePipelineStage(ABC, WorkerManageable):
                     # Update success statistics
                     with self.stats_lock:
                         self.total_processed += 1
+
+                except RateLimitDeferral as d:
+                    # DEFER: sleep a bounded interval INSIDE the claim (bounded by
+                    # the D5 invariant WAIT_CAP < visibility_timeout_s), then
+                    # return the row to pending without touching attempts.  No
+                    # total_errors / tasks_requeued / total_processed: a deferral
+                    # is not a completion (failure-handling S19).
+                    wait = self._effective_defer_wait(d.wait_s)
+                    if d.stage_pause:
+                        with self.stats_lock:
+                            self._defer_pause_until = max(self._defer_pause_until, time.time() + wait)
+                    if wait > 0:
+                        time.sleep(wait)
+                    self.defer_task(task, wait_s=wait)
 
                 except Exception as e:
                     logger.error(f"[{self.name}] error processing task: {e}")

@@ -103,7 +103,7 @@ def test_s7_fetch_failure_never_produces_gathered_ok(workspace, monkeypatch):
     def dead_network(url="", retries=3, interval=1.0, **kwargs):
         raise ConnectionError("HTTP 503 error: upstream gone")
 
-    monkeypatch.setattr(search_client, "http_get", dead_network)
+    monkeypatch.setattr(search_client, "fetch_gather_content", dead_network)
     registry = _registry(workspace)
     try:
         stage = _stage(workspace, registry, mode="strict")
@@ -133,7 +133,7 @@ def test_s7_fetch_failure_never_produces_gathered_ok(workspace, monkeypatch):
 # ---------------------------------------------------------------------------
 def test_s8_zero_key_success_keeps_coverage_semantics(workspace, monkeypatch):
     monkeypatch.setattr(
-        search_client, "http_get",
+        search_client, "fetch_gather_content",
         lambda url="", retries=3, interval=1.0, **kwargs: "<html>no secrets here</html>",
     )
     registry = _registry(workspace)
@@ -152,5 +152,54 @@ def test_s8_zero_key_success_keeps_coverage_semantics(workspace, monkeypatch):
             (url_hash(URL), PROVIDER, digest),
         )
         assert coverage[0][0] == 1  # "researched, nothing found" stays covered
+    finally:
+        registry.stop()
+
+
+# ---------------------------------------------------------------------------
+# failure-handling-S21 (fix-gather-transport: deferral writes NO outcome)
+# ---------------------------------------------------------------------------
+def test_s21_deferred_gather_writes_no_registry_outcome(workspace, monkeypatch):
+    """WHEN an acquisition task's fetch is deferred on a published rate limit
+    THEN no visit_status transition and no link_coverage row are written, so a
+    later gather-skip decision still treats the link as never-attempted.
+
+    Contrast with s7 above: a FAILED fetch records visit_status='failed'
+    (REASON_FAILED_RETRY reachable); a DEFERRAL must record nothing at all -
+    the refusal is a property of the remote budget, not of the link
+    (spec failure-handling "Gather-outcome fidelity"; design D4).
+
+    RED at plan time: RateLimitDeferral does not exist and the worker has no
+    deferral branch (it would fall into the catch-all and record a false
+    failed gather).
+    """
+    from core.exceptions import RateLimitDeferral
+
+    def refused(url, **kwargs):
+        raise RateLimitDeferral("rate limit exceeded", wait_s=1.0)
+
+    monkeypatch.setattr(search_client, "fetch_gather_content", refused)
+    registry = _registry(workspace)
+    try:
+        stage = _stage(workspace, registry, mode="strict")
+
+        # The typed deferral escapes for the worker loop's DEFER branch...
+        with pytest.raises(RateLimitDeferral):
+            stage.process_task(_task())
+
+        registry.flush(10.0)
+        digest = patterns_hash(key_pattern=KEY_PATTERN)
+
+        # ...and the registry shows NO trace of the attempt: neither a failed
+        # visit nor a coverage row. The link stays eligible exactly as if it
+        # had never been attempted.
+        status = _rows(workspace, "SELECT visit_status FROM links WHERE url_hash=?", (url_hash(URL),))
+        assert status == []
+        coverage = _rows(
+            workspace,
+            "SELECT COUNT(*) FROM link_coverage WHERE url_hash=? AND provider=? AND patterns_hash=?",
+            (url_hash(URL), PROVIDER, digest),
+        )
+        assert coverage[0][0] == 0
     finally:
         registry.stop()

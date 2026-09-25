@@ -19,7 +19,7 @@ from constant.search import (
 )
 from constant.system import SERVICE_TYPE_GITHUB_API, SERVICE_TYPE_GITHUB_WEB
 from core.enums import ErrorReason, PipelineStage, ResultType
-from core.exceptions import TransientFetchError
+from core.exceptions import RateLimitDeferral, TransientFetchError
 from core.models import (
     AcquisitionTask,
     CheckTask,
@@ -562,7 +562,14 @@ class AcquisitionStage(BasePipelineStage):
                     endpoint_pattern=task.endpoint_pattern,
                     model_pattern=task.model_pattern,
                     metadata=metadata,
+                    transport=self.resources.config.gather.transport,
                 )
+            except RateLimitDeferral:
+                # A deferral records NO gather outcome at all: no visit_status
+                # transition, no coverage row (failure-handling S21).  It must
+                # escape before both the TransientFetchError branch and the
+                # catch-all (which would record a false failed gather).
+                raise
             except TransientFetchError as e:
                 if mode == "strict":
                     # The blob fetch never happened: record a failed gather (no
@@ -610,6 +617,10 @@ class AcquisitionStage(BasePipelineStage):
             self._record_gathered(task, success=True)
 
             return output
+
+        except RateLimitDeferral:
+            # Unconditional: a deferral is not a gather failure in ANY mode.
+            raise
 
         except TransientFetchError:
             # Strict mode: propagate to ``process_task`` for mode-policy handling

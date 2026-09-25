@@ -490,6 +490,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             prioritization_metrics=self._prioritization_metrics(),
             aggregation_metrics=get_aggregation_metrics(),
             refine_metrics=self.get_refine_metrics(),
+            gather_transport_metrics=client.get_gather_transport_stats(),
         )
 
         return pipeline_status

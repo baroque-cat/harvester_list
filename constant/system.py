@@ -50,7 +50,6 @@ GITHUB_CREDENTIAL_COOLDOWN_MAX: int = 900
 GITHUB_CREDENTIAL_COOLDOWN_FACTOR: float = 2.0
 GITHUB_WEB_COUNT_DELAY_MAX: float = 2.0  # Random delay up to 2 seconds
 CHAT_RETRY_INTERVAL: int = 1
-COLLECT_RETRY_INTERVAL: int = 1
 
 # Signal handling timeouts
 FORCE_EXIT_GRACE_PERIOD: float = 5.0  # Time to wait for second Ctrl+C
@@ -98,4 +97,5 @@ NO_RETRY_ERROR_CODES: Set[int] = {400, 401, 402, 404, 422}
 # Service types
 SERVICE_TYPE_GITHUB_API: str = "github_api"
 SERVICE_TYPE_GITHUB_WEB: str = "github_web"
+SERVICE_TYPE_GITHUB_RAW: str = "github_raw"
 PROVIDER_SERVICE_PREFIX: str = "provider"

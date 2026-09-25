@@ -300,3 +300,112 @@ def test_credential_rotation_is_not_a_failure_empty(monkeypatch):
     assert out is not None
     assert calls["n"] == 2                                   # rotation happened as before
     assert getattr(stage, "failure_empties_detected", 0) == 0  # cooldown is its own channel
+
+
+# ---------------------------------------------------------------------------
+# failure-handling-S19 (fix-gather-transport: DEFER does not consume the budget)
+# ---------------------------------------------------------------------------
+def test_s19_deferral_does_not_consume_the_retry_budget(monkeypatch):
+    """WHEN a started strict-mode stage defers a task on a published rate limit
+    and the same task later succeeds within the run THEN attempts is unchanged,
+    no drop/requeue/error counter moves, and only the success is accounted.
+
+    RED at plan time: cfg.gather is absent, RateLimitDeferral is absent, the
+    worker loop has no deferral branch and tasks_deferred does not exist
+    (design D4; spec failure-handling "Bounded retry and honest accounting").
+    """
+    import json  # noqa: F401  (kept local: only the new scenarios need it)
+
+    from core.exceptions import RateLimitDeferral
+    from core.models import AcquisitionTask
+    from stage.definition import AcquisitionStage
+
+    cfg_holder = {}
+
+    def flaky_fetch(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            raise RateLimitDeferral("rate limit exceeded", wait_s=0.05)
+        return "token=sk-abcdefgh01234567"
+
+    calls = []
+    monkeypatch.setattr(search_client, "fetch_gather_content", flaky_fetch)
+
+    resources = _resources("strict")
+    resources.config.gather.transport = "raw"  # RED driver: no gather section yet
+    cfg_holder["cfg"] = resources.config
+    stage = AcquisitionStage(resources, lambda out: None, thread_count=1, max_retries=3)
+    task = TaskFactory.create_acquisition_task(
+        PROVIDER, "https://github.com/acme/widgets/blob/main/leak.py",
+        Patterns(key_pattern=KEY_PATTERN),
+    )
+
+    stage.start()
+    try:
+        assert stage.put_task(task) is True
+        drained = _wait_drain(stage, deadline=10.0)
+    finally:
+        stage.stop(timeout=2.0)
+
+    assert drained, "worker loop did not settle within the deadline"
+    assert len(calls) == 2                       # deferred once, then succeeded
+    assert task.attempts == 0                    # deferral never touches attempts
+    assert stage.tasks_dropped_max_retries == 0  # not a drop...
+    assert stage.tasks_requeued == 0             # ...not a requeue...
+    assert stage.total_errors == 0               # ...not an error
+    assert stage.tasks_deferred == 1             # counted on its own ledger
+    assert stage.total_processed == 1            # only the successful completion
+
+
+# ---------------------------------------------------------------------------
+# failure-handling-S20 (fix-gather-transport: deferral circulates bounded)
+# ---------------------------------------------------------------------------
+def test_s20_deferral_cannot_circulate_forever(tmp_path, caplog):
+    """GIVEN a real SqliteTaskQueue with an age gate WHEN a task is deferred
+    repeatedly and its ORIGINAL created_at passes the gate THEN the existing
+    startup maintenance purges it loudly - the ceiling is max_age_hours, not
+    the retry budget (design D4; mirrors tests/test_tq_sqlite_queue.py S13).
+
+    RED at plan time: stage.defer_task does not exist.
+    """
+    import json
+
+    from core.models import AcquisitionTask  # noqa: F401
+    from stage.definition import AcquisitionStage
+    from storage.task_queue import SqliteTaskQueue
+
+    stage = AcquisitionStage(
+        _resources("strict"),
+        lambda out: None,
+        thread_count=1,
+        max_retries=3,
+        queue_backend="sqlite",
+        queue_dir=str(tmp_path / "qs"),
+        queue_max_age_hours=24.0,
+    )
+    try:
+        task = TaskFactory.create_acquisition_task(
+            PROVIDER, "https://github.com/acme/widgets/blob/main/leak.py",
+            Patterns(key_pattern=KEY_PATTERN),
+        )
+        task.created_at = time.time() - 25 * 3600  # born aged-out; deferral keeps this
+        assert stage.put_task(task) is True
+
+        got = stage.queue.get(timeout=2.0)
+        assert stage.defer_task(got) is True       # repeated deferral, attempts untouched
+        stage.queue.task_done()
+        assert stage.queue.qsize() == 1            # still circulating as pending
+        db_path = str(tmp_path / "qs" / "gather_queue.sqlite")
+    finally:
+        stage.queue.close()
+
+    with caplog.at_level(logging.WARNING):
+        q2 = SqliteTaskQueue(db_path, serializer=json.dumps, deserializer=json.loads,
+                             name="acquisition", max_age_hours=24.0)
+    try:
+        assert q2.qsize() == 0                     # purged by the age gate, not claimable
+        assert any("purged" in rec.getMessage().lower() for rec in caplog.records), (
+            "the age-gate purge that bounds deferral must be loud"
+        )
+    finally:
+        q2.close()

@@ -4,6 +4,7 @@
 HTTP client utilities and GitHub-specific search functions for the search engine.
 """
 
+import base64
 import datetime
 import gzip
 import itertools
@@ -215,7 +216,6 @@ def request(method: str, url: str, timeout: float = 10, **kwargs: Any) -> reques
 from constant.search import API_RESULTS_PER_PAGE, WEB_RESULTS_PER_PAGE
 from constant.system import (
     CHAT_RETRY_INTERVAL,
-    COLLECT_RETRY_INTERVAL,
     DEFAULT_HEADERS,
     DEFAULT_QUESTION,
     GITHUB_API_INTERVAL,
@@ -224,9 +224,10 @@ from constant.system import (
     GITHUB_WEB_COUNT_DELAY_MAX,
     NO_RETRY_ERROR_CODES,
     SERVICE_TYPE_GITHUB_API,
+    SERVICE_TYPE_GITHUB_RAW,
     SERVICE_TYPE_GITHUB_WEB,
 )
-from core.exceptions import NetworkError, TransientFetchError, ValidationError
+from core.exceptions import NetworkError, RateLimitDeferral, TransientFetchError, ValidationError
 from core.models import RateLimitConfig
 from core.types import IAuthProvider
 from tools.coordinator import get_user_agent
@@ -281,6 +282,11 @@ class GitHubClient:
         url_lower = url.lower()
         if "api.github.com" in url_lower:
             return SERVICE_TYPE_GITHUB_API
+        if "raw.githubusercontent.com" in url_lower:
+            # Must precede the generic "github.com" test: githubusercontent.com
+            # does not contain github.com, so without this branch the plain
+            # content host falls through to None (no throttling at all).
+            return SERVICE_TYPE_GITHUB_RAW
         elif "github.com" in url_lower:
             return SERVICE_TYPE_GITHUB_WEB
 
@@ -848,6 +854,475 @@ def http_get(
             raise NetworkError(f"Unexpected error: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Gather transport (fix-gather-transport, design D2/D3/D4/D5/D6/D8)
+#
+# The gather stage fetches file content through one of three transports chosen
+# by configuration: ``html`` (the legacy anonymous rendered blob page), ``raw``
+# (the plain-content host derived from the discovered blob link, the default)
+# and ``rest`` (the authenticated REST contents endpoint).  Every refusal is
+# classified by the signal the remote actually published and mapped to one of
+# three distinct outcomes: DEFER (a typed RateLimitDeferral), BOUNDED REQUEUE
+# (the pre-existing transient failure) or LOUD DROP.
+# ---------------------------------------------------------------------------
+
+_RAW_HOST = "https://raw.githubusercontent.com"
+_GITHUB_BLOB_RE = re.compile(r"^https?://github\.com/([^/]+)/([^/]+)/blob/(.+)$", re.I)
+_HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# The canonical counter surface (gather-transport-S21).  Request AND byte
+# counters exist for every transport up front so the published schema is
+# STABLE: a pure-``raw`` run still exposes ``bytes_html``/``bytes_rest`` (as
+# zeros) instead of growing the key set mid-run when another transport is
+# first exercised.  Dashboards and alerts may rely on this exact set.
+_GATHER_TRANSPORT_STAT_KEYS: Tuple[str, ...] = (
+    "requests_raw",
+    "bytes_raw",
+    "requests_html",
+    "bytes_html",
+    "requests_rest",
+    "bytes_rest",
+    "deferred_rate_limit",
+    "deferred_secondary",
+    "dropped_auth",
+    "dropped_not_found",
+    "head_fallback",
+    "unparseable_link",
+    "truncated",
+)
+
+_GATHER_TRANSPORT_STATS: Dict[str, int] = {key: 0 for key in _GATHER_TRANSPORT_STAT_KEYS}
+
+
+def reset_gather_transport_stats() -> None:
+    """Reset the gather-transport observability counters (tests / fresh runs).
+
+    Driven by the canonical key tuple rather than the live dict, and mutates in
+    place so the surface can neither grow nor shrink across resets and no
+    caller can be left holding a stale mapping.
+    """
+    for key in _GATHER_TRANSPORT_STAT_KEYS:
+        _GATHER_TRANSPORT_STATS[key] = 0
+
+
+def get_gather_transport_stats() -> Dict[str, int]:
+    """Expose per-transport gather counters as a flat ``Dict[str, int]``."""
+    return dict(_GATHER_TRANSPORT_STATS)
+
+
+def _gather_stat_inc(key: str, amount: int = 1) -> None:
+    if key not in _GATHER_TRANSPORT_STATS:
+        # Loud, never fatal: an undeclared counter would silently widen the
+        # published schema, which is exactly what S21 forbids.
+        logger.warning(f"undeclared gather transport counter ignored: {key}")
+        return
+    _GATHER_TRANSPORT_STATS[key] = _GATHER_TRANSPORT_STATS.get(key, 0) + int(amount)
+
+
+# Built-in transport used when the operator configuration is unreachable.  Kept
+# identical to ``GatherConfig.transport``'s default so a config-less caller and a
+# fully configured one agree (design D1: raw is the default everywhere).
+_DEFAULT_GATHER_TRANSPORT = "raw"
+
+
+def _configured_gather_transport() -> str:
+    """Resolve the operator-configured gather transport (``gather.transport``).
+
+    ``collect(transport=None)`` must honour configuration rather than silently
+    hardcoding a surface, otherwise an embedded or future caller would bypass the
+    operator's rollback flag (design D2: rollback is a flag flip and nothing else).
+
+    The lookup is deferred and fully guarded on purpose: this module stays free of
+    a hard top-level dependency on ``config`` (no import cycle, no new coupling in
+    the client layer per design D6), and callers that never load ``config.yaml`` —
+    unit tests, ad-hoc scripts — degrade to the built-in default instead of
+    raising ``RuntimeError`` from ``get_config()``.
+    """
+    try:
+        from config import get_config
+
+        configured = getattr(get_config().gather, "transport", None)
+    except Exception:
+        return _DEFAULT_GATHER_TRANSPORT
+    normalized = str(configured).strip().lower() if configured is not None else ""
+    return normalized or _DEFAULT_GATHER_TRANSPORT
+
+
+def _split_blob_ref_path(parts: List[str]):
+    """Split ``<ref>/<path>`` segments extracted after ``/blob/``.
+
+    A 40-hex first segment is unambiguously the immutable revision.  Otherwise a
+    branch name may itself contain slashes, so the trailing directory+filename
+    pair is taken as the path and everything before it as the revision.
+    """
+    if len(parts) >= 2 and _HEX40_RE.match(parts[0]):
+        return parts[0], "/".join(parts[1:])
+    if len(parts) >= 3:
+        return "/".join(parts[:-2]), "/".join(parts[-2:])
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return None, None
+
+
+def _parse_blob_link(link: Any) -> Optional[Dict[str, str]]:
+    """Parse ``https://github.com/<owner>/<repo>/blob/<ref>/<path>``.
+
+    Tolerates ``?plain=1`` query strings and ``#L..`` fragments; returns ``None``
+    for anything that is not a recognizable blob link.  Never raises.
+    """
+    if not isinstance(link, str):
+        return None
+    text = link.strip()
+    if not text:
+        return None
+    text = text.split("#", 1)[0]
+    text = text.split("?", 1)[0]
+    match = _GITHUB_BLOB_RE.match(text)
+    if not match:
+        return None
+
+    owner, repo, rest = match.group(1), match.group(2), match.group(3)
+    parts = [segment for segment in rest.split("/") if segment]
+    if len(parts) < 2:
+        return None
+    ref, path = _split_blob_ref_path(parts)
+    if not ref or not path:
+        return None
+    return {"owner": owner, "repo": repo, "ref": ref, "path": path}
+
+
+def derive_raw_url(blob_url: Any) -> Optional[str]:
+    """Derive the plain-content address for a discovered blob link (design D2).
+
+    A usable 40-hex revision is emitted verbatim; any other revision falls back
+    to ``HEAD`` (counted + logged, never guessed silently).  Unparseable input
+    returns ``None`` and is counted; the function NEVER raises and never accepts
+    a blob content hash as the revision.
+    """
+    info = _parse_blob_link(blob_url)
+    if info is None:
+        _gather_stat_inc("unparseable_link")
+        return None
+
+    ref = info["ref"]
+    if not _HEX40_RE.match(ref):
+        _gather_stat_inc("head_fallback")
+        logger.warning(f"[gather-transport] unusable revision, falling back to HEAD: {blob_url}")
+        ref = "HEAD"
+
+    return f"{_RAW_HOST}/{info['owner']}/{info['repo']}/{ref}/{info['path']}"
+
+
+def gather_target_url(url: Any, transport: str) -> Optional[str]:
+    """Resolve the transport-specific address for a discovered link (design D2).
+
+    ``html`` returns the discovered link unchanged (rollback parity); ``raw``
+    derives the plain-content address; ``rest`` derives the REST contents
+    endpoint.  A URL already on the target host is passed through unchanged.
+    """
+    kind = str(transport).strip().lower()
+    if kind == "html":
+        return url
+
+    if not isinstance(url, str) or not url.strip():
+        return derive_raw_url(url) if kind == "raw" else None
+
+    stripped = url.strip()
+    lowered = stripped.lower()
+    if kind == "raw" and "raw.githubusercontent.com" in lowered:
+        return stripped
+    if kind == "rest" and "api.github.com" in lowered:
+        return stripped
+    if kind == "raw":
+        return derive_raw_url(stripped)
+
+    info = _parse_blob_link(stripped)
+    if info is None:
+        _gather_stat_inc("unparseable_link")
+        return None
+
+    ref = info["ref"]
+    if not _HEX40_RE.match(ref):
+        _gather_stat_inc("head_fallback")
+        logger.warning(f"[gather-transport] unusable revision, falling back to HEAD: {stripped}")
+        ref = "HEAD"
+
+    return (
+        f"https://api.github.com/repos/{info['owner']}/{info['repo']}"
+        f"/contents/{info['path']}?ref={ref}"
+    )
+
+
+def _gather_wait_from_headers(headers: Dict[str, str]) -> Optional[float]:
+    """Read a published finite wait from ``Retry-After`` / ``X-RateLimit-Reset``."""
+    normalized = {str(key).lower(): str(value) for key, value in (headers or {}).items()}
+    retry_after = trim(normalized.get("retry-after", ""))
+    if retry_after:
+        if retry_after.isdigit():
+            return float(retry_after)
+        try:
+            return max(0.0, parsedate_to_datetime(retry_after).timestamp() - time.time())
+        except Exception:
+            pass
+
+    reset_at = trim(normalized.get("x-ratelimit-reset", ""))
+    if reset_at.isdigit():
+        return max(0.0, float(reset_at) - time.time())
+    return None
+
+
+def _gather_wait_from_content(content: str) -> Optional[float]:
+    """Parse a human-readable wait out of a refusal body (fallback only)."""
+    text = content or ""
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict):
+            text = str(data.get("message", text))
+    except Exception:
+        pass
+
+    match = re.search(r"(?:retry after|try again in|wait)\s+(\d+)\s*(second|minute|hour)s?", text, flags=re.I)
+    if match:
+        value = float(match.group(1))
+        unit = match.group(2).lower()
+        if unit.startswith("hour"):
+            return value * 3600
+        if unit.startswith("minute"):
+            return value * 60
+        return value
+    if re.search(r"few minutes", text, flags=re.I):
+        return 180.0
+    return None
+
+
+def _gather_is_rate_limit_signal(status: int, reason: str) -> bool:
+    """True when a refusal carries rate-limit semantics (not a bare auth error).
+
+    Reuses the marker vocabulary of the class client's ``_is_http_rate_limited``
+    without touching the shared detectors globally (design D4).
+    """
+    if status == 429:
+        return True
+    if status == 403 and re.search(r"rate limit|abuse detection|please wait|try again later", reason or "", re.I):
+        return True
+    return False
+
+
+def _gather_is_secondary(reason: str) -> bool:
+    """True for an actor-scoped secondary/abuse limit (no published resumption)."""
+    return bool(re.search(r"secondary rate limit|abuse detection", reason or "", re.I))
+
+
+def _decode_payload_bytes(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return gzip.decompress(raw).decode("utf-8")
+        except Exception:
+            raise NetworkError("Failed to decode response content")
+
+
+def _decode_rest_content(text: str) -> str:
+    """Base64-decode the REST contents ``content`` field when present."""
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and data.get("encoding") == "base64" and data.get("content"):
+            decoded = base64.b64decode(data["content"])
+            return decoded.decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return text
+
+
+def _read_capped_payload(response: Any, transport: str, cap: int) -> Tuple[str, int]:
+    """Read a response with a byte cap, returning ``(text, delivered_bytes)``.
+
+    An oversized payload is truncated and counted; the retained prefix stays
+    valid extraction input and is NOT treated as a failure (design D8).
+    """
+    cap = max(1, int(cap))
+    total = 0
+    chunks: List[bytes] = []
+    truncated = False
+
+    reader = getattr(response, "iter_content", None)
+    if callable(reader):
+        for chunk in reader(chunk_size=8192):
+            if not chunk:
+                continue
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            remaining = cap - total
+            if len(chunk) > remaining:
+                if remaining > 0:
+                    chunks.append(chunk[:remaining])
+                total = cap
+                truncated = True
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    else:
+        data = getattr(response, "content", b"")
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        if len(data) > cap:
+            data = data[:cap]
+            truncated = True
+        chunks.append(data)
+        total = len(data)
+
+    if truncated:
+        _gather_stat_inc("truncated")
+        logger.warning(f"[gather-transport] payload truncated at {cap} bytes ({transport})")
+
+    text = _decode_payload_bytes(b"".join(chunks))
+    if transport == "rest":
+        text = _decode_rest_content(text)
+    return text, total
+
+
+def _gather_credential() -> Optional[str]:
+    """Resolve a credential for the authenticated ``rest`` transport, if any."""
+    provider = getattr(_github_client, "resource_provider", None)
+    if provider is not None:
+        try:
+            token = provider.get_token()
+            if token:
+                return token
+        except Exception:
+            pass
+    return None
+
+
+def fetch_gather_content(
+    url: str,
+    transport: str = "raw",
+    max_payload_bytes: int = 8 * 1024 * 1024,
+    max_refusal_wait_s: float = 60.0,
+    retries: int = 3,
+    timeout: float = 10,
+) -> str:
+    """Fetch gathered file content through the configured transport (design D6).
+
+    Resolves the transport address, acquires/report a rate-limit token when the
+    module client exists, and classifies every refusal by signal: a published
+    finite wait defers, an actor-scoped abuse limit defers with a stage pause,
+    and a genuine auth failure or missing resource drops once.  The retained
+    prefix of an oversized payload is returned rather than discarded (D8).
+    """
+    kind = str(transport).strip().lower()
+    if kind not in ("html", "raw", "rest"):
+        kind = "raw"
+
+    target = gather_target_url(url, kind)
+    if target is None:
+        # No request is ever issued for an unresolvable address (S7).
+        raise TransientFetchError(f"gather fetch failed: unusable gather link: {url!r}")
+
+    client = _github_client
+    service: Optional[str] = None
+    credential: Optional[str] = None
+    headers = DEFAULT_HEADERS.copy()
+    if kind == "rest":
+        credential = _gather_credential()
+        if credential:
+            headers["Authorization"] = f"Bearer {credential}"
+
+    attempts = max(1, int(retries))
+    cap = max(1, int(max_payload_bytes))
+    refusal_cap = float(max_refusal_wait_s)
+    last_error: Optional[Exception] = None
+
+    for attempt in range(attempts):
+        if client is not None:
+            service = client._service(target)
+            if not client._limit(service, credential):
+                client._report(service, False, credential)
+                raise TransientFetchError(f"gather fetch suppressed by local limiter for url: {target}")
+
+        _gather_stat_inc(f"requests_{kind}")
+
+        try:
+            response = request("GET", target, headers=headers, timeout=timeout)
+        except requests.exceptions.HTTPError as e:
+            status = http_error_status(e)
+            reason = http_error_message(e)
+            response_headers = dict(e.response.headers) if e.response is not None else {}
+            if client is not None:
+                client._report(service, False, credential)
+
+            # A rate-limit signal must be checked BEFORE the bare 403/401 branch:
+            # GitHub delivers secondary limits as 403 (the misclassification fix).
+            if _gather_is_rate_limit_signal(status, reason):
+                published = _gather_wait_from_headers(response_headers)
+                if published is None:
+                    published = _gather_wait_from_content(reason)
+                if _gather_is_secondary(reason):
+                    wait = min(published, refusal_cap) if published is not None else refusal_cap
+                    _gather_stat_inc("deferred_secondary")
+                    logger.error(
+                        f"[gather-transport] secondary/abuse rate limit (HTTP {status}); "
+                        f"pausing stage for {wait:.0f}s, url: {target}"
+                    )
+                    raise RateLimitDeferral(
+                        f"secondary rate limit (HTTP {status}) for url: {target}",
+                        wait_s=wait,
+                        stage_pause=True,
+                    )
+                wait = min(published, refusal_cap) if published is not None else refusal_cap
+                _gather_stat_inc("deferred_rate_limit")
+                logger.warning(
+                    f"[gather-transport] rate-limit refusal (HTTP {status}); deferring {wait:.0f}s, url: {target}"
+                )
+                raise RateLimitDeferral(f"rate limit (HTTP {status}) for url: {target}", wait_s=wait)
+
+            if status in (401, 403):
+                _gather_stat_inc("dropped_auth")
+                logger.warning(
+                    f"[gather-transport] authentication failure (HTTP {status}), dropping url: {target}"
+                )
+                raise TransientFetchError(
+                    f"gather fetch authentication failed (HTTP {status}) for url: {target}"
+                )
+
+            if status == 404:
+                _gather_stat_inc("dropped_not_found")
+                logger.warning(f"[gather-transport] resource not found (HTTP 404), dropping url: {target}")
+                raise TransientFetchError(f"gather fetch not found (HTTP 404) for url: {target}")
+
+            last_error = TransientFetchError(f"gather fetch failed (HTTP {status}) for url: {target}")
+            if attempt + 1 < attempts:
+                time.sleep(min(2.0**attempt * 0.1, 1.0))
+                continue
+            raise last_error
+
+        except (requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+            if client is not None:
+                client._report(service, False, credential)
+            last_error = TransientFetchError(f"gather fetch network error for url: {target}: {e}")
+            if attempt + 1 < attempts:
+                time.sleep(min(2.0**attempt * 0.1, 1.0))
+                continue
+            raise last_error
+
+        try:
+            text, delivered = _read_capped_payload(response, kind, cap)
+        except Exception as e:
+            if client is not None:
+                client._report(service, False, credential)
+            raise TransientFetchError(f"gather fetch read failed for url: {target}: {e}") from e
+
+        if client is not None:
+            client._report(service, True, credential)
+        _gather_stat_inc(f"bytes_{kind}", delivered)
+        return text
+
+    if last_error is not None:
+        raise last_error
+    raise TransientFetchError(f"gather fetch failed for url: {target}")
+
+
 def chat(
     url: str, headers: Dict, model: str = "", params: Optional[Dict] = None, retries: int = 2, timeout: int = 10
 ) -> Tuple[int, str]:
@@ -1393,7 +1868,7 @@ def _search_code_impl(
         return [], ""
 
 
-@handle_exceptions(default_result=[], log_level="error", exclude=(TransientFetchError,))
+@handle_exceptions(default_result=[], log_level="error", exclude=(TransientFetchError, RateLimitDeferral))
 def collect(
     key_pattern: str,
     url: str = "",
@@ -1403,6 +1878,7 @@ def collect(
     model_pattern: str = "",
     text: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    transport: Optional[str] = None,
 ) -> List[Service]:
     """Extract API keys and related information from URLs or text content
 
@@ -1416,6 +1892,11 @@ def collect(
         text: Text content to search (if provided, url is ignored)
         metadata: Optional out-mapping; receives ``file_commit_date`` (epoch
             float or ``None``) extracted from the already-downloaded page.
+        transport: Gather transport (``html``/``raw``/``rest``).  When ``None``
+            the URL path resolves against the operator configuration
+            (``gather.transport``, see ``_configured_gather_transport``) and an
+            explicit-text payload keeps the historical rendered-page date
+            parsing.  An explicit argument always wins over configuration.
 
     Returns:
         List[Service]: List of Service objects with extracted information
@@ -1423,15 +1904,28 @@ def collect(
     if (not isinstance(url, str) and not isinstance(text, str)) or not isinstance(key_pattern, str):
         return []
 
+    resolved = str(transport).strip().lower() if transport is not None else ""
+    # The date parser only applies to a rendered page; a plain-content or REST
+    # payload carries no markup and yields NULL by construction (design D7).
+    parse_file_date = resolved in ("", "html")
+
     if text:
         content = text
     else:
         # Fetch phase: a failure here is a failure-empty and must surface as a
         # typed transient failure instead of collapsing into an empty success
-        # (design D4, gather-outcome fidelity).  Extraction below stays fail-open.
+        # (design D4, gather-outcome fidelity).  A rate-limit refusal is a third
+        # category: it escapes untouched as a deferral.  Extraction below stays
+        # fail-open.
+        fetch_transport = resolved or _configured_gather_transport()
+        parse_file_date = fetch_transport == "html"
         try:
-            content = http_get(url=url, retries=retries, interval=COLLECT_RETRY_INTERVAL)
-        except TransientFetchError:
+            content = fetch_gather_content(
+                url=url,
+                transport=fetch_transport,
+                retries=retries,
+            )
+        except (TransientFetchError, RateLimitDeferral):
             raise
         except Exception as e:
             raise TransientFetchError(f"gather fetch failed for url: {url}: {e}") from e
@@ -1443,12 +1937,16 @@ def collect(
     if not content:
         return []
 
-    # Capture the file's last-commit date from the payload we already hold.
+    # Capture the file's last-commit date from the payload we already hold,
+    # but only when the transported payload actually carries rendered markup.
     if metadata is not None:
-        try:
-            metadata["file_commit_date"] = _extract_file_commit_date(content)
-        except Exception as exc:  # pragma: no cover - defensive
-            _date_warning("file_date_fault", str(exc))
+        if parse_file_date:
+            try:
+                metadata["file_commit_date"] = _extract_file_commit_date(content)
+            except Exception as exc:  # pragma: no cover - defensive
+                _date_warning("file_date_fault", str(exc))
+                metadata["file_commit_date"] = None
+        else:
             metadata["file_commit_date"] = None
 
     # extract keys from content

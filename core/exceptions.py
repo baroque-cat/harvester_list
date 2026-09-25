@@ -52,6 +52,33 @@ class TransientFetchError(NetworkError, ConnectionError):
         super().__init__(message=message, reason=reason, **kwargs)
 
 
+class RateLimitDeferral(NetworkError):
+    """A fetch was refused on a published rate limit before completing.
+
+    Deliberately a *sibling* of :class:`TransientFetchError` rather than a
+    subclass of the builtin :class:`ConnectionError`: ``RetryCore.should_retry_error``
+    retries ``ConnectionError``/``TimeoutError``, and no existing
+    ``except TransientFetchError`` handler may collapse a deferral into a
+    failure-empty.  A deferral is neither an answer nor a task-level fault
+    (failure-handling S18).
+
+    ``wait_s`` is the bounded, published resumption wait; ``stage_pause`` marks
+    an actor-scoped (abuse/secondary) refusal that should pause the whole stage,
+    not just re-enqueue this task.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        wait_s: float = 0.0,
+        stage_pause: bool = False,
+        **kwargs,
+    ):
+        super().__init__(message=message, **kwargs)
+        self.wait_s = float(wait_s)
+        self.stage_pause = bool(stage_pause)
+
+
 class ValidationError(BaseError):
     """Input validation errors"""
 

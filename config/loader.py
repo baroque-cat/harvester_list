@@ -31,6 +31,7 @@ from .schemas import (
     DisplayContextConfig,
     EarlyStopConfig,
     EnrichmentConfig,
+    GatherConfig,
     GlobalConfig,
     LoadBalanceStrategy,
     MonitoringConfig,
@@ -156,6 +157,10 @@ class ConfigLoader:
         # Parse durable task-queue backend configuration
         if "queue" in data:
             config.queue = self._parse_task_queue_config(data["queue"])
+
+        # Parse gather transport configuration
+        if "gather" in data:
+            config.gather = self._parse_gather_config(data["gather"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -479,6 +484,24 @@ class ConfigLoader:
             backend=data.get("backend", "memory"),
             visibility_timeout_s=data.get("visibility_timeout_s", 300.0),
             max_age_hours=data.get("max_age_hours", 24.0),
+        )
+
+    def _parse_gather_config(self, data: Dict[str, Any]) -> GatherConfig:
+        """Parse the gather transport configuration section.
+
+        Unknown keys are ignored like the sibling parse methods; validation
+        is delegated to the dataclass ``__post_init__``.
+
+        Args:
+            data: Gather configuration data
+
+        Returns:
+            GatherConfig: Parsed gather configuration
+        """
+        return GatherConfig(
+            transport=data.get("transport", "raw"),
+            max_payload_bytes=data.get("max_payload_bytes", 8 * 1024 * 1024),
+            max_refusal_wait_s=data.get("max_refusal_wait_s", 60.0),
         )
 
     def _parse_rate_limits(self, data: Dict[str, Any]) -> Dict[str, RateLimitConfig]:

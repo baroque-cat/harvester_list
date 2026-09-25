@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Opportunistically captures repository freshness, repository size, and file-level last-commit dates from HTTP payloads the harvester already downloads (API search JSON, blob HTML pages), delivering them into the link registry without extra network requests and without ever breaking the pipeline on malformed **or absent** data. Live probing (September 2026, design D7) established that current GitHub payloads do not expose these fields at the free extraction points; this capability is therefore the always-on delivery channel and safe-degradation contract, while the actual supply of dates is restored by the `add-repo-meta-enrichment` change. Fill-rate metrics serve as drift detectors: they announce if GitHub ever restores the fields.
+Opportunistically captures repository freshness, repository size, and file-level last-commit dates from HTTP payloads the harvester already downloads (API search JSON, and gathered blob payloads in whatever form the configured `gather-transport` delivers them), delivering them into the link registry without extra network requests and without ever breaking the pipeline on malformed **or absent** data. Live probing (September 2026, design D7) established that current GitHub payloads do not expose these fields at the free extraction points; this capability is therefore the always-on delivery channel and safe-degradation contract, while the actual supply of dates is restored by the `add-repo-meta-enrichment` change. Fill-rate metrics serve as drift detectors: they announce if GitHub ever restores the fields.
 
 ## Requirements
 ### Requirement: Repository metadata from API search results
@@ -31,7 +31,7 @@ For every item of an API code-search response the system SHALL extract `reposito
 
 ### Requirement: File commit date from gathered blob pages
 
-During acquisition the system SHALL extract ISO datetimes from `<relative-time … datetime="…">` elements in the already-downloaded blob HTML **when such markup is present** and record the **maximum** of all matches as `file_commit_date` (conservative bias: overestimating freshness causes at most an extra re-gather, underestimating could cause a false skip). Live probing (September 2026, design D7) established that current GitHub serves blob pages with client-side-rendered timestamps — the served HTML carries no `datetime` attributes. Zero matches SHALL yield NULL without exception; this is the prevailing production case, not an edge case.
+During acquisition the system SHALL extract ISO datetimes from `<relative-time … datetime="…">` elements **when the transported payload carries such markup** and record the **maximum** of all matches as `file_commit_date` (conservative bias: overestimating freshness causes at most an extra re-gather, underestimating could cause a false skip). The extraction point is therefore transport-dependent: it applies to a rendered blob page, and a transport that delivers plain file content or a structured REST response carries no such markup, in which case `file_commit_date` SHALL be NULL by construction without any parse attempt and without exception. Live probing (September 2026, design D7; re-confirmed against a live blob page on 2026-09-25, where the marker census found `relative-time` present once but `datetime=` present zero times because the page is a client-side-rendered shell) established that current GitHub does not serve these attributes, so NULL is the prevailing production case on every transport, not an edge case. Zero matches SHALL yield NULL without exception. Fill-rate metrics SHALL remain in place unchanged as the drift detector that announces if GitHub ever restores the fields, and switching transport SHALL NOT worsen the observed NULL share.
 
 #### Scenario: Date captured from blob HTML
 
@@ -47,6 +47,16 @@ During acquisition the system SHALL extract ISO datetimes from `<relative-time �
 
 - **WHEN** acquisition processes a live-captured (September 2026) blob HTML page whose timestamps are rendered client-side
 - **THEN** `file_commit_date` is NULL, a warning counter increments, key extraction proceeds unaffected, and `date_fill_rate_web` reports 0.0 for that run
+
+#### Scenario: Plain-content transport yields NULL without a parse attempt
+
+- **WHEN** acquisition runs under a transport that delivers raw file bytes rather than a rendered page
+- **THEN** `file_commit_date` is NULL, no markup parse is attempted, key extraction proceeds unaffected, and no exception reaches the worker loop
+
+#### Scenario: Transport switch does not worsen the fill rate
+
+- **WHEN** the same workload is gathered under the rendered-page transport and under the default plain-content transport
+- **THEN** the proportion of gathered links carrying a non-NULL `file_commit_date` under the plain-content transport is not lower than under the rendered-page transport
 
 ### Requirement: Transport asymmetry enforced
 
