@@ -554,6 +554,14 @@ class ConfigValidator:
         if int(gather_config.max_payload_bytes) <= 0:
             self.errors.append("Gather max_payload_bytes must be positive")
 
+        # Bool only, loud: ``false`` is a supported rollback position (legacy
+        # classification), not a hazard, so it earns no warning (design D5).
+        if not isinstance(gather_config.defer_local_suppression, bool):
+            self.errors.append(
+                f"gather.defer_local_suppression must be a boolean "
+                f"(got: {gather_config.defer_local_suppression!r})"
+            )
+
         wait_cap = float(gather_config.max_refusal_wait_s)
         if wait_cap <= 0:
             self.errors.append("Gather max_refusal_wait_s must be positive")

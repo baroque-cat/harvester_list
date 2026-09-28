@@ -7,7 +7,7 @@ This module provides unified rendering for all status display needs.
 It replaces the scattered display logic throughout the system.
 """
 
-from typing import List
+from typing import Any, List
 
 from config import get_config
 from config.schemas import DisplayContextConfig
@@ -17,6 +17,28 @@ from .enums import AlertLevel, DisplayMode, StatusContext
 from .models import SystemStatus
 
 logger = get_logger("state")
+
+
+# Every run-metric surface published on ``PipelineStatus`` must have a rendering
+# path here (run-observability RO-S4): a counter no operator can read cannot be
+# used to accept or reject a run.  This registry is exactly the set of
+# ``PipelineStatus`` fields ending in ``_metrics`` (``credential_metrics``
+# included, so the completeness check has no exemptions); a pin enumerates the
+# dataclass fields against it, so publishing a new surface without a renderer is
+# a test failure rather than a silent gap.
+_RENDERED_METRIC_SURFACES = (
+    "date_metrics",
+    "skip_metrics",
+    "enrichment_metrics",
+    "early_stop_metrics",
+    "key_ledger_metrics",
+    "aggregation_metrics",
+    "refine_metrics",
+    "gather_transport_metrics",
+    "recheck_metrics",
+    "credential_metrics",
+    "prioritization_metrics",
+)
 
 
 def get_display_config(context: StatusContext, mode: DisplayMode, **overrides) -> DisplayContextConfig:
@@ -320,6 +342,10 @@ class StatusDisplayEngine:
         key_ledger_line = self._format_key_ledger_metrics_line(status)
         recheck_line = self._format_recheck_metrics_line(status)
         prioritization_line = self._format_prioritization_metrics_line(status)
+        gather_line = self._format_gather_transport_metrics_line(status)
+        aggregation_line = self._format_aggregation_metrics_line(status)
+        refine_line = self._format_refine_metrics_line(status)
+        credential_line = self._format_credential_metrics_line(status)
 
         if not status.pipeline.stages:
             lines.append("No pipeline data available")
@@ -337,6 +363,14 @@ class StatusDisplayEngine:
                 lines.append(recheck_line)
             if prioritization_line:
                 lines.append(prioritization_line)
+            if gather_line:
+                lines.append(gather_line)
+            if aggregation_line:
+                lines.append(aggregation_line)
+            if refine_line:
+                lines.append(refine_line)
+            if credential_line:
+                lines.append(credential_line)
             return lines
 
         # Table header
@@ -380,6 +414,18 @@ class StatusDisplayEngine:
 
         if prioritization_line:
             lines.append(prioritization_line)
+
+        if gather_line:
+            lines.append(gather_line)
+
+        if aggregation_line:
+            lines.append(aggregation_line)
+
+        if refine_line:
+            lines.append(refine_line)
+
+        if credential_line:
+            lines.append(credential_line)
 
         return lines
 
@@ -477,6 +523,154 @@ class StatusDisplayEngine:
         candidates = metrics.get("candidates") or []
         rendered = ", ".join(f"{owner}/{repo}:{priority:.1f}" for owner, repo, priority in candidates)
         return f"Top candidates: {rendered}" if rendered else ""
+
+    @staticmethod
+    def _metric_int(value: Any, default: int = 0) -> int:
+        """Coerce a metric figure to a non-negative int, fail-open (RO-S7).
+
+        ``None``, non-numeric strings, ``NaN``, infinities and negatives all
+        degrade to ``default`` instead of raising or printing ``nan``/``inf`` into
+        operator output.
+        """
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        if number != number or number in (float("inf"), float("-inf")):
+            return default
+        if number < 0:
+            return default
+        return int(number)
+
+    @staticmethod
+    def _metric_rate(value: Any, default: float = 0.0) -> float:
+        """Coerce a metric figure to a non-negative float, fail-open (RO-S7)."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        if number != number or number in (float("inf"), float("-inf")):
+            return default
+        if number < 0:
+            return default
+        return number
+
+    @staticmethod
+    def _format_gather_transport_metrics_line(status: SystemStatus) -> str:
+        """Render per-transport gather economics (gather-transport S21/S27).
+
+        Reads only the declared keys (design D8), emits one segment per transport
+        that carried traffic, and reports the deferral/drop/fallback counters
+        separately so "the remote refused us" is distinguishable from "we refused
+        ourselves" (S25).  Never raises and never prints a credential.
+        """
+        metrics = getattr(status.pipeline, "gather_transport_metrics", None)
+        if not metrics:
+            return ""
+        metric_int = StatusDisplayEngine._metric_int
+
+        segments = []
+        for kind in ("raw", "html", "rest"):
+            requests = metric_int(metrics.get(f"requests_{kind}"))
+            delivered = metric_int(metrics.get(f"bytes_{kind}"))
+            samples = metric_int(metrics.get(f"latency_samples_{kind}"))
+            if requests <= 0 and delivered <= 0 and samples <= 0:
+                continue
+            segment = f"{kind} req={requests} bytes={delivered}"
+            if samples > 0:
+                p50 = metric_int(metrics.get(f"latency_p50_ms_{kind}"))
+                p99 = metric_int(metrics.get(f"latency_p99_ms_{kind}"))
+                segment += f" p50={p50}ms p99={p99}ms"
+            segments.append(segment)
+
+        deferred = (
+            f"defer[rl={metric_int(metrics.get('deferred_rate_limit'))}, "
+            f"budget={metric_int(metrics.get('deferred_local_budget'))}, "
+            f"sec={metric_int(metrics.get('deferred_secondary'))}, "
+            f"cred={metric_int(metrics.get('deferred_credentials'))}]"
+        )
+        dropped = (
+            f"drop[auth={metric_int(metrics.get('dropped_auth'))}, "
+            f"404={metric_int(metrics.get('dropped_not_found'))}]"
+        )
+        head = metric_int(metrics.get("head_fallback"))
+        truncated = metric_int(metrics.get("truncated"))
+        badlinks = metric_int(metrics.get("unparseable_link"))
+        if not segments and not any((head, truncated, badlinks)):
+            # No traffic and no refusal/fallback signal: render nothing rather
+            # than a zero-filled placeholder (RO-S2 spirit).
+            if not any(
+                metric_int(metrics.get(key))
+                for key in (
+                    "deferred_rate_limit",
+                    "deferred_local_budget",
+                    "deferred_secondary",
+                    "deferred_credentials",
+                    "dropped_auth",
+                    "dropped_not_found",
+                )
+            ):
+                return ""
+
+        body = (" ".join(segments) + " ") if segments else ""
+        tail = f"head={head} trunc={truncated} badlink={badlinks}"
+        return f"Gather: {body}{deferred} {dropped} {tail}"
+
+    @staticmethod
+    def _format_aggregation_metrics_line(status: SystemStatus) -> str:
+        """Render the shared search-response aggregation counters (RO-S1)."""
+        metrics = getattr(status.pipeline, "aggregation_metrics", None)
+        if not metrics:
+            return ""
+        metric_int = StatusDisplayEngine._metric_int
+        return (
+            f"Aggregation: hits={metric_int(metrics.get('hits'))} "
+            f"misses={metric_int(metrics.get('misses'))} "
+            f"joins={metric_int(metrics.get('joins'))} "
+            f"entries={metric_int(metrics.get('entries'))} "
+            f"bytes={metric_int(metrics.get('bytes'))} "
+            f"pairs={metric_int(metrics.get('aggregatable_pairs'))}"
+        )
+
+    @staticmethod
+    def _format_refine_metrics_line(status: SystemStatus) -> str:
+        """Render the refine governance counters and coverage estimate (RO-S1)."""
+        metrics = getattr(status.pipeline, "refine_metrics", None)
+        if not metrics:
+            return ""
+        metric_int = StatusDisplayEngine._metric_int
+        metric_rate = StatusDisplayEngine._metric_rate
+        mode = str(metrics.get("mode", "") or "")
+        return (
+            f"Refine: mode={mode} "
+            f"gen={metric_int(metrics.get('children_generated'))} "
+            f"adm={metric_int(metrics.get('children_admitted'))} "
+            f"refused[depth={metric_int(metrics.get('refused_depth'))}, "
+            f"budget={metric_int(metrics.get('refused_budget'))}] "
+            f"trunc={metric_int(metrics.get('truncated_to_cap'))} "
+            f"cov[min={metric_rate(metrics.get('coverage_estimate_min')):.4f}, "
+            f"avg={metric_rate(metrics.get('coverage_estimate_avg')):.4f}]"
+        )
+
+    @staticmethod
+    def _format_credential_metrics_line(status: SystemStatus) -> str:
+        """Render the credential-liveness counters (RO-S4, no exemptions).
+
+        The R5.2 shutdown INFO line (``Credential liveness: …``) is left
+        untouched; this is the periodic/status rendering of the same surface.
+        """
+        metrics = getattr(status.pipeline, "credential_metrics", None)
+        if not metrics:
+            return ""
+        metric_int = StatusDisplayEngine._metric_int
+        return (
+            f"Credential: exhausted={metric_int(metrics.get('exhausted_episodes'))} "
+            f"deferred={metric_int(metrics.get('deferred_by_credentials'))} "
+            f"secondary={metric_int(metrics.get('secondary_limit_incidents'))} "
+            f"early={metric_int(metrics.get('early_releases'))} "
+            f"emergency={metric_int(metrics.get('emergency_trips'))} "
+            f"blocking={metric_int(metrics.get('blocking_mode_active'))}"
+        )
 
     def _format_provider_section(self, status: SystemStatus) -> List[str]:
         """Format provider section with table-like layout"""

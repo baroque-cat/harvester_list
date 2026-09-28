@@ -17,7 +17,6 @@ from constant.search import (
     WEB_MAX_PAGES,
     WEB_RESULTS_PER_PAGE,
 )
-from constant.system import SERVICE_TYPE_GITHUB_API, SERVICE_TYPE_GITHUB_WEB
 from core.enums import ErrorReason, PipelineStage, ResultType
 from core.exceptions import RateLimitDeferral, TransientFetchError
 from core.models import (
@@ -332,22 +331,6 @@ class SearchStage(BasePipelineStage):
                     f"[{self.name}] GitHub credential cooling during page search, "
                     f"retry with another credential, wait: {e.wait:.1f}s"
                 )
-
-    def _apply_rate_limit(self, use_api: bool) -> bool:
-        """Apply rate limiting for GitHub requests"""
-        service_type = SERVICE_TYPE_GITHUB_API if use_api else SERVICE_TYPE_GITHUB_WEB
-        if not self.resources.limiter.acquire(service_type):
-            wait_time = self.resources.limiter.wait_time(service_type)
-            if wait_time > 0:
-                time.sleep(wait_time)
-                if not self.resources.limiter.acquire(service_type):
-                    bucket = self.resources.limiter._get_bucket(service_type)
-                    max_value = bucket.burst if bucket else "unknown"
-                    logger.info(
-                        f'[{self.name}] rate limit exceeded for Github {"Rest API" if use_api else "Web"}, max: {max_value}'
-                    )
-                    return False
-        return True
 
     def _handle_first_page_results(
         self, task: SearchTask, results: List[str], total: int, output: StageOutput

@@ -237,6 +237,11 @@ def test_s21_transport_economics_are_observable(monkeypatch):
     # EXACT key set, not a subset: S21 publishes a stable per-transport surface,
     # so a missing OR an extra/undeclared counter is a contract break.  A subset
     # check would silently tolerate schema drift mid-run.
+    # Widened deliberately by fix-throttle-deferral-and-metrics: the canonical
+    # tuple gained `deferred_credentials` (its increment existed but the key was
+    # never declared, so it was silently dropped) and `deferred_local_budget`,
+    # and the derived latency keys are now published too.  The exact-set guard is
+    # preserved, not weakened: every one of them is a declared member now.
     expected_keys = {
         "requests_raw",
         "bytes_raw",
@@ -246,11 +251,22 @@ def test_s21_transport_economics_are_observable(monkeypatch):
         "bytes_rest",
         "deferred_rate_limit",
         "deferred_secondary",
+        "deferred_credentials",
+        "deferred_local_budget",
         "dropped_auth",
         "dropped_not_found",
         "head_fallback",
         "unparseable_link",
         "truncated",
+        "latency_samples_raw",
+        "latency_p50_ms_raw",
+        "latency_p99_ms_raw",
+        "latency_samples_html",
+        "latency_p50_ms_html",
+        "latency_p99_ms_html",
+        "latency_samples_rest",
+        "latency_p50_ms_rest",
+        "latency_p99_ms_rest",
     }
     assert set(stats) == expected_keys, f"observability key set drifted: {set(stats) ^ expected_keys}"
     for key in expected_keys:

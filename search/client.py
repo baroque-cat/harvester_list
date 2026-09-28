@@ -336,6 +336,31 @@ class GitHubClient:
 
         return False
 
+    def _local_budget_wait_s(self, service: str, credential: Optional[str] = None) -> float:
+        """Re-read the basket's own refill time after a lost acquisition (design D3).
+
+        ``_limit`` returns False only after the scheduled wait was slept and the
+        token went to a competing worker, so a fresh ``wait_time()`` is the
+        honest wait until our own budget can serve this request.  Bucket naming
+        is private to this class (``_bucket_name``/``_ensure_bucket``), hence the
+        helper rather than duplicating that rule at the call site.  Never raises:
+        a limiter that cannot answer degrades to ``0.0``.
+        """
+        if not self.limiter or not service:
+            return 0.0
+        try:
+            bucket_name = self._ensure_bucket(service, credential)
+            wait = float(self.limiter.wait_time(bucket_name))
+            bucket = self.limiter._get_bucket(bucket_name)
+            rate = float(getattr(bucket, "rate", 0.0)) if bucket is not None else 0.0
+            # The refill time for one token is the floor: a suppression is by
+            # definition "no token available now", so a basket that reports zero
+            # (a lost race, or a stub) is answered with its own refill rate.
+            refill = (1.0 / rate) if rate > 0 else 0.0
+            return max(0.0, wait, refill)
+        except Exception:
+            return 0.0
+
     def _report(self, service: str, success: bool, credential: Optional[str] = None) -> None:
         """Report request result for adaptive adjustment"""
         if self.limiter and service:
@@ -945,6 +970,8 @@ _GATHER_TRANSPORT_STAT_KEYS: Tuple[str, ...] = (
     "bytes_rest",
     "deferred_rate_limit",
     "deferred_secondary",
+    "deferred_credentials",
+    "deferred_local_budget",
     "dropped_auth",
     "dropped_not_found",
     "head_fallback",
@@ -954,21 +981,127 @@ _GATHER_TRANSPORT_STAT_KEYS: Tuple[str, ...] = (
 
 _GATHER_TRANSPORT_STATS: Dict[str, int] = {key: 0 for key in _GATHER_TRANSPORT_STAT_KEYS}
 
+# ---------------------------------------------------------------------------
+# Latency histogram (gather-transport S27/S28/S29, run-observability RO-S9/S10)
+#
+# A fixed band structure per transport kind, so memory held by the summary does
+# NOT grow with the number of requests (design D6).  Each entry is the UPPER
+# edge of its band; the first band's lower bound is 0.  The edges are chosen so
+# acceptance row A2 is decidable: they separate the captured raw band
+# (250/300/350) and separate 750 ms from 1000 ms (the ``p99 < 1 s`` criterion).
+# The final edge is open (every value above the last finite edge lands there);
+# it is reported as a large finite sentinel so a published percentile is always
+# an integer and never understates the measured one.
+# ---------------------------------------------------------------------------
+_LATENCY_BAND_EDGES_MS: Tuple[float, ...] = (
+    25,
+    50,
+    75,
+    100,
+    150,
+    200,
+    250,
+    300,
+    350,
+    400,
+    500,
+    750,
+    1000,
+    1500,
+    2000,
+    3000,
+    5000,
+    10000,
+    float("inf"),
+)
+
+# Conservative integer reported when a percentile falls in the open band (never
+# reachable in practice: the fetch timeout bounds a real sample far below it).
+# Chosen above the last finite edge so a published percentile never understates
+# the measured one.
+_LATENCY_OPEN_BAND_REPORT_MS = 60000
+
+_GATHER_LATENCY_BANDS: Dict[str, List[int]] = {
+    kind: [0] * len(_LATENCY_BAND_EDGES_MS) for kind in ("raw", "html", "rest")
+}
+
+
+def _gather_latency_observe(kind: str, ms: float) -> None:
+    """Record one completed fetch's latency into its fixed band (S28).
+
+    Malformed input is ignored (fail-open); the published key set and band
+    structure can never change with the number of observations.
+    """
+    bands = _GATHER_LATENCY_BANDS.get(kind)
+    if bands is None:
+        return
+    try:
+        value = float(ms)
+    except (TypeError, ValueError):
+        return
+    if value != value:  # NaN
+        return
+    if value < 0:
+        value = 0.0
+    for index, edge in enumerate(_LATENCY_BAND_EDGES_MS):
+        if value <= edge:
+            bands[index] += 1
+            return
+    bands[-1] += 1
+
+
+def _gather_latency_percentile(bands: List[int], percentile: float) -> int:
+    """Upper edge of the band containing the target rank, or 0 with no samples.
+
+    Nearest-rank definition; reporting the band's UPPER edge is conservative, so
+    a published percentile never understates the measured one (RO-S9).
+    """
+    total = sum(bands)
+    if total <= 0:
+        return 0
+    rank = int(-(-percentile * total // 1))  # ceil, without floats
+    rank = max(1, min(total, rank))
+    cumulative = 0
+    for index, count in enumerate(bands):
+        cumulative += count
+        if cumulative >= rank:
+            edge = _LATENCY_BAND_EDGES_MS[index]
+            if edge == float("inf"):
+                return _LATENCY_OPEN_BAND_REPORT_MS
+            return int(edge)
+    return 0
+
 
 def reset_gather_transport_stats() -> None:
     """Reset the gather-transport observability counters (tests / fresh runs).
 
     Driven by the canonical key tuple rather than the live dict, and mutates in
     place so the surface can neither grow nor shrink across resets and no
-    caller can be left holding a stale mapping.
+    caller can be left holding a stale mapping.  The latency histogram is zeroed
+    in place too, so a fresh run cannot inherit the previous run's distribution
+    (RO-S10).
     """
     for key in _GATHER_TRANSPORT_STAT_KEYS:
         _GATHER_TRANSPORT_STATS[key] = 0
+    for bands in _GATHER_LATENCY_BANDS.values():
+        for index in range(len(bands)):
+            bands[index] = 0
 
 
 def get_gather_transport_stats() -> Dict[str, int]:
-    """Expose per-transport gather counters as a flat ``Dict[str, int]``."""
-    return dict(_GATHER_TRANSPORT_STATS)
+    """Expose per-transport gather counters as a flat ``Dict[str, int]``.
+
+    The raw counters are copied verbatim; derived latency figures are added per
+    transport (sample count plus 50th/99th percentile upper edges in ms).  The
+    derived keys are always present (zeros before any sample), so the published
+    surface has a stable schema (S21/S27/S28).
+    """
+    stats: Dict[str, int] = dict(_GATHER_TRANSPORT_STATS)
+    for kind, bands in _GATHER_LATENCY_BANDS.items():
+        stats[f"latency_samples_{kind}"] = sum(bands)
+        stats[f"latency_p50_ms_{kind}"] = _gather_latency_percentile(bands, 0.50)
+        stats[f"latency_p99_ms_{kind}"] = _gather_latency_percentile(bands, 0.99)
+    return stats
 
 
 def _gather_stat_inc(key: str, amount: int = 1) -> None:
@@ -1007,6 +1140,32 @@ def _configured_gather_transport() -> str:
         return _DEFAULT_GATHER_TRANSPORT
     normalized = str(configured).strip().lower() if configured is not None else ""
     return normalized or _DEFAULT_GATHER_TRANSPORT
+
+
+# Built-in flag value used when the operator configuration is unreachable.  Kept
+# identical to ``GatherConfig.defer_local_suppression``'s default so a config-less
+# caller and a fully configured one agree (design D5/D13).
+_DEFAULT_DEFER_LOCAL_SUPPRESSION = True
+
+
+def _configured_defer_local_suppression() -> bool:
+    """Resolve the operator-configured local-budget deferral flag.
+
+    Mirrors :func:`_configured_gather_transport` exactly: the ``config`` import is
+    deferred and fully guarded so this module keeps no hard top-level dependency
+    on ``config`` (no import cycle), and a caller that never loaded ``config.yaml``
+    degrades to the built-in default rather than raising ``RuntimeError``.
+    ``collect()`` passes the resolved value through so an explicit caller and a
+    config-less caller agree and the operator's rollback flag cannot be bypassed
+    by an embedded caller (design D13).
+    """
+    try:
+        from config import get_config
+
+        configured = getattr(get_config().gather, "defer_local_suppression", _DEFAULT_DEFER_LOCAL_SUPPRESSION)
+    except Exception:
+        return _DEFAULT_DEFER_LOCAL_SUPPRESSION
+    return bool(configured)
 
 
 def _split_blob_ref_path(parts: List[str]):
@@ -1267,6 +1426,7 @@ def fetch_gather_content(
     max_refusal_wait_s: float = 60.0,
     retries: int = 3,
     timeout: float = 10,
+    defer_local_suppression: Optional[bool] = None,
 ) -> str:
     """Fetch gathered file content through the configured transport (design D6).
 
@@ -1275,10 +1435,22 @@ def fetch_gather_content(
     finite wait defers, an actor-scoped abuse limit defers with a stage pause,
     and a genuine auth failure or missing resource drops once.  The retained
     prefix of an oversized payload is returned rather than discarded (D8).
+
+    A fetch withheld because the system's **own** budget has no token is a
+    deferral too (``RateLimitDeferral`` with the basket's own refill time and a
+    stage pause), never a task fault, so nothing is reported to the adaptive
+    budget and no attempt is burned (design D1/D4).  ``defer_local_suppression``
+    overrides that classification; ``None`` resolves the operator flag through
+    :func:`_configured_defer_local_suppression`, and ``False`` restores the
+    legacy failure-empty byte-for-byte (design D5/D13).
     """
     kind = str(transport).strip().lower()
     if kind not in ("html", "raw", "rest"):
         kind = "raw"
+
+    if defer_local_suppression is None:
+        defer_local_suppression = _configured_defer_local_suppression()
+    defer_local = bool(defer_local_suppression)
 
     target = gather_target_url(url, kind)
     if target is None:
@@ -1318,11 +1490,37 @@ def fetch_gather_content(
         if client is not None:
             service = client._service(target)
             if not client._limit(service, credential):
+                if defer_local:
+                    # Our own budget is empty: this is a deferral, not a fault of
+                    # the task.  The wait is the basket's own refill time, clamped
+                    # by the configured refusal cap, and ``stage_pause`` stops the
+                    # sibling workers claiming into the same empty budget
+                    # (design D1/D2/D3).  Nothing is reported to the adaptive
+                    # budget: no request was issued, so there is no remote outcome
+                    # to learn from (design D4).
+                    wait = client._local_budget_wait_s(service, credential)
+                    if wait <= 0.0:
+                        wait = refusal_cap
+                    wait = min(wait, refusal_cap)
+                    _gather_stat_inc("deferred_local_budget")
+                    logger.warning(
+                        f"[gather-transport] own budget withheld fetch; deferring "
+                        f"{wait:.2f}s with stage pause, url: {target}"
+                    )
+                    raise RateLimitDeferral(
+                        f"gather fetch withheld by local limiter for url: {target}",
+                        wait_s=wait,
+                        stage_pause=True,
+                    )
+                # Legacy rollback path (design D5/S26), byte-for-byte: still a
+                # failure-empty AND still reported as a failure to the adaptive
+                # budget.  A half-rollback would keep the destructive half.
                 client._report(service, False, credential)
                 raise TransientFetchError(f"gather fetch suppressed by local limiter for url: {target}")
 
         _gather_stat_inc(f"requests_{kind}")
 
+        started = time.perf_counter()
         try:
             response = request("GET", target, headers=headers, timeout=timeout)
         except requests.exceptions.HTTPError as e:
@@ -1392,6 +1590,11 @@ def fetch_gather_content(
             if client is not None:
                 client._report(service, False, credential)
             raise TransientFetchError(f"gather fetch read failed for url: {target}: {e}") from e
+
+        # Timed span: request issuance through payload read.  A withheld fetch
+        # never reaches here, so it is never observed as a slow request (S29);
+        # only completed network fetches feed the distribution (S27).
+        _gather_latency_observe(kind, (time.perf_counter() - started) * 1000.0)
 
         if client is not None:
             client._report(service, True, credential)
@@ -2004,6 +2207,7 @@ def collect(
                 url=url,
                 transport=fetch_transport,
                 retries=retries,
+                defer_local_suppression=_configured_defer_local_suppression(),
             )
         except (TransientFetchError, RateLimitDeferral):
             raise

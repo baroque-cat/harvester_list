@@ -1641,6 +1641,7 @@ gather:
   transport: "raw"                # html | raw | rest
   max_payload_bytes: 8388608      # 8 MiB streaming cap (raw/rest)
   max_refusal_wait_s: 60.0        # bounded refusal sleep; must be < queue.visibility_timeout_s
+  defer_local_suppression: true   # true (default) = own-budget withholding is a deferral; false = legacy failure
 ```
 
 > **Do not confuse the two `gather` keys.** The per-provider stage *enable* flag
@@ -1688,6 +1689,29 @@ ERROR and the `deferred_secondary` counter; a genuine auth failure or 404 →
 **loud counted drop**; timeout/5xx → the existing **bounded requeue**. A 403
 carrying rate-limit markers is a deferral, not an authentication failure.
 
+**Own-budget withholding is a third outcome: a deferral, not a fault.** When a
+gather fetch cannot obtain a token from the system's *own* `github_raw` basket,
+no request was ever issued — so it is neither a remote refusal nor a failure of
+the task. With `defer_local_suppression: true` (the default) the fetch raises
+the typed `RateLimitDeferral` with a wait derived from the basket's own refill
+time (`1 / base_rate`, clamped by `max_refusal_wait_s` — at most 0.5 s at
+`base_rate 2.0`) and `stage_pause=True`, so the whole stage stops claiming while
+the shared budget refills instead of all workers claiming and starving in
+lockstep. The task keeps its `attempts`, `created_at` and dedup identity and is
+counted in the new `deferred_local_budget` counter; nothing is written to the
+registry. Crucially, a withheld request is **never reported to the adaptive
+budget**: `TokenBucket.adjust_rate` models remote tolerance, and feeding it an
+event in which no remote was contacted halves the very rate that produced the
+withholding (a positive-feedback collapse to `0.1 × base`). Only outcomes of
+requests that were actually issued are reported.
+
+**Rollback for the withholding classification.** `gather.defer_local_suppression:
+false` restores the pre-change behavior byte-for-byte: the withheld fetch raises
+`TransientFetchError` (failure-empty), the task burns an attempt and enters the
+bounded-requeue path, **and** the suppression is reported to the adaptive budget
+as a failure — the whole legacy loop, not half of it. A non-boolean value is
+rejected loudly by the loader and validator; `false` is otherwise silent.
+
 **Rollback is a flag flip — the only mechanism.** Set `gather.transport: html`
 to reproduce the pre-change anonymous rendered-page fetch byte-for-byte; set it
 back to `raw` to resume. No code removal and **no data migration** are needed in
@@ -1709,9 +1733,33 @@ gate, never by the retry budget.
 **Observability.** `get_gather_transport_stats()` (also on the `PipelineStatus`
 surface as `gather_transport_metrics`) exposes flat integer counters:
 `requests_{raw,html,rest}`, `bytes_{raw,html,rest}`, `deferred_rate_limit`,
-`deferred_secondary`, `dropped_auth`, `dropped_not_found`, `head_fallback`,
-`unparseable_link`, `truncated`. An oversized payload is truncated at
-`max_payload_bytes`, counted, and its retained prefix is still searched.
+`deferred_secondary`, `deferred_credentials`, `deferred_local_budget`,
+`dropped_auth`, `dropped_not_found`, `head_fallback`, `unparseable_link`,
+`truncated`. Per transport it also publishes a bounded-memory latency summary:
+`latency_samples_{kind}`, `latency_p50_ms_{kind}` and `latency_p99_ms_{kind}`,
+accumulated into a fixed set of millisecond bands (edges
+`25,50,75,100,150,200,250,300,350,400,500,750,1000,1500,2000,3000,5000,10000`)
+so memory does not grow with the number of requests. A published percentile is
+the **upper edge of the band containing the rank**, i.e. conservative: it never
+understates the measured latency. A withheld fetch is never timed (its sample
+count does not advance), so the percentiles describe real network fetches only.
+An oversized payload is truncated at `max_payload_bytes`, counted, and its
+retained prefix is still searched.
+
+The three collected-but-previously-unrendered surfaces are operators now:
+detailed status output contains one compact line each, rendered only when the
+surface is non-empty and read through an explicit key allowlist (so an upstream
+key cannot widen output or leak a value):
+
+```
+Gather: raw req=12 bytes=3456 p50=250ms p99=750ms defer[rl=1, budget=3, sec=0, cred=0] drop[auth=0, 404=2] head=1 trunc=0 badlink=0
+Aggregation: hits=5 misses=2 joins=1 entries=6 bytes=1234 pairs=4
+Refine: mode=on gen=144 adm=128 refused[depth=0, budget=0] trunc=16 cov[min=0.0027, avg=0.0746]
+```
+
+Read **A1** (mean bytes per file) as `bytes_raw / req` on the `Gather:` line and
+**A2** as `p50=`/`p99=` (upper band edges). The same status is rendered once at
+shutdown; the R5.2 `Credential liveness: …` INFO line is unchanged.
 
 **Unchanged:** authenticated search and `repo_meta` behavior, wire-query
 construction, registry schema, the existing bounded-requeue and loud-drop

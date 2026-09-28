@@ -635,11 +635,16 @@ class GatherConfig:
     endpoint.  ``max_payload_bytes`` bounds a streamed plain-content read
     (design D8); ``max_refusal_wait_s`` bounds any refusal sleep so it can
     never exceed the durable queue visibility window (design D5).
+    ``defer_local_suppression`` folds a withholding by the system's own budget
+    into the DEFER seam (default ``True``, the fixed behavior); ``False`` is the
+    rollback position that restores the legacy ``TransientFetchError`` failure
+    classification (design D5).
     """
 
     transport: str = "raw"
     max_payload_bytes: int = 8 * 1024 * 1024
     max_refusal_wait_s: float = 60.0
+    defer_local_suppression: bool = True
 
     def __post_init__(self):
         # Mirrors ConfigValidator._validate_gather_config on purpose: this
@@ -656,6 +661,14 @@ class GatherConfig:
         self.max_refusal_wait_s = float(self.max_refusal_wait_s)
         if self.max_refusal_wait_s <= 0:
             raise ValueError("gather.max_refusal_wait_s must be positive")
+
+        # A non-bool must raise, not coerce: the flag selects a behavioral
+        # contract (deferral vs legacy failure-empty), so a truthy string is a
+        # configuration error the operator must see (design D5).
+        if not isinstance(self.defer_local_suppression, bool):
+            raise ValueError(
+                f"gather.defer_local_suppression must be a boolean (got: {self.defer_local_suppression!r})"
+            )
 
 
 @dataclass

@@ -373,6 +373,17 @@ gather:
   # claim renewal, so a longer sleep would let the row be re-delivered and run
   # twice. The validator rejects a contradictory pair loudly.
   max_refusal_wait_s: 60.0
+  # How a fetch withheld by our OWN github_raw token basket is classified.
+  #   true  (default): a deferral - RateLimitDeferral with the basket's refill
+  #          time and a stage pause; attempts/dedup identity preserved, counted in
+  #          deferred_local_budget, and NOT reported to the adaptive budget (a
+  #          withheld request has no remote outcome, so reporting it would decay
+  #          the budget that produced the withholding).
+  #   false: the legacy classification byte-for-byte - TransientFetchError
+  #          (failure-empty), an attempt burned via the bounded-requeue path, AND
+  #          the failure reported to the adaptive budget. Config-flip rollback;
+  #          no code change or data migration.
+  defer_local_suppression: true
 
 # Credential liveness (fix-credential-liveness)
 # Bounds every wait for a pooled GitHub credential and routes exhaustion to the

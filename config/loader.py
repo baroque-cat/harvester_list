@@ -517,6 +517,9 @@ class ConfigLoader:
             transport=data.get("transport", "raw"),
             max_payload_bytes=data.get("max_payload_bytes", 8 * 1024 * 1024),
             max_refusal_wait_s=data.get("max_refusal_wait_s", 60.0),
+            # Bool only: ``__post_init__``/validator reject a truthy string rather
+            # than coercing it (design D5).
+            defer_local_suppression=data.get("defer_local_suppression", True),
         )
 
     def _parse_credential_liveness_config(self, data: Dict[str, Any]) -> CredentialLivenessConfig:

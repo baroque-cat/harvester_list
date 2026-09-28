@@ -1,50 +1,4 @@
-# gather-transport Specification
-
-## Purpose
-
-Governs how the gather stage obtains file content for key extraction: a config-selected transport, correct derivation of the transport-specific address from an already-discovered blob link, rate-limit isolation so gathering cannot starve code search, and refusal handling whose every outcome is bounded, classified and counted rather than silently abandoned.
-
-## Requirements
-
-### Requirement: Transport selection with loud configuration validation
-
-The system SHALL support a `gather` configuration section selecting the content transport as one of `html`, `raw` or `rest`, together with positive numeric bounds for payload size and refusal waiting. With no `gather` section at all the transport SHALL resolve to `raw`. Selecting `html` SHALL reproduce the pre-change fetching behavior, and switching transports SHALL require no data migration in either direction. An unknown transport name or a non-positive numeric field SHALL fail configuration validation loudly at load time, naming the offending value.
-
-#### Scenario: S1 absent section resolves to the measured-cheapest transport
-- **WHEN** a configuration without any `gather` section is loaded
-- **THEN** the resolved transport is `raw`, and a configuration that explicitly selects `html` fetches gathered content through the same anonymous rendered-page path used before this capability existed
-
-#### Scenario: S2 unknown transport name fails validation loudly
-- **WHEN** a configuration sets the gather transport to a value other than `html`, `raw` or `rest`
-- **THEN** configuration loading or validation raises an error naming the offending value and the pipeline is not constructed
-
-#### Scenario: S3 non-positive numeric gather fields fail validation loudly
-- **WHEN** a configuration sets a gather payload-size bound or a gather refusal-wait bound to zero or a negative number
-- **THEN** configuration loading or validation raises an error identifying the field
-
-### Requirement: Transport address derived opportunistically from the discovered link
-
-Gathered content SHALL be addressed by transforming the link produced at discovery time, and the transformation SHALL be opportunistic: when the link exposes a usable immutable revision the system SHALL use it, and when it does not the system SHALL fall back to a defined safe default, count the fallback and log it — never guessing silently and never raising into a worker loop. The task payload persisted in queues and snapshots SHALL continue to carry the discovered link unchanged, so a transport switch remains valid for already-persisted work. A content-hash field that identifies a file blob rather than a revision SHALL NOT be used as an address component.
-
-#### Scenario: S4 immutable revision is used verbatim
-- **WHEN** a discovered link carries a 40-character lowercase hexadecimal revision and a repository path
-- **THEN** the derived address targets that exact revision and path on the plain-content host, and no fallback counter increments
-
-#### Scenario: S5 unusable revision falls back loudly
-- **WHEN** a discovered link's revision segment is not a 40-character hexadecimal string
-- **THEN** the derived address targets the repository's default head instead, a dedicated fallback counter increments, and a warning names the affected link
-
-#### Scenario: S6 blob content hash is never mistaken for a revision
-- **WHEN** a discovery payload carries both a blob content hash and a separate revision reference for the same file
-- **THEN** the derived address uses the revision reference, and using the blob content hash in its place is demonstrably rejected as an unresolvable address
-
-#### Scenario: S7 unparseable link degrades safely
-- **WHEN** the value to be gathered is not a recognizable repository blob link
-- **THEN** no exception reaches the worker loop, the outcome is counted, and the task follows the existing failure accounting rather than hanging or crashing the stage
-
-#### Scenario: S8 persisted tasks survive a transport switch
-- **WHEN** tasks enqueued under one transport are recovered after the configured transport is changed and the process restarted
-- **THEN** the recovered tasks are processed normally under the new transport with no rewrite of their stored payload
+## MODIFIED Requirements
 
 ### Requirement: Gather traffic is throttled under its own budget
 
@@ -109,18 +63,6 @@ A fetch withheld by the system's **own** budget before any request is sent belon
 #### Scenario: S26 legacy classification is a configuration flip
 - **WHEN** an operator disables local-budget deferral in configuration and restarts
 - **THEN** a withheld gather fetch is classified as a retryable failure-empty exactly as before this capability existed, with no code change and no data migration
-
-### Requirement: Refusal waits respect the durable queue visibility window
-
-No gather worker SHALL remain asleep inside a claimed durable-queue row longer than that queue's visibility timeout, because an expired claim is re-delivered to another worker. A configuration whose refusal-wait cap is not strictly below the queue visibility timeout SHALL fail validation loudly, naming both values.
-
-#### Scenario: S17 contradictory wait configuration is rejected
-- **WHEN** the configured gather refusal-wait cap is greater than or equal to the configured queue visibility timeout
-- **THEN** configuration validation fails with an error naming both values, and the pipeline is not constructed
-
-#### Scenario: S18 a deferred task is never executed twice
-- **WHEN** a gather task is deferred repeatedly under a durable queue backend while other workers continue consuming
-- **THEN** the task is claimed by exactly one worker at a time, no claim expires while its worker is sleeping, and acknowledged work shows no duplicate execution
 
 ### Requirement: Payload handling is economical, bounded and observable
 
