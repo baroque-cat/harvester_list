@@ -66,6 +66,43 @@ except Exception:
     pass
 
 
+# Set once ``shutdown_logging`` has flushed the sinks and is about to close
+# them.  Every handler carries a filter that drops records once this is true, so
+# a surviving daemon worker may still call the logger without writing to a
+# stream the interpreter is finalizing (ROI-S7/D6).
+_LOGGING_SHUTDOWN = False
+
+
+def _redaction_failure_marker(record: logging.LogRecord) -> str:
+    """Fail-closed replacement for a rendered line whose redaction raised.
+
+    Names the record's level, origin logger and source location so the degraded
+    line remains diagnosable, and omits the payload entirely so a broken
+    redactor cannot publish the very secret it exists to hide (D2).  This
+    deliberately does *not* log: it runs inside a formatter, where logging would
+    risk recursion.
+    """
+    return (
+        f"[LOG_REDACTION_ERROR level={record.levelname} logger={record.name} "
+        f"location={record.filename}:{record.lineno}]"
+    )
+
+
+def _redact_line(text: str, record: logging.LogRecord) -> str:
+    """Redact credential material from a formatter's final rendered line (D1).
+
+    Applied to the rendered line rather than to ``record.msg`` so material the
+    renderer adds — traceback text above all — is covered on the same terms.
+    Fails closed via the marker above.  Must be the last step of every
+    renderer's ``format``; ``tests/test_roi_redaction.py`` pins completeness
+    structurally.
+    """
+    try:
+        return redact_api_keys_in_text(text)
+    except Exception:
+        return _redaction_failure_marker(record)
+
+
 class ColoredFormatter(logging.Formatter):
     """Custom log formatter with color support and file location"""
 
@@ -98,7 +135,7 @@ class ColoredFormatter(logging.Formatter):
 
         # Create fixed-width string with filename and line number
         record_copy.fileloc = f"[{record_copy.filename}:{record_copy.lineno}]"
-        return super().format(record_copy)
+        return _redact_line(super().format(record_copy), record)
 
 
 class APIKeyRedactionFormatter(logging.Formatter):
@@ -110,18 +147,12 @@ class APIKeyRedactionFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         # Format the record normally first
         formatted_msg = super().format(record)
-        # Redact API keys in the formatted message
-        return self._redact_api_keys_in_message(formatted_msg)
+        # Redact API keys in the rendered line (D1/D3)
+        return self._redact_api_keys_in_message(formatted_msg, record)
 
-    def _redact_api_keys_in_message(self, message: str) -> str:
-        """Replace API keys in log message with redacted versions"""
-        try:
-            return redact_api_keys_in_text(message)
-        except Exception as e:
-            # Log the error but do not expose the original message
-            logger = logging.getLogger(__name__)
-            logger.error(f"Error redacting API keys in log: {e}")
-            return "[LOG_REDACTION_ERROR]"
+    def _redact_api_keys_in_message(self, message: str, record: logging.LogRecord) -> str:
+        """Replace API keys in the rendered line; fail closed (D2)."""
+        return _redact_line(message, record)
 
 
 # JSON formatter for structured file logs (optional)
@@ -142,10 +173,12 @@ class JSONFormatter(logging.Formatter):
             for key, value in record.__dict__.items():
                 if key not in payload and not key.startswith("_"):
                     payload[key] = value
-            return json.dumps(payload, ensure_ascii=False)
+            return _redact_line(json.dumps(payload, ensure_ascii=False), record)
         except Exception:
-            # Fallback to plain text if JSON formatting fails
-            return f"{record.levelname} {record.filename}:{record.lineno} {record.getMessage()}"
+            # Fallback to plain text if JSON formatting fails.  The fallback is
+            # a sink in its own right, so it is redacted on the same terms.
+            fallback = f"{record.levelname} {record.filename}:{record.lineno} {record.getMessage()}"
+            return _redact_line(fallback, record)
 
 
 def _is_tty() -> bool:
@@ -154,40 +187,6 @@ def _is_tty() -> bool:
         return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
     except Exception:
         return False
-
-
-class RedactionFilter(logging.Filter):
-    """Filter that redacts API keys in log records before formatting."""
-
-    # Cache standard LogRecord attributes to avoid repeated computation
-    _standard_attrs = None
-
-    def __init__(self) -> None:
-        super().__init__()
-        # Initialize standard attributes cache if not already done
-        if RedactionFilter._standard_attrs is None:
-            baseline_record = logging.LogRecord(name="", level=0, pathname="", lineno=0, msg="", args=(), exc_info=None)
-            RedactionFilter._standard_attrs = set(baseline_record.__dict__.keys())
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            # Redact in message
-            msg = record.getMessage()
-            msg = redact_api_keys_in_text(msg)
-            # We cannot assign to getMessage(); update 'msg' only if it is a string
-            if isinstance(record.msg, str):
-                record.msg = msg
-
-            # Redact any extra fields that might contain sensitive data
-            # Use cached standard attributes to identify custom fields
-            for key, value in record.__dict__.items():
-                if not key.startswith("_") and isinstance(value, str) and key not in self._standard_attrs:
-                    redacted = redact_api_keys_in_text(value)
-                    setattr(record, key, redacted)
-            return True
-        except Exception:
-            # In case of any failure, do not block logging
-            return True
 
 
 # Log format with file location and fixed width
@@ -220,7 +219,7 @@ class FileFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         # Create file location string
         record.fileloc = f"[{record.filename}:{record.lineno}]"
-        return super().format(record)
+        return _redact_line(super().format(record), record)
 
 
 class SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
@@ -389,16 +388,16 @@ class FileFormatterWithRedaction(logging.Formatter):
         record.fileloc = f"[{record.filename}:{record.lineno}]"
         # Format the record normally first
         formatted_msg = super().format(record)
-        # Then apply API key redaction
-        return self._redact_api_keys_in_message(formatted_msg)
+        # Then apply API key redaction to the rendered line
+        return self._redact_api_keys_in_message(formatted_msg, record)
 
-    def _redact_api_keys_in_message(self, message: str) -> str:
-        """Replace API keys in log message with redacted versions"""
-        try:
-            return redact_api_keys_in_text(message)
-        except Exception:
-            # Return original message if redaction fails
-            return message
+    def _redact_api_keys_in_message(self, message: str, record: logging.LogRecord) -> str:
+        """Replace API keys in the rendered line; fail closed (ROI-S3).
+
+        This used to return the original message when redaction raised, which
+        published the secret exactly when the layer meant to hide it broke.
+        """
+        return _redact_line(message, record)
 
 
 FILE_FORMATTER = FileFormatterWithRedaction("%(asctime)s | %(levelname)-8s | %(fileloc)-30s | %(message)s")
@@ -411,6 +410,24 @@ LOG_LEVELS = {
     "error": logging.ERROR,
     "critical": logging.CRITICAL,
 }
+
+
+class _FinalizationFilter(logging.Filter):
+    """Drops every record once finalization of the logging layer has begun (D6).
+
+    Attached to *handlers*, not loggers.  ``Handler.handle`` calls
+    ``self.filter(record)`` before emitting, so a handler filter does run —
+    unlike a filter parked on an ancestor logger, which ``Logger.callHandlers``
+    never consults (it walks ancestors collecting handlers only).  This is what
+    makes a write to a closing sink impossible rather than merely unlikely.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not _LOGGING_SHUTDOWN
+
+
+# One shared filter instance across every handler the logging layer creates.
+_FINALIZATION_FILTER = _FinalizationFilter()
 
 
 class Logger:
@@ -536,8 +553,12 @@ class Logger:
         if Logger._file_handler is not None:
             return  # Already setup
 
-        # Set logs directory path (but don't create it yet)
-        Logger._logs_dir = Path("logs")
+        # Resolve the logs directory unless the caller supplied one (D9).  The
+        # class attribute defaults to None, so production still resolves to the
+        # CWD-relative ``logs/`` exactly as ``main.py`` and AGENTS.md §1.2 rely
+        # on; a preset survives here so tests can scope the sink to themselves.
+        if Logger._logs_dir is None:
+            Logger._logs_dir = Path("logs")
 
         # Main log file (all levels) - without timestamp
         main_log_file = Logger._logs_dir / "main.log"
@@ -546,6 +567,7 @@ class Logger:
         )
         Logger._file_handler.setFormatter(get_file_formatter())
         Logger._file_handler.setLevel(logging.DEBUG)
+        Logger._file_handler.addFilter(_FINALIZATION_FILTER)
 
     @staticmethod
     def _get_or_create_module_handler(module_name: str) -> logging.Handler:
@@ -563,6 +585,7 @@ class Logger:
         )
         module_handler.setFormatter(get_file_formatter())
         module_handler.setLevel(logging.DEBUG)
+        module_handler.addFilter(_FINALIZATION_FILTER)
 
         Logger._module_handlers[module_name] = module_handler
         return module_handler
@@ -599,6 +622,7 @@ class Logger:
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(FORMATTER)
         console_handler.setLevel(log_level)
+        console_handler.addFilter(_FINALIZATION_FILTER)
         logger_instance.addHandler(console_handler)
 
         # Add module-specific file handler
@@ -866,9 +890,13 @@ def init_logging(
     # Configure rollover behavior
     Logger.configure_rollover(rollover_retries, rollover_delay)
 
-    # Attach redaction filter to all loggers (root level for simplicity)
-    redaction_filter = RedactionFilter()
-    logging.getLogger().addFilter(redaction_filter)
+    # Redaction is a property of the formatters (D1), not a logger filter.  A
+    # filter attached to the root logger cannot fire for a category logger:
+    # ``setup_logger`` sets ``propagate = False``, and ``Logger.callHandlers``
+    # walks ancestors collecting *handlers* only — an ancestor's filters are
+    # never applied to a descendant's record, and the root logger has no
+    # handlers.  Do not re-add one here: the structural pins (ROI-S4/ROI-S5)
+    # will fail.
 
     # Setup exit handlers for graceful shutdown
     _setup_exit_handlers()
@@ -930,8 +958,19 @@ def get_rollover_health():
 
 
 def shutdown_logging():
-    """Gracefully shutdown logging system and close all handlers"""
+    """Gracefully shutdown logging system and close all handlers.
+
+    The finalization flag is set *after* the flush and *before* any handler is
+    closed, so output produced before shutdown is still written while nothing
+    that arrives afterwards can reach a closing sink (ROI-S7/ROI-S8/D6).
+    """
+    global _LOGGING_SHUTDOWN
+
     Logger.flush_all_handlers()
+
+    # Everything already produced has been flushed; from here on, a record
+    # (e.g. from a surviving daemon worker) is dropped by the handler filter.
+    _LOGGING_SHUTDOWN = True
 
     # Close file handlers
     if Logger._file_handler:

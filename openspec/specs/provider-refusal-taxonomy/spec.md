@@ -65,7 +65,12 @@ vocabulary change is one edit and two surfaces cannot drift apart.
 The transport SHALL NOT sleep for a published resumption time. It SHALL publish the wait on the
 typed signal so the stage performs a bounded wait and defers the task through the durable queue.
 Any wait SHALL be clamped by a configured cap that is validated as strictly below the queue
-visibility window, because no claim-renewal API exists. The typed signal SHALL be neither retried by
+visibility window, because no claim-renewal API exists. The cap that clamps a refusal SHALL be the
+cap of the surface that produced it: a refusal raised while talking to a model provider is bounded
+by the provider ceiling, and a refusal raised while talking to the code-hosting surface is bounded
+by that surface's ceiling. A configured ceiling that a ceiling from an unrelated section silently
+overrides SHALL NOT be presented to the operator as the bound, and the ceiling reported with a
+deferral SHALL be the one that governed. The typed signal SHALL be neither retried by
 the retry policy nor absorbed by a fail-open wrapper. Every shipped provider transport SHALL let the
 signal escape, including a transport that wraps its own outbound call in a broad exception handler or
 that iterates over several publishers.
@@ -92,6 +97,24 @@ that iterates over several publishers.
   in a broad exception handler — the multi-publisher transport and the request-signing transport
 - **THEN** the signal escapes the handler rather than being converted into an empty answer or into a
   silently skipped publisher, and it does so for every shipped provider transport
+
+#### Scenario: PRT-S26 — a provider refusal is bounded by the provider ceiling, not by another surface's
+- **WHEN** a stage that talks to a model provider defers on a published wait larger than the provider
+  ceiling, while the ceiling configured for the code-hosting surface is lower still
+- **THEN** the wait actually applied is the provider ceiling, and the deferral record reports the
+  provider ceiling as the bound that governed rather than the unrelated lower one
+
+#### Scenario: PRT-S27 — a code-hosting-surface refusal keeps its own ceiling
+- **WHEN** a stage that talks to the code-hosting surface defers on a published wait larger than that
+  surface's ceiling
+- **THEN** the wait actually applied is that surface's ceiling, unchanged by the provider-surface
+  amendment
+
+#### Scenario: PRT-S28 — the applied wait is unchanged while the two ceilings are equal
+- **WHEN** both ceilings hold their shipped default value and a provider publishes a wait larger than
+  either
+- **THEN** the wait actually applied is the same one that was applied before the ceiling became
+  surface-aware, and it remains strictly below the queue visibility window
 
 ### Requirement: Refusals are counted by class and are never silent
 

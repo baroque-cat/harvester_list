@@ -1859,7 +1859,15 @@ def chat(
     """Make chat API request with retry logic."""
 
     def output(code: int, message: str, debug: bool = False) -> None:
-        text = f"[chat] failed to request URL: {url}, headers: {headers}, status code: {code}, message: {message}"
+        # Minimise at the source (design D5): report the sorted header *names*
+        # — "was an authorization header even sent?" stays answerable — and
+        # never the values.  Redaction (ROI-S1) is the last line of defence,
+        # not the only one.
+        header_names = sorted(headers) if isinstance(headers, dict) else []
+        text = (
+            f"[chat] failed to request URL: {url}, headers: {header_names}, "
+            f"status code: {code}, message: {message}"
+        )
         if debug:
             logger.debug(text)
         else:
@@ -1900,19 +1908,21 @@ def chat(
                 break
         except requests.exceptions.HTTPError as e:
             code = http_error_status(e)
-            if code != 401:
-                try:
-                    # read response body
-                    message = http_error_message(e)
+            try:
+                # read response body
+                message = http_error_message(e)
 
-                    # not a json string, use reason instead
-                    if not message.startswith("{") or not message.endswith("}"):
-                        message = e.response.reason if e.response is not None else str(e)
-                except Exception:
-                    message = str(e)
+                # not a json string, use reason instead
+                if not message.startswith("{") or not message.endswith("}"):
+                    message = e.response.reason if e.response is not None else str(e)
+            except Exception:
+                message = str(e)
 
-                # print http status code and error message
-                output(code=code, message=message, debug=False)
+            # Report every failure with its status and header *names* (ROI-S6).
+            # The 401 case used to be silenced to avoid publishing the header
+            # value; now that the value is dropped at the source, the failure is
+            # logged like any other and stays diagnosable.
+            output(code=code, message=message, debug=False)
 
             if code in NO_RETRY_ERROR_CODES:
                 break

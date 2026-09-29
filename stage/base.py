@@ -140,6 +140,14 @@ class WorkerManageable(Protocol):
 class BasePipelineStage(ABC, WorkerManageable):
     """Base class for pipeline stages with hybrid architecture support"""
 
+    # Config section whose ``max_refusal_wait_s`` bounds a deferral produced by
+    # this stage (design D8).  Defaults to the code-hosting surface (``gather``,
+    # the shipped behaviour); provider-facing stages override it to
+    # ``provider``.  The ceiling is clamped by ``_effective_defer_wait`` and
+    # reported by ``defer_task``, so the number an operator reads is the one
+    # that governed.
+    _refusal_wait_surface = "gather"
+
     def __init__(
         self,
         name: str,
@@ -212,6 +220,9 @@ class BasePipelineStage(ABC, WorkerManageable):
         self._defer_pause_until = 0.0
         # Durable-backend write failures (a dropped task is always counted).
         self.tasks_dropped_backend_errors = 0
+        # Tasks discarded because ``stop()`` had begun (design D7): reported
+        # once per stage and counted for the stop-completion record.
+        self.tasks_discarded_after_shutdown = 0
 
         # Work state tracking
         self.active_workers = 0
@@ -310,18 +321,37 @@ class BasePipelineStage(ABC, WorkerManageable):
                     worker_name = worker.name if hasattr(worker, "name") else f"worker-{id(worker)}"
                     alive_workers.append(worker_name)
 
-        # Track zombie threads for monitoring
+        # Track zombie threads for monitoring.  The stop-completion record
+        # carries the teardown discard total on both paths so the number
+        # survives the run even though only the first discard is logged (D7).
+        discarded = self.tasks_discarded_after_shutdown
         if alive_workers:
             self.zombie_threads = alive_workers
-            logger.warning(f"[{self.name}] {len(alive_workers)} workers did not stop gracefully")
+            logger.warning(
+                f"[{self.name}] {len(alive_workers)} workers did not stop gracefully, "
+                f"tasks discarded after shutdown: {discarded}"
+            )
         else:
             self.zombie_threads = []
-            logger.info(f"[{self.name}] all workers stopped gracefully")
+            logger.info(
+                f"[{self.name}] all workers stopped gracefully, "
+                f"tasks discarded after shutdown: {discarded}"
+            )
 
     def put_task(self, task: ProviderTask) -> bool:
         """Add task to queue with deduplication check"""
         if not self.accepting:
-            logger.warning(f"[{self.name}] not accepting tasks, discard: {task}")
+            # Loud once, counted always (D7): under load this branch fires
+            # thousands of times during shutdown, and one line per task buries
+            # real finalization errors.
+            with self.stats_lock:
+                self.tasks_discarded_after_shutdown += 1
+                first_discard = self.tasks_discarded_after_shutdown == 1
+            if first_discard:
+                logger.warning(
+                    f"[{self.name}] not accepting tasks, discard: {task}; "
+                    f"further discards are counted, not logged"
+                )
             return False
 
         # Generate task ID for deduplication
@@ -425,7 +455,10 @@ class BasePipelineStage(ABC, WorkerManageable):
         elif math.isinf(cap):
             wait_detail = f"bounded wait: {float(wait_s):.1f}s (no configured cap)"
         else:
-            wait_detail = f"bounded wait: {float(wait_s):.1f}s (cap {cap:.1f}s)"
+            wait_detail = (
+                f"bounded wait: {float(wait_s):.1f}s "
+                f"(cap {cap:.1f}s, {self._refusal_wait_surface} surface)"
+            )
         logger.warning(
             f"[{self.name}] deferred task on rate limit, provider: {getattr(task, 'provider', '')}, "
             f"{wait_detail}, task: {task}"
@@ -433,13 +466,16 @@ class BasePipelineStage(ABC, WorkerManageable):
         return True
 
     def _defer_wait_cap(self) -> float:
-        """Configured refusal-wait ceiling in seconds (design D5).
+        """Configured refusal-wait ceiling in seconds (design D5/D8).
 
-        Returns ``inf`` when the gather config is unreachable so the caller
-        degrades to the published wait instead of inventing a tighter bound.
+        Reads the section named by ``_refusal_wait_surface`` so a refusal is
+        bounded by the ceiling of the surface that produced it.  Returns ``inf``
+        when that section is unreachable so the caller degrades to the published
+        wait instead of inventing a tighter bound.
         """
         try:
-            return float(self.resources.config.gather.max_refusal_wait_s)
+            section = getattr(self.resources.config, self._refusal_wait_surface)
+            return float(section.max_refusal_wait_s)
         except Exception:
             return float("inf")
 

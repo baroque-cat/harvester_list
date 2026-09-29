@@ -432,7 +432,7 @@ sequenceDiagram
      - **Shard Management** (`storage/shard.py`): NDJSON shard management with rotation
      - **Snapshot Management** (`storage/snapshot.py`): Backup and restore functionality
    - **Tools & Utilities** (`tools/`): Infrastructure tools and utilities
-     - **Logging System** (`tools/logger.py`): Structured logging with API key redaction
+     - **Logging System** (`tools/logger.py`): Structured logging in which every operator-visible sink (console and every file format) redacts credential material from the final rendered line and **fails closed** — if redaction itself breaks, the line is replaced by a marker naming the level, origin logger and source location, never the payload
      - **Rate Limiting** (`tools/ratelimit.py`): Adaptive rate control with token bucket algorithm
      - **Load Balancing** (`tools/balancer.py`): Resource distribution strategies
      - **Credential Management** (`tools/credential.py`): Secure credential rotation and management
@@ -1797,6 +1797,14 @@ unchanged. A refusal with **no** published wait keeps the legacy retryable
 transient path (there is nothing to defer on), never the authentication path.
 The typed signal is neither retried by the retry policy nor absorbed by the
 fail-open `_fetch_models` wrapper (`exclude=`).
+
+**The ceiling that governs a deferral is the one belonging to its surface.** A
+refusal raised while talking to an LLM provider is clamped by
+`provider.max_refusal_wait_s`; a refusal raised while talking to the
+code-hosting surface (search/gather) is clamped by `gather.max_refusal_wait_s`.
+The deferral record names the surface and the ceiling that actually governed, so
+an operator can trust the printed bound. No behaviour changes under the shipped
+defaults (both are `60.0`); the change only matters when the two are set apart.
 
 **Our own provider basket starving `check` is a deferral too.** When the
 per-provider basket cannot hand out a token, the check worker raises the typed

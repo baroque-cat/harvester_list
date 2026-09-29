@@ -677,6 +677,10 @@ class AcquisitionStage(BasePipelineStage):
 class CheckStage(BasePipelineStage):
     """Pipeline stage for validating API keys with pure functional processing"""
 
+    # This stage talks to model providers, so a refusal it defers on is bounded
+    # by ``provider.max_refusal_wait_s`` (design D8).
+    _refusal_wait_surface = "provider"
+
     def __init__(self, resources: StageResources, handler: OutputHandler, **kwargs):
         super().__init__(PipelineStage.CHECK.value, resources, handler, **kwargs)
 
@@ -940,6 +944,10 @@ class CheckStage(BasePipelineStage):
 )
 class InspectStage(BasePipelineStage):
     """Pipeline stage for inspecting API capabilities with pure functional processing"""
+
+    # This stage talks to model providers, so a refusal it defers on is bounded
+    # by ``provider.max_refusal_wait_s`` (design D8).
+    _refusal_wait_surface = "provider"
 
     def __init__(self, resources: StageResources, handler: OutputHandler, **kwargs):
         super().__init__(PipelineStage.INSPECT.value, resources, handler, **kwargs)

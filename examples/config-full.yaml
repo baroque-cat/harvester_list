@@ -372,6 +372,9 @@ gather:
   # queue.visibility_timeout_s when backend is sqlite: the durable queue has no
   # claim renewal, so a longer sleep would let the row be re-delivered and run
   # twice. The validator rejects a contradictory pair loudly.
+  # Per-surface ceiling: this one governs refusals raised on the code-hosting
+  # surface (search/gather). It is not a global bound — a provider refusal is
+  # governed by provider.max_refusal_wait_s below.
   max_refusal_wait_s: 60.0
   # How a fetch withheld by our OWN github_raw token basket is classified.
   #   true  (default): a deferral - RateLimitDeferral with the basket's refill
@@ -405,6 +408,9 @@ provider:
   # queue.visibility_timeout_s when backend is sqlite: the durable queue has no
   # claim renewal, so a longer wait would let the claimed row be re-delivered and
   # run twice. The validator rejects a contradictory pair loudly.
+  # Per-surface ceiling: this one governs refusals raised on the provider
+  # surface (check/inspect). It is not a global bound — a code-hosting refusal is
+  # governed by gather.max_refusal_wait_s above.
   max_refusal_wait_s: 60.0
 
 # Credential liveness (fix-credential-liveness)

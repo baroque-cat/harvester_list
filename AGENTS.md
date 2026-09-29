@@ -69,3 +69,22 @@ suite after (or vice versa), and record the clean run in `verification.md`.
 - Guard globs in gate scripts (`for f in "$RUN"/data/queue_state/*.sqlite` +
   `[ -e "$f" ] || continue`): under `zsh` a non-matching glob aborts the whole
   script with `no matches found`.
+
+## 4. Test suite: sink isolation and collection scope
+
+A suite run no longer writes log files into the repository (`fix-run-output-hygiene`):
+
+- `pytest.ini` declares `testpaths = tests`, so collection from the repository
+  root never includes the root package module (`__init__.py`, whose relative
+  `from .main import ...` dies with `ImportError: attempted relative import with
+  no known parent package` when collected standalone). This is what makes a
+  measurement reproducible at a parent commit from a separate `git worktree`
+  (lesson И4 in `plan_races.md`).
+- `tests/conftest.py::pytest_configure` points `Logger._logs_dir` at a
+  per-session temp directory before collection imports product code, and strips
+  the file handlers that those imports already attached. It must be a
+  `pytest_configure` hook and not a fixture: importing `tools.logger` executes
+  `tools/__init__.py`, whose module-level `get_logger(...)` calls resolve the
+  sink location at import time — before any fixture could run.
+- Consequence: an empty repository `logs/` after a suite run is an invariant. A
+  file appearing there is a regression in the isolation, not harmless output.

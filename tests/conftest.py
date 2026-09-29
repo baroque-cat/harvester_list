@@ -9,6 +9,7 @@ import datetime
 import json
 import os
 import sqlite3
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import pytest
@@ -18,6 +19,38 @@ from core.models import CheckResult, Condition, Patterns, ResultStorage
 from core.types import IProvider
 
 REGISTRY_FILENAME = "registry.sqlite"
+
+
+def pytest_configure(config):
+    """Scope the log sink to this test session (ROI-S12/ROI-S13, design D10).
+
+    This has to run in a *configure* hook rather than a fixture: importing
+    ``tools.logger`` executes ``tools/__init__.py``, whose module imports call
+    ``get_logger`` and resolve ``Logger._logs_dir`` at import time — before any
+    fixture can run.  Collection imports product code, so redirecting here is
+    the last moment before a sink is fixed.  Handlers that those early imports
+    already attached are stripped below, because the redirect alone cannot undo
+    them.
+    """
+    import logging as _logging
+    import tempfile
+
+    import tools.logger as lg
+
+    session_logs = Path(tempfile.mkdtemp(prefix="pytest-logs-"))
+    lg.Logger._logs_dir = session_logs
+    lg.Logger._file_handler = None
+    lg.Logger._module_handlers.clear()
+    lg.Logger._loggers.clear()
+    if hasattr(lg.Logger, "_directory_initialized"):
+        del lg.Logger._directory_initialized
+
+    for logger_obj in list(_logging.Logger.manager.loggerDict.values()):
+        if not isinstance(logger_obj, _logging.Logger):
+            continue
+        for handler in list(logger_obj.handlers):
+            if isinstance(handler, _logging.FileHandler):
+                logger_obj.removeHandler(handler)
 
 
 def _registry_path(workspace: str) -> str:
