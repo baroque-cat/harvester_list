@@ -63,11 +63,18 @@ def _task_config():
 
 
 def _governor(mode="on", depth=1, partitions=3, budget=50):
+    # The incident seed's generated children all collapse onto the parent's wire
+    # on the API transport, so the default-on wire-collapse guard would withhold
+    # them and mask the depth/cap/budget behaviour these scenarios pin (S1/S8/
+    # S11).  The guard itself is covered by tests/test_rfg_wire_collapse.py; here
+    # it is explicitly disabled so the pre-existing governance layers are tested
+    # in isolation.
     return RefineGovernor(
         mode=mode,
         max_refine_depth=depth,
         max_partitions_per_refine=partitions,
         max_search_tasks_per_run=budget,
+        drop_wire_indistinguishable=False,
     )
 
 

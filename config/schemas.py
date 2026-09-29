@@ -564,6 +564,10 @@ class RefineGovernorConfig:
     max_refine_depth: int = 2
     max_partitions_per_refine: int = 128
     max_search_tasks_per_run: int = 10000
+    # Wire-collapse guard rollback (fix-refine-fanout-wire-collapse, design D8):
+    # ``False`` restores pre-guard admission byte-for-byte, in tasks and in log
+    # output, independently of ``mode``.  Default on.
+    drop_wire_indistinguishable: bool = True
 
     def __post_init__(self):
         # Mirrors ConfigValidator._validate_refine_governor_config on purpose:
@@ -589,6 +593,14 @@ class RefineGovernorConfig:
 
         if self.max_refine_depth > 5:
             raise ValueError("refine_governor.max_refine_depth must be at most 5")
+
+        # Boolean, never coerced: ``bool("false")`` is ``True``, so coercion would
+        # silently invert an operator's rollback (design D8).  Mirrored in
+        # ConfigValidator._validate_refine_governor_config on purpose.
+        if not isinstance(self.drop_wire_indistinguishable, bool):
+            raise ValueError(
+                "refine_governor.drop_wire_indistinguishable must be a boolean"
+            )
 
 
 @dataclass

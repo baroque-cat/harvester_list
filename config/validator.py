@@ -521,6 +521,14 @@ class ConfigValidator:
         if int(governor.max_refine_depth) > 5:
             self.errors.append("RefineGovernor max_refine_depth must be at most 5")
 
+        # Mirrors RefineGovernorConfig.__post_init__ (deliberate duplication):
+        # a non-boolean value would silently invert the rollback flag, so it
+        # fails loudly and names the key.  No coercion (design D8).
+        if not isinstance(governor.drop_wire_indistinguishable, bool):
+            self.errors.append(
+                "refine_governor.drop_wire_indistinguishable must be a boolean"
+            )
+
     def _validate_task_queue_config(self, config: Config) -> None:
         """Validate the durable task-queue backend configuration section.
 

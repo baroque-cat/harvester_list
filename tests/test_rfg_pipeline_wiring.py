@@ -19,7 +19,9 @@ from config.schemas import Config, RefineGovernorConfig
 from manager.pipeline import Pipeline
 from search import refine_governor as rfg_module
 
-# The ten metric keys design D9 promises on the status surface.
+# The metric keys the status surface promises: the eleven of design D9
+# (add-refine-fanout-governor) plus the two added by the wire-collapse guard
+# (fix-refine-fanout-wire-collapse, design D6).
 D9_KEYS = (
     "mode",
     "children_generated",
@@ -32,6 +34,8 @@ D9_KEYS = (
     "budget_remaining",
     "coverage_estimate_min",
     "coverage_estimate_avg",
+    "refused_wire_collapse",
+    "distinct_wire_admitted",
 )
 
 
@@ -123,3 +127,40 @@ def test_zero_budget_is_rejected_at_config_level():
         RefineGovernorConfig(max_partitions_per_refine=0)
     with pytest.raises(ValueError):
         RefineGovernorConfig(mode="enforce")
+
+
+def test_s31_guard_boolean_is_validated_like_the_mode():
+    """refine-fanout-governor-S31: WHEN ``drop_wire_indistinguishable`` carries a
+    value that is not a boolean THEN configuration validation fails loudly before
+    any run starts and names the key -- at both mirrored sites (the dataclass
+    ``__post_init__`` that guards direct construction, and ``ConfigValidator``
+    which the loader path goes through).
+
+    Coercion is what must NOT happen: ``bool("false")`` is ``True``, so accepting
+    a string here would silently turn an operator's rollback into the opposite
+    setting.
+    """
+    from config.validator import ConfigValidator
+
+    for bad in ("yes", "false", None, 1, 0):
+        with pytest.raises(ValueError) as excinfo:
+            RefineGovernorConfig(drop_wire_indistinguishable=bad)
+        assert "drop_wire_indistinguishable" in str(excinfo.value), bad
+
+        cfg = Config()
+        cfg.refine_governor.drop_wire_indistinguishable = bad  # bypass __post_init__
+        with pytest.raises(ValueError) as excinfo:
+            ConfigValidator().validate(cfg)
+        assert "drop_wire_indistinguishable" in str(excinfo.value), bad
+
+    # both real booleans are accepted, and the default keeps the guard on
+    for good in (True, False):
+        assert RefineGovernorConfig(drop_wire_indistinguishable=good) \
+            .drop_wire_indistinguishable is good
+    assert RefineGovernorConfig().drop_wire_indistinguishable is True
+
+    # and the value actually reaches the governor
+    governor = _configure(Config(
+        refine_governor=RefineGovernorConfig(drop_wire_indistinguishable=False)
+    )).refine_governor
+    assert governor.drop_wire_indistinguishable is False

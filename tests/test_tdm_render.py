@@ -367,3 +367,55 @@ def test_ro_s11_mean_bytes_per_file_is_computable():
     assert requests == 12 and delivered == 3456
     mean_bytes_per_file = delivered / requests
     assert mean_bytes_per_file == pytest.approx(288.0)
+
+
+# ---------------------------------------------------------------------------
+# refine-fanout-governor-S32
+# ---------------------------------------------------------------------------
+def test_rfg_s32_three_refusal_reasons_are_separable():
+    """WHEN a run produces depth refusals, budget refusals and wire-collapse
+    withholdings THEN the rendered refinement line reports three distinguishable
+    counts reconciling with the run's decisions, so a reader can tell "never
+    generated" from "generated and withheld" and from "withheld as cap surplus".
+
+    Token names follow the existing RO-S1 pin style (`depth=`, `budget=`) and are
+    fixed by the change's design D6.
+    """
+    metrics = dict(REFINE)
+    metrics.update(children_generated=144, children_admitted=100,
+                   refused_depth=3, refused_budget=5, refused_wire_collapse=7,
+                   truncated_to_cap=16)
+    line = _line(_section(_status(refine_metrics=metrics)), "Refine:")[0]
+
+    bracket = re.search(r"refused\[([^\]]*)\]", line)
+    assert bracket, f"refusal breakdown missing from {line!r}"
+    reasons = dict(re.findall(r"(\w+)=(\d+)", bracket.group(1)))
+    assert len(reasons) == 3, reasons
+    assert reasons["depth"] == "3"
+    assert reasons["budget"] == "5"
+    assert reasons["wire"] == "7"
+    # the withholding populations are disjoint and fit inside what the governor saw
+    assert 100 + 7 + 16 + 5 <= metrics["children_generated"]
+
+
+# ---------------------------------------------------------------------------
+# refine-fanout-governor-S33
+# ---------------------------------------------------------------------------
+def test_rfg_s33_distinguishable_work_is_published_next_to_volume():
+    """WHEN refined children have been admitted THEN the surface reports both the
+    number of admitted children and the number of distinct wire queries they
+    represent, so the ratio between them is readable without querying the queue.
+
+    The figures are the measured waste signature of the 2026-09-29 A/B: 82 171
+    admitted children expressing 19 distinct wire queries.
+    """
+    metrics = dict(REFINE)
+    metrics.update(children_admitted=82171, distinct_wire_admitted=19)
+    line = _line(_section(_status(refine_metrics=metrics)), "Refine:")[0]
+
+    admitted = re.search(r"adm=(\d+)", line)
+    uniq = re.search(r"uniq_wires=(\d+)", line)
+    assert admitted and uniq, f"volume and distinguishable-work figures must both render: {line!r}"
+    assert int(admitted.group(1)) == 82171
+    assert int(uniq.group(1)) == 19
+    assert int(admitted.group(1)) / int(uniq.group(1)) == pytest.approx(82171 / 19)

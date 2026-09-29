@@ -1426,6 +1426,7 @@ refine_governor:
   max_refine_depth: 2           # refinement recursion cap (1..5)
   max_partitions_per_refine: 128  # per-refine partition clamp (positive)
   max_search_tasks_per_run: 10000 # admitted refined children per process run (> 0)
+  drop_wire_indistinguishable: true # withhold transport-indistinguishable children
 ```
 
 **Modes.** A three-position flag; flips require a restart.
@@ -1464,6 +1465,19 @@ refine_governor:
   per-child WARNING naming provider, parent query and reason (`budget`). Root
   tasks (configured conditions) and page tasks are **exempt** — the configured
   conditions always run. The budget resets each process run.
+- *Wire collapse:* children the transport cannot distinguish from work already
+  selected are not enqueued — a child whose wire query equals its parent's, and
+  all but one child of each group of children sharing a wire query (the survivor
+  is the lexicographically smallest raw query, so the choice is deterministic
+  across processes). On the API transport `search/querykey.wire_query` reduces a
+  `/regex/` span to its fixed literals, so partitions that differ only *after*
+  the prefix collapse to one request; on the web transport the wire query is the
+  raw query verbatim, so nothing is withheld. Withheld children consume neither
+  the width cap nor the budget, and withholding is logged once per parent (never
+  once per child). Rollback is the single boolean
+  `drop_wire_indistinguishable: false`, which restores pre-change admission
+  byte-for-byte (tasks and log output) independently of `mode`; the status
+  figures `refused[... wire=N]` and `uniq_wires=N` evidence the guard.
 
 **Default basis (2026-09-21 measurements).** The offline generator emits 72 /
 1 296 / **46 656** children for partitions 64 / 1 000 / 46 007 — the last in
@@ -1486,10 +1500,13 @@ edit; lowering is a one-flip rollback.
 
 **Metrics.** Exposed in `PipelineStatus.refine_metrics`: `mode`,
 `children_generated`, `children_admitted`, `refused_depth`, `refused_budget`,
-`truncated_to_cap`, `parents_refined`, `parents_at_depth_cap_paginated`,
+`refused_wire_collapse`, `truncated_to_cap`, `distinct_wire_admitted`,
+`parents_refined`, `parents_at_depth_cap_paginated`,
 `budget_remaining`, `coverage_estimate_min` / `coverage_estimate_avg`. Each
 refined parent also logs an INFO line (`generated` / `admitted` / `truncated` /
-`refused_budget` / `coverage`).
+`refused_budget` / `coverage`), and a parent that withheld anything logs one
+aggregated `wire_collapse` INFO line. The rendered `Refine:` status line carries
+`refused[depth=…, budget=…, wire=…]` and `uniq_wires=…`.
 
 **Relationships.** The env seatbelts `REGEX_MAX_QUERIES` / `REGEX_MAX_DEPTH`
 (`search/github/refine/config.py`) remain as engine-level defense in depth but are

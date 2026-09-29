@@ -1,0 +1,37 @@
+## Why
+
+The refine governor bounds how many children a parent may produce, but nothing between the refine engine and the search queue asks whether a child is **distinguishable from its siblings on the wire**. On the API transport `search/querykey.wire_query()` reduces a `/regex/` span to its fixed literals (`RefineEngine.clean_regex`), so partitions that differ only inside character classes after the prefix collapse to one request. Measured on a live 300 s run: **8 297 distinct raw partitions → 18 distinct wire queries**, and the queue held **74 670 rows to express 155 distinct `(wire, page)` fetches** (99.79 % redundant). The client-side filter is identical for every child (`data.regex` is the root pattern, additional patterns empty), so an identical wire response yields an identical harvest — the redundancy is pure cost.
+
+The cost is not only disk. A config A/B (`max_refine_depth` 2 vs 1, two matched 300 s soaks) showed depth **subtracts** coverage: depth 2 spent the entire `max_search_tasks_per_run: 10000` budget subdividing 19 first-characters for **one** provider (`refused[budget]=56048`, 99.99 % of queued rows from that provider, 82 171 rows, 322 MB harvested, 27 MB console), while depth 1 spent 512 of the budget, left it unexhausted, and reached **32** distinct wire queries across **all four** providers (4 247 rows, 24 MB, 3.5 MB console). Same gather throughput in both arms (2 548 vs 2 555 requests) — gather is basket-bound, not search-bound. Lowering the depth cap is not the fix: it is seed-specific, and any depth can emit children the transport cannot tell apart.
+
+## What Changes
+
+- **Wire-collapse guard in `RefineGovernor.select_children`.** From the engine's candidates the governor admits **at most one child per distinct wire query**, and **no child whose wire query equals the parent's**. Selection, never rewriting: the survivor is one of the generator's own outputs, so `wire_query` values remain exactly what the engine produced.
+- **Guard runs before the partition cap and before budget admission.** Withheld children consume neither `max_partitions_per_refine` nor `max_search_tasks_per_run`, which is where the measured coverage gain comes from: budget previously spent on indistinguishable subdivisions becomes available for distinguishable ones.
+- **Deterministic survivor within a wire group.** Admission order becomes `(fingerprint, raw)` and the lexicographically smallest raw query survives each wire group. This *strengthens* the existing cross-process determinism guarantee: today same-wire siblings tie on fingerprint and the survivor depends on the engine's set-based, cross-process-salted ordering.
+- **Provably inert on the web transport.** There `wire_query` returns the raw query verbatim, so the guard's condition reduces to the pre-existing `child != parent` filter and intra-batch duplicates are already distinct strings. Pinned as a scenario rather than assumed.
+- **New rollback flag `refine_governor.drop_wire_indistinguishable`** (default `true`). `false` restores pre-change behaviour byte-for-byte in tasks *and* log output, independently of `mode`. Invariant "rollback is a config flip, no code change, no data migration" preserved.
+- **Tri-mode contract extended, not bypassed.** `off` stays a verbatim passthrough (guard inert, counters inert); `shadow` computes, counts and logs the would-be withholdings while enqueuing everything; `on` enforces.
+- **Two new figures on the existing `refine_metrics` surface, both rendered:** `refused_wire_collapse` (children withheld by the guard) and `distinct_wire_admitted` (distinct wire queries among admitted children, cumulative). Together with `children_admitted` they make the guard self-evidencing in the status line: after the guard, admitted ÷ distinct-wire tends to 1, and any drift back toward the measured 481 is visible without SQL. Memory is bounded by the existing run budget.
+- **Withholdings are logged once per parent, never per child.** The existing per-child budget-refusal WARNING produced 56 048 lines in the measured run (70 059 WARNING lines total, ×11.9 the other arm); the guard must not repeat that pattern.
+- **Not changed:** the refine engine and its partitioning; `wire_query`/`fingerprint` semantics; child attribution (provider, patterns, `use_api`); dedup identities and baskets (invariant 1 — no task merging, each provider still executes its own tasks); queue claim and its ordering (`storage/task_queue.py` untouched, so the route's main technical risk is not incurred); aggregation and its TTL semantics; refusal taxonomy and both deferral caps; `total_count`-based partition denominator and `coverage_estimate` (R6).
+- **Deliberately deferred:** the `aggregation_ratio` KPI. It belongs to `search-aggregation`, and the same A/B showed it *rewards* waste in isolation — 307.6 for the arm doing ×1.7 less distinguishable work — so it must be published paired with a distinguishable-work measure, not alone.
+
+## Capabilities
+
+### New Capabilities
+
+*(none — the guard is a new requirement inside an existing capability, not a new capability)*
+
+### Modified Capabilities
+
+- `refine-fanout-governor`: admission gains a third withholding reason (wire collapse) alongside depth and budget; the child set becomes "at most one per distinct wire query, excluding the parent's wire"; the tri-mode requirement extends to the new decision; the coverage-observability requirement gains two rendered figures and the third refusal reason; "existing protections preserved" is amended from "sorted/truncated, never rewritten" to "sorted/truncated/**filtered**, never rewritten".
+
+## Impact
+
+- **Code:** `search/refine_governor.py` (guard, ordering, counters, logging), `state/display.py` (`_format_refine_metrics_line` allowlist gains two keys), `config/schemas.py` + `config/defaults.py` + `config/loader.py` (new boolean key), `stage/definition.py` only if the call site must pass the parent wire (it already passes `parent_query` and `use_api`, so no signature change is expected).
+- **Configuration:** one new key under the existing `refine_governor` section; no key removed or renamed; `examples/config-full.yaml` and README annotated. Existing configs keep working (default `true` = guard on); an operator wanting the old behaviour sets it `false`.
+- **Storage / durability:** none. No schema change, no migration, no `PRAGMA user_version` bump, no change to claim or to queue ordering.
+- **Observability:** the `Refine:` status line grows two figures; RO-S1's "refusals by reason" already covers a third reason, and RO-S5's allowlist keeps unexpected keys out, so no `run-observability` requirement changes.
+- **Evidence base:** `plan.md` II.16 / II.16.1 / II.16.2, II.4.2, II.5.2; `plan_races.md` П3, И6, И7 and section 8 item 8 (which obliges this change to compare on a defined boundary, to count what it withholds, and to prove harvest equality with **unique** entities rather than record counts). Live figures cited above are from run root `/var/tmp/opencode-r11-ab/ab_20260929T233850` (config md5 `a8685be3b149aa3780871948587806d8`, both arms `SOAK_EXIT=0`, 429 = 403 = secondary = 0).
+- **Third-party response format:** no claim in this change rests on a provider response shape. The wire-collapse mechanism is a property of our own `clean_regex` and is cited from code plus two live runs against GitHub's code-search API (2026-09-29, authenticated pool, `Remaining: 5000`, no 429/403/secondary windows).

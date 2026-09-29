@@ -333,6 +333,16 @@ refine_governor:
   # consume it (> 0 -- non-positive caps fail validation loudly;
   # 10000 ~= one daily cycle at the configured rate)
   max_search_tasks_per_run: 10000
+  # Wire-collapse guard (fix-refine-fanout-wire-collapse): withhold refined
+  # children the transport cannot distinguish from work already selected -- a
+  # child whose wire query equals its parent's, and all but one child of each
+  # group of children sharing a wire query. Selection only: survivors are the
+  # generator's own verbatim queries. Withheld children consume neither the
+  # partition cap nor the run budget, so the budget is spent on distinguishable
+  # work. Inert on the web transport (there the wire query is the raw query).
+  # `false` restores pre-change admission byte-for-byte (tasks and log output),
+  # independently of `mode` -- the rollback flip.
+  drop_wire_indistinguishable: true
 
 # Durable task-queue backend (fix-queue-persistence-under-load)
 # Selects the per-stage queue implementation. memory is the byte-identical

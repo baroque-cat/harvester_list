@@ -667,8 +667,10 @@ class StatusDisplayEngine:
             f"gen={metric_int(metrics.get('children_generated'))} "
             f"adm={metric_int(metrics.get('children_admitted'))} "
             f"refused[depth={metric_int(metrics.get('refused_depth'))}, "
-            f"budget={metric_int(metrics.get('refused_budget'))}] "
+            f"budget={metric_int(metrics.get('refused_budget'))}, "
+            f"wire={metric_int(metrics.get('refused_wire_collapse'))}] "
             f"trunc={metric_int(metrics.get('truncated_to_cap'))} "
+            f"uniq_wires={metric_int(metrics.get('distinct_wire_admitted'))} "
             f"cov[min={metric_rate(metrics.get('coverage_estimate_min')):.4f}, "
             f"avg={metric_rate(metrics.get('coverage_estimate_avg')):.4f}]"
         )

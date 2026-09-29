@@ -4,26 +4,50 @@
 
 ``RefineGovernor`` sits strictly between "the refine engine produced candidate
 children" and "children enter the search queue".  It never rewrites wire
-queries: it clamps the partition count handed to the engine, sorts/truncates
-the engine's output, and admits children within a per-run budget.
+queries: it clamps the partition count handed to the engine, sorts/truncates/
+filters the engine's output, and admits children within a per-run budget.
 
 Modes (tri-mode rollout flag):
 
 - ``off``    -- passthrough: input order preserved, all counters inert.
 - ``shadow`` -- everything is enqueued exactly as in ``off`` while every
-                would-be clamp/truncation/budget decision is computed, counted
-                and logged (measures the coverage price before enforcement).
+                would-be clamp/truncation/budget/wire-collapse decision is
+                computed, counted and logged (measures the coverage price
+                before enforcement).
 - ``on``     -- decisions enforced.
 
-Admission order is ascending ``search/querykey.fingerprint`` (design D5): the
-sha256 of ``"<api|web>|<wire_query>"`` is stable across processes and
-provider-independent, so identical inputs admit identical children regardless of
-the engine's internal (set-based, cross-process salted) ordering, and twins of
-the same query from different providers converge on the same survivor set.
+Wire-collapse guard (fix-refine-fanout-wire-collapse, design D2-D9): when
+``drop_wire_indistinguishable`` is true (default), admission withholds any
+candidate the transport cannot distinguish from work already selected -- a child
+whose wire query equals the parent's, and all but one child of each group of
+children sharing a wire query.  The comparison uses ``search.querykey.wire_query``
+(the single source of truth that both the actual request and the shared-response
+cache key are built from), never ``RefineEngine.clean_regex`` directly, so the
+guard is provably inert on the web transport (where ``wire_query`` is the raw
+query).  The guard is *selection*, not rewriting: the survivor is one of the
+generator's own outputs.
+
+Admission order is ascending ``search/querykey.fingerprint`` with the raw query
+as tiebreaker (design D4/D5): the sha256 of ``"<api|web>|<wire_query>"`` is
+stable across processes and provider-independent, so identical inputs admit
+identical children regardless of the engine's internal (set-based, cross-process
+salted) ordering, and twins of the same query from different providers converge
+on the same survivor set.  The raw-query tiebreaker additionally makes *which*
+candidate survives a same-wire group deterministic, not just the survivor set.
 Fingerprint order also spreads truncation gaps pseudo-randomly over the query
 space instead of permanently sacrificing one fixed region (lexicographic order
 always drops the alphabet tail -- measured on the 2026-09-21 incident seed at
 cap 128: ``w x y z`` excluded on every run).
+
+Memory: ``distinct_wire_admitted`` is a cumulative counter -- each parent
+contributes the number of distinct wire queries among the children it admitted.
+Under enforcement it therefore equals ``children_admitted`` (the spec's
+post-condition); with the guard off it exposes the collapse ratio.  It
+deliberately does not retain a global set of fingerprints: the same wire can be
+admitted under two different parents, so a global set would under-count the
+distinguishable work admitted under separate parents (design D6 amended; see the
+change's ``design.md``).  It resets with the process like every other governor
+counter.
 
 All mutable state lives behind a single ``threading.Lock`` because
 ``WorkerManager`` may scale the search stage at runtime.
@@ -32,7 +56,7 @@ All mutable state lives behind a single ``threading.Lock`` because
 import threading
 from typing import Any, Dict, List
 
-from search.querykey import fingerprint
+from search.querykey import fingerprint, wire_query
 from tools.logger import get_logger
 
 logger = get_logger("search")
@@ -49,6 +73,7 @@ class RefineGovernor:
         max_refine_depth: int = 2,
         max_partitions_per_refine: int = 128,
         max_search_tasks_per_run: int = 10000,
+        drop_wire_indistinguishable: bool = True,
     ) -> None:
         normalized = str(mode).strip().lower()
         if normalized not in _VALID_MODES:
@@ -60,21 +85,31 @@ class RefineGovernor:
             raise ValueError(
                 "refine_governor depth/partitions must be positive and budget non-negative"
             )
+        # Boolean, never coerced: ``bool("false")`` is ``True``, so coercion would
+        # silently invert an operator's rollback (design D8).  Trailing keyword
+        # with a default keeps the pinned positional signature unchanged.
+        if not isinstance(drop_wire_indistinguishable, bool):
+            raise ValueError(
+                "refine_governor.drop_wire_indistinguishable must be a boolean"
+            )
 
         self.mode = normalized
         self.max_refine_depth = depth
         self.max_partitions_per_refine = partitions
         self.max_search_tasks_per_run = budget
+        self.drop_wire_indistinguishable = drop_wire_indistinguishable
 
         self._lock = threading.Lock()
         self._children_generated = 0
         self._children_admitted = 0
         self._refused_depth = 0
         self._refused_budget = 0
+        self._refused_wire_collapse = 0
         self._truncated_to_cap = 0
         self._parents_refined = 0
         self._parents_at_depth_cap_paginated = 0
         self._budget_used = 0
+        self._distinct_wire_admitted = 0
         self._coverage: List[float] = []
 
     # ------------------------------------------------------------------
@@ -134,6 +169,12 @@ class RefineGovernor:
         Returns the children to enqueue for this parent.  ``off`` and ``shadow``
         withhold nothing; ``on`` returns the admitted subset.
 
+        With ``drop_wire_indistinguishable`` (default true) and ``mode`` in
+        ``shadow``/``on``, the wire-collapse guard additionally withholds every
+        candidate whose ``search.querykey.wire_query`` equals its parent's and all
+        but one candidate of each group sharing a wire query (design D2/D3/D5).
+        Withheld children consume neither the partition cap nor the run budget.
+
         ``off`` deliberately returns the generator's list verbatim -- empty and
         self-referential entries included -- so the stage's own pre-existing
         filters (and their warnings) fire exactly as they did before this change:
@@ -151,15 +192,47 @@ class RefineGovernor:
         candidates = [q for q in queries if q and q != parent_query]
         generated = len(candidates)
 
+        # Deterministic admission order: ascending wire fingerprint, raw query as
+        # tiebreaker so same-wire siblings also have a deterministic relative
+        # order and the lexicographically smallest raw survives its wire group
+        # (design D4/D5).
+        ordered = sorted(candidates, key=lambda q: (fingerprint(q, use_api), q))
+
+        # Wire-collapse guard (design D2/D3/D5): selection among the generator's
+        # own outputs, applied before the cap and the budget so withheld children
+        # consume neither.  Computed identically in shadow and on; inert when the
+        # rollback flag is off.
+        parent_equal = 0
+        sibling_duplicate = 0
+        if self.drop_wire_indistinguishable:
+            parent_wire = wire_query(parent_query, use_api)
+            survivors: List[str] = []
+            seen_wires = set()
+            for child in ordered:
+                child_wire = wire_query(child, use_api)
+                if child_wire == parent_wire:
+                    parent_equal += 1
+                elif child_wire in seen_wires:
+                    sibling_duplicate += 1
+                else:
+                    seen_wires.add(child_wire)
+                    survivors.append(child)
+            collapsed = parent_equal + sibling_duplicate
+            population = survivors
+        else:
+            collapsed = 0
+            population = ordered
+
         cap = self.max_partitions_per_refine
-        # Deterministic admission order: ascending wire fingerprint (design D5).
-        ordered = sorted(candidates, key=lambda q: fingerprint(q, use_api))
-        capped = ordered[:cap]
-        truncated = generated - len(capped)
+        capped = population[:cap]
+        # Truncation surplus is measured on the post-guard population so a
+        # withheld child is never counted twice (design D5).
+        truncated = len(population) - len(capped)
 
         if self.mode == "shadow":
             with self._lock:
                 self._children_generated += generated
+                self._refused_wire_collapse += collapsed
                 self._truncated_to_cap += truncated
                 remaining = max(0, self.max_search_tasks_per_run - self._budget_used)
                 would_admit = capped[:remaining]
@@ -168,8 +241,20 @@ class RefineGovernor:
                 # Track the would-be "on" trajectory so subsequent batches
                 # measure the same budget drain enforcement would cause.
                 self._budget_used += len(would_admit)
+                # ``distinct_wire_admitted`` is an observation, not a decision:
+                # shadow records the wires enforcement would admit (design D8).
+                # It is a per-parent distinct count summed over the run, so under
+                # enforcement it equals ``children_admitted`` even though the same
+                # wire may be admitted under two different parents (design D6).
+                self._distinct_wire_admitted += len(
+                    {fingerprint(q, use_api) for q in would_admit}
+                )
                 if generated > 0:
                     self._parents_refined += 1
+            self._log_wire_collapse(
+                provider, parent_query, generated, parent_equal,
+                sibling_duplicate, len(would_admit), shadow=True,
+            )
             self._log_truncation(provider, parent_query, truncated)
             self._log_budget_refusals(provider, parent_query, would_refuse)
             coverage = self._record_coverage(would_admit, transport_limit, total)
@@ -183,6 +268,7 @@ class RefineGovernor:
 
         with self._lock:
             self._children_generated += generated
+            self._refused_wire_collapse += collapsed
             self._truncated_to_cap += truncated
             remaining = max(0, self.max_search_tasks_per_run - self._budget_used)
             admitted = capped[:remaining]
@@ -190,9 +276,16 @@ class RefineGovernor:
             self._budget_used += len(admitted)
             self._children_admitted += len(admitted)
             self._refused_budget += len(refused)
+            self._distinct_wire_admitted += len(
+                {fingerprint(q, use_api) for q in admitted}
+            )
             if generated > 0:
                 self._parents_refined += 1
 
+        self._log_wire_collapse(
+            provider, parent_query, generated, parent_equal,
+            sibling_duplicate, len(admitted), shadow=False,
+        )
         self._log_truncation(provider, parent_query, truncated)
         self._log_budget_refusals(provider, parent_query, refused)
         coverage = self._record_coverage(admitted, transport_limit, total)
@@ -222,6 +315,33 @@ class RefineGovernor:
             f"{self.max_partitions_per_refine} (reason=cap)"
         )
 
+    def _log_wire_collapse(
+        self,
+        provider: str,
+        parent_query: str,
+        generated: int,
+        parent_equal: int,
+        sibling_duplicate: int,
+        admitted: int,
+        shadow: bool,
+    ) -> None:
+        """One aggregated INFO line per parent that withheld anything (design D7).
+
+        Never one line per withheld child: the per-child ``_log_budget_refusals``
+        pattern produced 56 048 of 70 059 WARNING lines in the measured arm.  The
+        stable token ``wire_collapse`` identifies the line.
+        """
+        collapsed = parent_equal + sibling_duplicate
+        if collapsed <= 0:
+            return
+        marker = " (shadow)" if shadow else ""
+        logger.info(
+            f"[refine_governor] wire_collapse: provider={provider} query={parent_query} "
+            f"generated={generated} withheld={collapsed} "
+            f"parent_equal={parent_equal} sibling_duplicate={sibling_duplicate} "
+            f"admitted={admitted}{marker}"
+        )
+
     def _log_budget_refusals(self, provider: str, parent_query: str, refused: List[str]) -> None:
         for query in refused:
             logger.warning(
@@ -244,10 +364,12 @@ class RefineGovernor:
                 "children_admitted": self._children_admitted,
                 "refused_depth": self._refused_depth,
                 "refused_budget": self._refused_budget,
+                "refused_wire_collapse": self._refused_wire_collapse,
                 "truncated_to_cap": self._truncated_to_cap,
                 "parents_refined": self._parents_refined,
                 "parents_at_depth_cap_paginated": self._parents_at_depth_cap_paginated,
                 "budget_remaining": max(0, self.max_search_tasks_per_run - self._budget_used),
+                "distinct_wire_admitted": self._distinct_wire_admitted,
                 "coverage_estimate_min": min(coverage) if coverage else 1.0,
                 "coverage_estimate_avg": (sum(coverage) / len(coverage)) if coverage else 1.0,
             }
