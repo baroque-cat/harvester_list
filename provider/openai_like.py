@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 
 from constant.system import DEFAULT_COMPLETION_PATH, DEFAULT_MODEL_PATH
 from core.enums import ErrorReason
+from core.exceptions import RateLimitDeferral
 from core.models import CheckResult, Condition
 from search.client import http_get
 from tools.coordinator import get_user_agent
@@ -132,7 +133,7 @@ class OpenAILikeProvider(AIBaseProvider):
 
         return super()._judge(code, message)
 
-    @handle_exceptions(default_result=[], log_level="warning")
+    @handle_exceptions(default_result=[], exclude=(RateLimitDeferral,), log_level="warning")
     def _fetch_models(self, url: str, headers: Dict) -> List[str]:
         """Fetch models from API endpoint."""
         url = trim(url)

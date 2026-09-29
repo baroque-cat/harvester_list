@@ -493,6 +493,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             refine_metrics=self.get_refine_metrics(),
             gather_transport_metrics=client.get_gather_transport_stats(),
             credential_metrics=credential_liveness_metrics(),
+            provider_refusal_metrics=client.get_provider_refusal_stats(),
         )
 
         return pipeline_status

@@ -15,6 +15,7 @@ import requests
 
 from constant.system import NO_RETRY_ERROR_CODES
 from core.enums import ErrorReason
+from core.exceptions import RateLimitDeferral
 from core.models import CheckResult, Condition
 from search.client import http_error_message, http_error_status, http_get, request
 from tools.coordinator import get_user_agent
@@ -154,7 +155,7 @@ class AnthropicProvider(AIBaseProvider):
 
         return super()._judge(code, message)
 
-    @handle_exceptions(default_result=[], log_level="warning")
+    @handle_exceptions(default_result=[], exclude=(RateLimitDeferral,), log_level="warning")
     def _fetch_models(self, url: str, headers: Dict) -> List[str]:
         """Fetch Anthropic models from the Models API."""
         url = trim(url)

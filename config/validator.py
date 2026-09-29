@@ -102,6 +102,9 @@ class ConfigValidator:
         # Validate credential-liveness / bounded-wait configuration
         self._validate_credential_liveness_config(config)
 
+        # Validate LLM-provider refusal-classification configuration
+        self._validate_provider_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -573,6 +576,40 @@ class ConfigValidator:
             if wait_cap >= visibility:
                 self.errors.append(
                     f"Gather max_refusal_wait_s ({gather_config.max_refusal_wait_s}) must be "
+                    f"strictly less than queue.visibility_timeout_s ({config.queue.visibility_timeout_s}) "
+                    f"so no worker sleeps inside a claimed durable row past its visibility window"
+                )
+
+    def _validate_provider_config(self, config: Config) -> None:
+        """Validate the LLM-provider refusal-classification configuration section.
+
+        Re-checks the bool/positivity constraints enforced by the dataclass (they
+        can be bypassed by attribute mutation) and adds the cross-section
+        durability invariant from design D7: a refusal wait at or beyond the
+        durable queue's visibility timeout guarantees a duplicate execution
+        because the queue exposes no claim renewal.
+        """
+        provider = config.provider
+
+        # Bool only, loud: ``false`` is the supported rollback position (legacy
+        # classification), not a hazard, so it earns no warning (design D7).
+        if not isinstance(provider.classify_refusals, bool):
+            self.errors.append(
+                f"provider.classify_refusals must be a boolean "
+                f"(got: {provider.classify_refusals!r})"
+            )
+
+        wait_cap = float(provider.max_refusal_wait_s)
+        if wait_cap <= 0:
+            self.errors.append("Provider max_refusal_wait_s must be positive")
+
+        # Cross-section durability invariant (only meaningful for the durable
+        # backend; the in-memory queue has no visibility window).
+        if config.queue.backend == "sqlite":
+            visibility = float(config.queue.visibility_timeout_s)
+            if wait_cap >= visibility:
+                self.errors.append(
+                    f"provider.max_refusal_wait_s ({provider.max_refusal_wait_s}) must be "
                     f"strictly less than queue.visibility_timeout_s ({config.queue.visibility_timeout_s}) "
                     f"so no worker sleeps inside a claimed durable row past its visibility window"
                 )

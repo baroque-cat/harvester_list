@@ -695,6 +695,31 @@ class CheckStage(BasePipelineStage):
         """Validate that task is a CheckTask."""
         return isinstance(task, CheckTask)
 
+    def _classify_refusals(self) -> bool:
+        """Resolve the provider-refusal rollback flag for this stage.
+
+        The stage's own ``resources.config`` is authoritative when it carries the
+        section (tests, embedding); otherwise the guarded global resolver applies
+        so an embedded caller cannot bypass the operator's flag (design D7).
+        """
+        provider_config = getattr(self.resources.config, "provider", None)
+        flag = getattr(provider_config, "classify_refusals", None)
+        if flag is None:
+            return client._configured_classify_refusals()
+        return bool(flag)
+
+    def _max_refusal_wait_s(self) -> float:
+        """Resolve the durability cap for a provider-basket deferral (design D3)."""
+        provider_config = getattr(self.resources.config, "provider", None)
+        value = getattr(provider_config, "max_refusal_wait_s", None)
+        if value is None:
+            return client._configured_max_refusal_wait_s()
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return client._configured_max_refusal_wait_s()
+        return value if value > 0 else client._configured_max_refusal_wait_s()
+
     def _execute_task(self, task: ProviderTask) -> Optional[StageOutput]:
         """Execute check task processing."""
         return self._check_worker(task)
@@ -722,6 +747,36 @@ class CheckStage(BasePipelineStage):
             # Apply rate limiting
             service_type = get_service_name(task.provider)
             if not self.resources.limiter.acquire(service_type):
+                if self._classify_refusals():
+                    # Our own provider basket starved: a deferral, never a task
+                    # fault (design D3/D7).  The wait is the basket's own refill
+                    # time, clamped by the durability cap; the worker NEVER sleeps
+                    # it (invariant 6) - the stage handler does, bounded again by
+                    # ``_effective_defer_wait``.  Nothing is reported to the
+                    # adaptive budget: no request was issued, so there is no
+                    # remote outcome to learn from.  ``stage_pause=False`` because
+                    # the basket is per provider (invariant 1).
+                    bucket = self.resources.limiter._get_bucket(service_type)
+                    base_rate = float(getattr(bucket, "rate", 0.0) or 0.0)
+                    cap = self._max_refusal_wait_s()
+                    wait = (1.0 / base_rate) if base_rate > 0 else cap
+                    wait = min(wait, cap)
+                    client._provider_refusal_stat_inc("deferred_provider_budget")
+                    logger.info(
+                        f"[{self.name}] provider basket starved; deferring {wait:.2f}s "
+                        f"for provider: {task.provider}"
+                    )
+                    raise RateLimitDeferral(
+                        f"provider limiter starved for provider: {task.provider}",
+                        wait_s=wait,
+                        stage_pause=False,
+                        reason=ErrorReason.RATE_LIMITED.name,
+                        provider=task.provider,
+                    )
+
+                # Legacy rollback path (design D7), byte-for-byte: sleep the
+                # basket wait in-thread, then raise the failure-empty that
+                # requeues and burns an attempt.
                 wait_time = self.resources.limiter.wait_time(service_type)
                 if wait_time > 0:
                     time.sleep(wait_time)
@@ -779,6 +834,12 @@ class CheckStage(BasePipelineStage):
                     output.add_result(task.provider, ResultType.INVALID.value, [task.service])
 
             return output
+
+        except RateLimitDeferral:
+            # A provider-basket starvation deferral must propagate so the worker
+            # loop defers the row through the durable queue; it is not a task
+            # fault, so no failure is reported (design D3/D7).
+            raise
 
         except TransientFetchError:
             # Limiter starvation: propagate so ``process_task`` applies the mode
@@ -922,8 +983,19 @@ class InspectStage(BasePipelineStage):
             # Add models to be saved
             if models:
                 output.add_models(task.provider, task.service.key, models)
+            else:
+                # A genuine empty answer is an outcome, not a silent drop: count
+                # it so an unrecognised refusal dialect shows up as an anomalous
+                # empty-answer rate instead of vanishing (design D8).
+                client._provider_refusal_stat_inc("inspect_empty_answers")
 
             return output
+
+        except RateLimitDeferral:
+            # A typed refusal must propagate (the worker loop defers it) and is
+            # counted as refused - never as an empty answer (design D8).
+            client._provider_refusal_stat_inc("inspect_refused")
+            raise
 
         except TransientFetchError:
             # Uniform contract (design D8): typed transient failures are handled
@@ -931,5 +1003,11 @@ class InspectStage(BasePipelineStage):
             raise
 
         except Exception as e:
-            logger.error(f"[{self.name}] inspect models error, provider: {task.provider}, task: {task}, message: {e}")
+            # Identify the task by its HASHED id: ``_generate_id`` deliberately
+            # hashes the secret because task ids are rendered in log lines, so
+            # this error path must never render the raw task payload (design D9).
+            logger.error(
+                f"[{self.name}] inspect models error, provider: {task.provider}, "
+                f"task: {self._generate_id(task)}, message: {e}"
+            )
             return None

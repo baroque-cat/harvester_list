@@ -16,6 +16,7 @@ import requests
 
 from constant.system import DEFAULT_QUESTION
 from core.enums import ErrorReason
+from core.exceptions import RateLimitDeferral
 from core.models import CheckResult, Condition
 from search.client import http_error_message, http_error_status, http_get, request
 from tools.logger import get_logger
@@ -236,6 +237,10 @@ class BedrockProvider(AIBaseProvider):
             else:
                 return 400, f"Unsupported method: {method}"
 
+        except RateLimitDeferral:
+            # A capacity refusal is a typed hand-off, not a server error: let it
+            # propagate instead of collapsing it into (500, str(e)) (design D10).
+            raise
         except Exception as e:
             logger.error(f"Request failed: {e}")
             return 500, str(e)

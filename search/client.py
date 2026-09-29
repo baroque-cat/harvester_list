@@ -227,10 +227,12 @@ from constant.system import (
     SERVICE_TYPE_GITHUB_RAW,
     SERVICE_TYPE_GITHUB_WEB,
 )
+from core.enums import ErrorReason
 from core.exceptions import NetworkError, RateLimitDeferral, TransientFetchError, ValidationError
 from core.models import RateLimitConfig
 from core.types import IAuthProvider
 from tools.coordinator import get_user_agent
+from tools.http_signals import is_capacity_refusal, wait_from_content, wait_from_headers
 from tools.ratelimit import RateLimiter
 from tools.resources import managed_network
 from tools.retry import network_retry
@@ -714,8 +716,9 @@ class GitHubClient:
                 raise NetworkError("Failed to decode response content")
 
     def _is_http_rate_limited(self, code: int, message: str) -> bool:
-        text = message or ""
-        return code == 429 or (code == 403 and bool(re.search(r"rate limit|abuse detection", text, re.I)))
+        # Delegates to the single shared rule (design D1) so the class client and
+        # the gather transport can never diverge.
+        return is_capacity_refusal(code, message)
 
     def _credential_from_headers(self, headers: Dict, service: Optional[str]) -> str:
         if service == SERVICE_TYPE_GITHUB_API:
@@ -735,46 +738,13 @@ class GitHubClient:
         return self._wait_from_content(content)
 
     def _wait_from_headers(self, headers: Dict[str, str]) -> Optional[float]:
-        normalized = {str(key).lower(): str(value) for key, value in headers.items()}
-        retry_after = trim(normalized.get("retry-after", ""))
-        if retry_after:
-            if retry_after.isdigit():
-                return float(retry_after)
-            try:
-                retry_at = parsedate_to_datetime(retry_after)
-                return max(0.0, retry_at.timestamp() - time.time())
-            except Exception:
-                pass
-
-        reset_at = trim(normalized.get("x-ratelimit-reset", ""))
-        if reset_at.isdigit():
-            return max(0.0, float(reset_at) - time.time())
-
-        return None
+        # Thin delegation: the shared implementation is the single source of
+        # truth (design D1); this name/signature is kept for existing callers.
+        return wait_from_headers(headers)
 
     def _wait_from_content(self, content: str) -> Optional[float]:
-        text = content or ""
-        try:
-            data = json.loads(content)
-            if isinstance(data, dict):
-                text = str(data.get("message", text))
-        except Exception:
-            pass
-
-        match = re.search(r"(?:retry after|try again in|wait)\s+(\d+)\s*(second|minute|hour)s?", text, flags=re.I)
-        if match:
-            value = float(match.group(1))
-            unit = match.group(2).lower()
-            if unit.startswith("hour"):
-                return value * 3600
-            if unit.startswith("minute"):
-                return value * 60
-            return value
-
-        if re.search(r"few minutes", text, flags=re.I):
-            return 180.0
-
-        return None
+        # Thin delegation (design D1).
+        return wait_from_content(content)
 
 
 # Global GitHub client instance.  A credential-less default keeps the gather
@@ -893,6 +863,10 @@ def http_get(
             status_code = response.status_code
 
             if status_code != 200:
+                # NOTE: unreachable for error codes because the module-level
+                # ``request()`` above calls ``raise_for_status()``, so a non-2xx
+                # already raised ``HTTPError`` and was classified in the handler
+                # below.  Left alone deliberately (do not "fix" dead code here).
                 raise NetworkError(f"HTTP {status_code} error for URL: {url}")
 
             # Decode content
@@ -908,6 +882,30 @@ def http_get(
         # Handle HTTP errors with basic classification
         code = http_error_status(e)
         reason = http_error_message(e)
+        response = getattr(e, "response", None)
+        response_headers = dict(response.headers) if response is not None else {}
+
+        # A capacity refusal carrying a PUBLISHED wait becomes a typed deferral,
+        # so the stage can hand the task back to the durable queue instead of
+        # hammering the remote or misreading a 403 as an auth failure (design
+        # D2/D4).  The transport never sleeps the wait itself (invariant 6).
+        if _configured_classify_refusals() and is_capacity_refusal(code, reason):
+            published = wait_from_headers(response_headers)
+            if published is None:
+                published = wait_from_content(reason)
+            if published is not None and published > 0:
+                wait = min(float(published), float(_configured_max_refusal_wait_s()))
+                _provider_refusal_stat_inc("refusals_rate_limit")
+                raise RateLimitDeferral(
+                    f"provider rate limit (HTTP {code}) for URL: {url}",
+                    wait_s=wait,
+                    reason=ErrorReason.RATE_LIMITED.name,
+                )
+            # A capacity refusal without a published wait keeps the legacy
+            # transient path (never the authentication classification): there is
+            # nothing to defer on (design D4/PRT-S2).
+            raise ConnectionError(f"Rate limit exceeded (HTTP {code})")
+
         if code == 429:
             # Rate limit errors should be retried
             raise ConnectionError(f"Rate limit exceeded (HTTP {code})")
@@ -1168,6 +1166,98 @@ def _configured_defer_local_suppression() -> bool:
     return bool(configured)
 
 
+# Built-in provider-refusal policy used when the operator configuration is
+# unreachable.  Kept identical to ``ProviderConfig``'s defaults so a config-less
+# caller and a fully configured one agree (design D7).
+_DEFAULT_CLASSIFY_REFUSALS = True
+_DEFAULT_MAX_REFUSAL_WAIT_S = 60.0
+
+
+def _configured_classify_refusals() -> bool:
+    """Resolve the operator-configured provider-refusal classification flag.
+
+    Mirrors :func:`_configured_gather_transport` / :func:`_configured_defer_local_suppression`:
+    the ``config`` import is deferred and fully guarded so this module keeps no
+    hard top-level dependency on ``config`` (no import cycle), and a caller that
+    never loaded ``config.yaml`` degrades to the built-in default rather than
+    raising ``RuntimeError``.  ``http_get`` resolves it here so an embedded caller
+    cannot silently bypass the operator's rollback flag (design D7).
+    """
+    try:
+        from config import get_config
+
+        configured = getattr(get_config().provider, "classify_refusals", _DEFAULT_CLASSIFY_REFUSALS)
+    except Exception:
+        return _DEFAULT_CLASSIFY_REFUSALS
+    return bool(configured)
+
+
+def _configured_max_refusal_wait_s() -> float:
+    """Resolve the operator-configured refusal-wait cap (durability invariant).
+
+    Guarded exactly like the sibling resolvers: a missing/unloadable config or a
+    malformed figure degrades to the built-in default instead of raising into a
+    worker.  The cap is validated strictly below ``queue.visibility_timeout_s``
+    by both ``__post_init__`` and :class:`ConfigValidator` (design D7).
+    """
+    try:
+        from config import get_config
+
+        configured = getattr(get_config().provider, "max_refusal_wait_s", _DEFAULT_MAX_REFUSAL_WAIT_S)
+    except Exception:
+        return _DEFAULT_MAX_REFUSAL_WAIT_S
+    try:
+        value = float(configured)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_REFUSAL_WAIT_S
+    return value if value > 0 else _DEFAULT_MAX_REFUSAL_WAIT_S
+
+
+# ---------------------------------------------------------------------------
+# Provider-refusal counter surface (provider-refusal-taxonomy, design D6)
+#
+# A refusal caused by capacity is not a task fault: it must be counted by class
+# and surfaced.  The key tuple is declared up front so the published schema is
+# stable and an undeclared counter is rejected loudly rather than silently
+# widening it.  Kept separate from ``_GATHER_TRANSPORT_STATS`` (which is the
+# GitHub surface's) so two pools never mix in one line.
+# ---------------------------------------------------------------------------
+_PROVIDER_REFUSAL_STAT_KEYS: Tuple[str, ...] = (
+    "refusals_rate_limit",
+    "refusals_quota",
+    "refusals_auth",
+    "refusals_transient",
+    "deferred_provider_budget",
+    "inspect_refused",
+    "inspect_empty_answers",
+)
+
+_PROVIDER_REFUSAL_STATS: Dict[str, int] = {key: 0 for key in _PROVIDER_REFUSAL_STAT_KEYS}
+
+
+def reset_provider_refusal_stats() -> None:
+    """Reset the provider-refusal counters in place (tests / fresh runs)."""
+    for key in _PROVIDER_REFUSAL_STAT_KEYS:
+        _PROVIDER_REFUSAL_STATS[key] = 0
+
+
+def get_provider_refusal_stats() -> Dict[str, int]:
+    """Expose the provider-refusal counters as a flat ``Dict[str, int]``."""
+    return dict(_PROVIDER_REFUSAL_STATS)
+
+
+def _provider_refusal_stat_inc(key: str, amount: int = 1) -> None:
+    """Increment a declared provider-refusal counter, rejecting unknown keys.
+
+    Unlike the gather helper (which logs and drops an undeclared key), an
+    undeclared provider-refusal key is a programming error and is raised so a
+    typo can never silently widen the published surface (design D6).
+    """
+    if key not in _PROVIDER_REFUSAL_STATS:
+        raise ValueError(f"undeclared provider refusal counter: {key}")
+    _PROVIDER_REFUSAL_STATS[key] = _PROVIDER_REFUSAL_STATS.get(key, 0) + int(amount)
+
+
 def _split_blob_ref_path(parts: List[str]):
     """Split ``<ref>/<path>`` segments extracted after ``/blob/``.
 
@@ -1274,58 +1364,31 @@ def gather_target_url(url: Any, transport: str) -> Optional[str]:
 
 
 def _gather_wait_from_headers(headers: Dict[str, str]) -> Optional[float]:
-    """Read a published finite wait from ``Retry-After`` / ``X-RateLimit-Reset``."""
-    normalized = {str(key).lower(): str(value) for key, value in (headers or {}).items()}
-    retry_after = trim(normalized.get("retry-after", ""))
-    if retry_after:
-        if retry_after.isdigit():
-            return float(retry_after)
-        try:
-            return max(0.0, parsedate_to_datetime(retry_after).timestamp() - time.time())
-        except Exception:
-            pass
+    """Read a published finite wait from ``Retry-After`` / ``X-RateLimit-Reset``.
 
-    reset_at = trim(normalized.get("x-ratelimit-reset", ""))
-    if reset_at.isdigit():
-        return max(0.0, float(reset_at) - time.time())
-    return None
+    Thin delegation to the shared, single-source predicate (design D1): the
+    gather surface's observable behavior is unchanged, it simply reads the rule
+    from ``tools.http_signals`` instead of its own private copy.
+    """
+    return wait_from_headers(headers)
 
 
 def _gather_wait_from_content(content: str) -> Optional[float]:
-    """Parse a human-readable wait out of a refusal body (fallback only)."""
-    text = content or ""
-    try:
-        data = json.loads(content)
-        if isinstance(data, dict):
-            text = str(data.get("message", text))
-    except Exception:
-        pass
+    """Parse a human-readable wait out of a refusal body (fallback only).
 
-    match = re.search(r"(?:retry after|try again in|wait)\s+(\d+)\s*(second|minute|hour)s?", text, flags=re.I)
-    if match:
-        value = float(match.group(1))
-        unit = match.group(2).lower()
-        if unit.startswith("hour"):
-            return value * 3600
-        if unit.startswith("minute"):
-            return value * 60
-        return value
-    if re.search(r"few minutes", text, flags=re.I):
-        return 180.0
-    return None
+    Thin delegation (design D1).
+    """
+    return wait_from_content(content)
 
 
 def _gather_is_rate_limit_signal(status: int, reason: str) -> bool:
     """True when a refusal carries rate-limit semantics (not a bare auth error).
 
-    Reuses the marker vocabulary of the class client's ``_is_http_rate_limited``
-    without touching the shared detectors globally (design D4).
+    Thin delegation to the shared, single-source predicate (design D1/D4); the
+    marker vocabulary is now defined once in ``tools.http_signals`` so the
+    provider and gather surfaces cannot drift apart.
     """
-    if status == 429:
-        return True
-    if status == 403 and re.search(r"rate limit|abuse detection|secondary rate limit", reason or "", re.I):
-        return True
-    return False
+    return is_capacity_refusal(status, reason)
 
 
 def _gather_is_secondary(reason: str) -> bool:

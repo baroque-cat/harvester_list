@@ -2,7 +2,7 @@
 
 Traceability: failure-handling-S4, S5, S6, S9, S10, S11, S12, S13, S14.
 
-Harness: SearchStage/CheckStage are invoked with a mocked search client that
+Harness: SearchStage is invoked with a mocked search client that
 raises the typed transient failure; the tri-mode flag is set on
 ``config.pipeline.failure_handling`` (design D3). No network.
 
@@ -22,10 +22,10 @@ import pytest
 
 from config.schemas import Config, StageConfig, TaskConfig
 from core.exceptions import TransientFetchError  # RED driver: absent pre-fix
-from core.models import Patterns, SearchTask, Service
+from core.models import Patterns, SearchTask
 from search import client as search_client
 from stage.base import StageResources
-from stage.definition import CheckStage, SearchStage
+from stage.definition import SearchStage
 from stage.factory import TaskFactory
 from tools.state import GithubCredentialLimited
 
@@ -193,65 +193,19 @@ def test_s5_dedup_gate_admits_bounded_requeue():
 
 
 # ---------------------------------------------------------------------------
-# failure-handling-S9
+# failure-handling-S9 - REMOVED, superseded by fix-provider-failure-classification
+#
+# `test_s9_starved_check_requeues_instead_of_dropping` pinned the pre-change
+# contract: provider-basket starvation in the check stage raised
+# `TransientFetchError`, so the row was requeued and burned an attempt.  That
+# classification is now the defect itself (main spec `failure-handling`,
+# requirement "Check tasks survive limiter starvation"): starvation is a
+# deferral, not a task failure.  The legacy behavior survives only behind the
+# rollback flag `provider.classify_refusals: false` and is pinned there instead
+# by `tests/test_pfc_check_starve.py::test_fh4_s3_legacy_starvation_returns_with_the_rollback_flag`
+# and `::test_prt_s13_flag_off_restores_the_legacy_transport_classification`.
+# Deleted rather than weakened, per the house TDD rule.
 # ---------------------------------------------------------------------------
-class _StarvingLimiter:
-    def acquire(self, service):
-        return False
-
-    def wait_time(self, service):
-        return 0.01
-
-    def report_result(self, *args, **kwargs):
-        pass
-
-    def _get_bucket(self, service):
-        return None
-
-
-def test_s9_starved_check_requeues_instead_of_dropping(monkeypatch):
-    from core.types import IProvider
-    from core.models import CheckResult, ResultStorage
-
-    class FakeProvider(IProvider):
-        @property
-        def name(self):
-            return PROVIDER
-
-        @property
-        def conditions(self):
-            return []
-
-        @property
-        def result(self):
-            return ResultStorage()
-
-        def get_patterns(self):
-            return Patterns(key_pattern=KEY_PATTERN)
-
-        def check(self, token, address="", endpoint="", model="", **kwargs):
-            return CheckResult(available=False)
-
-        def inspect(self, token, address="", endpoint="", **kwargs):
-            return []
-
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-    stage = CheckStage(
-        _resources("strict", limiter=_StarvingLimiter(), providers={PROVIDER: FakeProvider()}),
-        lambda out: None,
-        thread_count=1,
-        max_retries=2,
-    )
-    task = TaskFactory.create_check_task(
-        PROVIDER, Service(address="https://api.x", endpoint="/v1", key="k-1", model="m")
-    )
-
-    # Pre-fix: returns None (silent drop). Contract: typed failure escapes so the
-    # worker loop requeues it within bounds.
-    with pytest.raises(TransientFetchError):
-        stage.process_task(task)
-
-
 # ---------------------------------------------------------------------------
 # failure-handling-S13
 # ---------------------------------------------------------------------------

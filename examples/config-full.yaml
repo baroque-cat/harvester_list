@@ -385,6 +385,28 @@ gather:
   #          no code change or data migration.
   defer_local_suppression: true
 
+# LLM-provider refusal classification (fix-provider-failure-classification)
+# A capacity refusal on the provider surface (check/inspect stages) is a typed
+# deferral, never a task failure: recognised by the same one wire-signal rule the
+# gather surface uses, counted by class, and handed to the durable-queue DEFER
+# seam when it publishes a resumption time.
+provider:
+  # true  (default): a 429/403-with-limit-marker carrying a published wait (or a
+  #          starved own provider basket in `check`) raises RateLimitDeferral with
+  #          a bounded wait; attempts/created_at/dedup identity preserved; counted
+  #          by class; never reported to the adaptive budget.
+  # false: the legacy classification byte-for-byte - a published-wait 429 stays a
+  #          retryable transient and a starved check re-enqueues with its attempt
+  #          count incremented. One flag governs both halves (config-flip
+  #          rollback; no code change or data migration). Non-boolean rejected
+  #          loudly by the loader and validator.
+  classify_refusals: true
+  # Bounded refusal wait in seconds (> 0). MUST be strictly below
+  # queue.visibility_timeout_s when backend is sqlite: the durable queue has no
+  # claim renewal, so a longer wait would let the claimed row be re-delivered and
+  # run twice. The validator rejects a contradictory pair loudly.
+  max_refusal_wait_s: 60.0
+
 # Credential liveness (fix-credential-liveness)
 # Bounds every wait for a pooled GitHub credential and routes exhaustion to the
 # durable task-deferral seam (bounded pause, attempts preserved, never dropped)

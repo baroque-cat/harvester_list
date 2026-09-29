@@ -38,6 +38,21 @@ _RENDERED_METRIC_SURFACES = (
     "recheck_metrics",
     "credential_metrics",
     "prioritization_metrics",
+    "provider_refusal_metrics",
+)
+
+
+# The declared provider-refusal counters, rendered in this exact order.  An
+# explicit allowlist (never ``dict.items()``) so an unexpected/secret-bearing key
+# in the surface can never widen operator output (design D6).
+_PROVIDER_REFUSAL_RENDER_KEYS = (
+    "refusals_rate_limit",
+    "refusals_quota",
+    "refusals_auth",
+    "refusals_transient",
+    "deferred_provider_budget",
+    "inspect_refused",
+    "inspect_empty_answers",
 )
 
 
@@ -346,6 +361,7 @@ class StatusDisplayEngine:
         aggregation_line = self._format_aggregation_metrics_line(status)
         refine_line = self._format_refine_metrics_line(status)
         credential_line = self._format_credential_metrics_line(status)
+        provider_refusal_line = self._format_provider_refusal_metrics_line(status)
 
         if not status.pipeline.stages:
             lines.append("No pipeline data available")
@@ -371,6 +387,8 @@ class StatusDisplayEngine:
                 lines.append(refine_line)
             if credential_line:
                 lines.append(credential_line)
+            if provider_refusal_line:
+                lines.append(provider_refusal_line)
             return lines
 
         # Table header
@@ -426,6 +444,9 @@ class StatusDisplayEngine:
 
         if credential_line:
             lines.append(credential_line)
+
+        if provider_refusal_line:
+            lines.append(provider_refusal_line)
 
         return lines
 
@@ -671,6 +692,28 @@ class StatusDisplayEngine:
             f"emergency={metric_int(metrics.get('emergency_trips'))} "
             f"blocking={metric_int(metrics.get('blocking_mode_active'))}"
         )
+
+    @staticmethod
+    def _format_provider_refusal_metrics_line(status: SystemStatus) -> str:
+        """Render the provider-refusal counters by class (design D6).
+
+        Reads only the declared keys, degrades malformed figures fail-open via
+        ``_metric_int``, and renders nothing when the surface is empty (RO-S2
+        spirit) so a run with no refusals shows no line.
+        """
+        metrics = getattr(status.pipeline, "provider_refusal_metrics", None)
+        if not metrics:
+            return ""
+        metric_int = StatusDisplayEngine._metric_int
+        figures = {key: metric_int(metrics.get(key)) for key in _PROVIDER_REFUSAL_RENDER_KEYS}
+        if not any(figures.values()):
+            # The published surface always carries its full declared key set (zeros
+            # before any refusal), so "empty" means all-zero: render nothing rather
+            # than a zero-filled placeholder, exactly as the ``Gather:`` renderer
+            # does (RO-S2 spirit, gate row B2).
+            return ""
+        body = " ".join(f"{key}={figures[key]}" for key in _PROVIDER_REFUSAL_RENDER_KEYS)
+        return f"ProviderRefusals: {body}"
 
     def _format_provider_section(self, status: SystemStatus) -> List[str]:
         """Format provider section with table-like layout"""

@@ -1768,6 +1768,69 @@ detector. Under `raw`/`rest` there is no rendered markup, so `file_commit_date`
 is NULL by construction with no parse attempt (current GitHub serves no
 `datetime=` attributes anyway).
 
+### Provider refusal classification (`provider`)
+
+A capacity refusal encountered while talking to an LLM provider (the `check`
+and `inspect` stages) is a deferral, never a task fault: it is recognised by
+the same one wire-signal rule the gather surface uses, counted by class, and —
+when it publishes a resumption time — handed to the durable-queue DEFER seam so
+no retry attempt is burned (`fix-provider-failure-classification`).
+
+```yaml
+provider:
+  classify_refusals: true   # true (default) = refusal is a deferral; false = legacy classification (rollback)
+  max_refusal_wait_s: 60.0  # bounded refusal wait; must be < queue.visibility_timeout_s under sqlite
+```
+
+**One signal, two surfaces.** A 429, or a 403 carrying a rate-limit / abuse
+marker, is classified by the shared predicate in `tools/http_signals.py` — the
+same rule the gather transport delegates to — so one response can never yield a
+deferral on one surface and an authentication failure on the other. A 403 with
+no throttling marker stays an authentication failure exactly as before.
+
+**A published wait travels on the signal; it is never slept in the transport.**
+The transport raises the typed `RateLimitDeferral` with the wait it read
+(`Retry-After`, `X-RateLimit-Reset`, or a wait in the body), clamped by
+`max_refusal_wait_s`; the stage performs the bounded wait and defers the task
+through the durable queue with `attempts`, `created_at` and dedup identity
+unchanged. A refusal with **no** published wait keeps the legacy retryable
+transient path (there is nothing to defer on), never the authentication path.
+The typed signal is neither retried by the retry policy nor absorbed by the
+fail-open `_fetch_models` wrapper (`exclude=`).
+
+**Our own provider basket starving `check` is a deferral too.** When the
+per-provider basket cannot hand out a token, the check worker raises the typed
+deferral with the basket's own refill time (`1 / base_rate`, clamped) and
+`stage_pause=false` — the basket belongs to one provider, so pausing every
+provider's validation to protect one starved basket would idle healthy capacity.
+The wait is not slept inside the claimed task (invariant 6); it is counted in
+`deferred_provider_budget` and **nothing** is reported to the adaptive budget,
+because no request was issued.
+
+**Rollback is a flag flip — the only mechanism.**
+`provider.classify_refusals: false` restores the pre-change classification
+byte-for-byte: the starved check is re-enqueued through the bounded-retry path
+with its attempt count incremented, a published-wait 429 stays the legacy
+retryable transient, and every refusal counter stays at zero. One flag governs
+both halves, so a half-rollback cannot keep the destructive half. A non-boolean
+value is rejected loudly by the loader and validator; `false` is otherwise
+silent.
+
+**Durability invariant `max_refusal_wait_s < queue.visibility_timeout_s`.** The
+durable queue exposes no claim-renewal API, so `provider.max_refusal_wait_s` is
+validated as strictly below `queue.visibility_timeout_s` (when
+`queue.backend: sqlite`); a deferred task circulates bounded by the queue's
+`max_age_hours` age gate.
+
+**Observability.** `get_provider_refusal_stats()` (also published on the
+`PipelineStatus` surface as `provider_refusal_metrics`) exposes flat integer
+counters: `refusals_rate_limit`, `refusals_quota`, `refusals_auth`,
+`refusals_transient`, `deferred_provider_budget`, `inspect_refused`,
+`inspect_empty_answers`. When non-empty they render as one allowlisted
+`ProviderRefusals:` line in detailed status (absent when empty). `inspect`
+identifies a refused or failed task by its hashed id, never its raw payload, so
+no token or cookie can reach a log line.
+
 ### Credential liveness (`credential_liveness`)
 
 Every wait for a pooled GitHub credential is bounded, accounted, and — when the

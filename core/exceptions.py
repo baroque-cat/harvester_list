@@ -65,6 +65,12 @@ class RateLimitDeferral(NetworkError):
     ``wait_s`` is the bounded, published resumption wait; ``stage_pause`` marks
     an actor-scoped (abuse/secondary) refusal that should pause the whole stage,
     not just re-enqueue this task.
+
+    ``reason`` is the :class:`ErrorReason` *name* the refusal belongs to
+    (``RATE_LIMITED`` for a remote capacity refusal), so the counters can be
+    keyed by the existing vocabulary rather than free text; ``provider`` is the
+    optional provider/service hint the refusal was raised for.  Both default to
+    ``None`` so every pre-existing call site and pin is unaffected (design D2).
     """
 
     def __init__(
@@ -72,11 +78,15 @@ class RateLimitDeferral(NetworkError):
         message: str,
         wait_s: float = 0.0,
         stage_pause: bool = False,
+        reason: Optional[str] = None,
+        provider: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(message=message, **kwargs)
         self.wait_s = float(wait_s)
         self.stage_pause = bool(stage_pause)
+        self.reason = reason
+        self.provider = provider
 
 
 class ValidationError(BaseError):

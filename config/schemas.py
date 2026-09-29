@@ -672,6 +672,41 @@ class GatherConfig:
 
 
 @dataclass
+class ProviderConfig:
+    """LLM-provider refusal-classification configuration.
+
+    ``classify_refusals`` (default ``True``, the fixed behavior) governs whether a
+    capacity refusal on the provider surface is deferred through the durable
+    queue and counted by class; ``False`` is the single-flag rollback position
+    that restores the legacy classification byte-for-byte - including the failure
+    report to the adaptive budget and the burned retry attempt - so a
+    half-rollback cannot keep the destructive half (design D7).
+
+    ``max_refusal_wait_s`` caps any deferral wait so it can never exceed the
+    durable queue visibility window; the cross-section invariant is validated by
+    :class:`ConfigValidator` under ``queue.backend: sqlite``.
+    """
+
+    classify_refusals: bool = True
+    max_refusal_wait_s: float = 60.0
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_provider_config on purpose: this
+        # guards direct (non-loader) construction in tests and embedding.
+        # A non-bool must raise, not coerce: the flag selects a behavioral
+        # contract, so a truthy string is a configuration error the operator
+        # must see (design D7).
+        if not isinstance(self.classify_refusals, bool):
+            raise ValueError(
+                f"provider.classify_refusals must be a boolean (got: {self.classify_refusals!r})"
+            )
+
+        self.max_refusal_wait_s = float(self.max_refusal_wait_s)
+        if self.max_refusal_wait_s <= 0:
+            raise ValueError("provider.max_refusal_wait_s must be positive")
+
+
+@dataclass
 class CredentialLivenessConfig:
     """Credential-liveness / bounded-wait configuration (fix-credential-liveness).
 
@@ -844,6 +879,7 @@ class Config:
     queue: TaskQueueConfig = field(default_factory=TaskQueueConfig)
     gather: GatherConfig = field(default_factory=GatherConfig)
     credential_liveness: CredentialLivenessConfig = field(default_factory=CredentialLivenessConfig)
+    provider: ProviderConfig = field(default_factory=ProviderConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -881,6 +917,7 @@ class Config:
             "queue": self._dataclass_to_dict(self.queue),
             "gather": self._dataclass_to_dict(self.gather),
             "credential_liveness": self._dataclass_to_dict(self.credential_liveness),
+            "provider": self._dataclass_to_dict(self.provider),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

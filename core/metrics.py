@@ -230,6 +230,11 @@ class PipelineStatus:
     # blocking-mode flag); empty until first populated.
     credential_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # LLM-provider refusal counters by class, plus the own-basket starvation
+    # deferral and inspect-stage refused/empty-answer counts
+    # (fix-provider-failure-classification, design D6); empty until populated.
+    provider_refusal_metrics: Dict[str, Any] = field(default_factory=dict)
+
     # Optional top-N priority candidates (empty while display_top_n == 0).
     prioritization_metrics: Dict[str, Any] = field(default_factory=dict)
 

@@ -23,6 +23,8 @@ import time
 from abc import ABC, abstractmethod
 from typing import Callable, Tuple, Type
 
+from core.exceptions import RateLimitDeferral
+
 from .logger import get_logger
 
 logger = get_logger("retry")
@@ -49,6 +51,12 @@ class RetryCore:
             bool: True if error should trigger retry
         """
         if attempt >= max_retries:
+            return False
+
+        # A typed rate-limit deferral is a hand-off to the stage, never a retry:
+        # the decision is by TYPE, not by the words "rate limit" in the message
+        # (design D5).  Must precede the text match below.
+        if isinstance(error, RateLimitDeferral):
             return False
 
         # Retry on network and timeout errors

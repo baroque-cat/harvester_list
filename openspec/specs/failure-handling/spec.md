@@ -78,11 +78,19 @@ A gather outcome SHALL be recorded as successful in the persistent registry only
 - **THEN** no `visit_status` transition and no `link_coverage` row are written for that attempt, and the link remains eligible for a future gather decision exactly as if it had not been attempted
 
 ### Requirement: Check tasks survive limiter starvation
-When the provider-side rate-limit bucket cannot be acquired even after the scheduled wait, the check task SHALL be re-enqueued through the bounded-retry path instead of being dropped, so no harvested key silently loses its validation.
+When the provider-side rate-limit bucket cannot be acquired even after the scheduled wait, the check task SHALL be **deferred** through the durable-queue deferral seam instead of being re-enqueued as a failure, so no harvested key silently loses its validation *and* no retry attempt is consumed by a condition the task did not cause. The deferral SHALL preserve the task's identity and age (`attempts`, `created_at`, deduplication key), SHALL be counted in a dedicated own-basket counter that is separate from remote refusals, and SHALL NOT be reported to the adaptive budget, because no request was issued. The wait carried by the deferral SHALL be derived from the basket's own refill time and clamped by the configured cap. The stage SHALL NOT pause as a whole: the basket belongs to one provider, so pausing every provider's validation to protect one starved basket would idle healthy capacity.
 
-#### Scenario: Starved check requeues
-- **WHEN** a check task finds its provider limiter bucket unavailable after waiting
-- **THEN** the task is re-enqueued with attempts incremented (bounded), and no silent completion is recorded
+#### Scenario: Starved check defers without burning an attempt
+- **WHEN** a check task finds its provider limiter bucket unavailable after the scheduled wait
+- **THEN** the task is deferred with its `attempts`, `created_at` and deduplication identity unchanged, no failure-empty and no task error is recorded, nothing is written to the registry, and no silent completion occurs
+
+#### Scenario: Starvation is counted apart from a remote refusal
+- **WHEN** a check task is deferred because our own provider basket was empty
+- **THEN** the dedicated own-basket counter advances while the remote rate-limit deferral counter does not, and the adaptive budget receives no report for an request that was never issued
+
+#### Scenario: Legacy starvation classification returns with the rollback flag
+- **WHEN** the provider classification flag is false and a check task is starved by its provider basket
+- **THEN** the task is re-enqueued through the bounded-retry path with attempts incremented exactly as before this change, and the own-basket deferral counter stays at zero
 
 ### Requirement: Tri-mode rollout flag
 The failure-handling contract SHALL be governed by a configuration flag with three modes: `legacy` (behavior byte-equivalent to the pre-change system, with the new detection counters inert — present but zero, never incremented — the pure rollback state), `shadow` (failure-empties detected, counted and logged with stage/provider/task context, while task outcomes remain exactly as in legacy), and `strict` (full enforcement of propagation, requeue and fidelity requirements above). Default at release: `shadow`. Switching modes SHALL require only a configuration change, never code removal.

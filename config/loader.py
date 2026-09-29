@@ -39,6 +39,7 @@ from .schemas import (
     PersistenceConfig,
     PipelineConfig,
     PrioritizationConfig,
+    ProviderConfig,
     RecheckConfig,
     RefineGovernorConfig,
     RegistryConfig,
@@ -176,6 +177,10 @@ class ConfigLoader:
         # Parse credential-liveness / bounded-wait configuration
         if "credential_liveness" in data:
             config.credential_liveness = self._parse_credential_liveness_config(data["credential_liveness"])
+
+        # Parse LLM-provider refusal-classification configuration
+        if "provider" in data:
+            config.provider = self._parse_provider_config(data["provider"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -539,6 +544,24 @@ class ConfigLoader:
             max_wait_s=data.get("max_wait_s", 60.0),
             early_release=data.get("early_release", True),
             emergency_threshold=data.get("emergency_threshold", 3),
+        )
+
+    def _parse_provider_config(self, data: Dict[str, Any]) -> ProviderConfig:
+        """Parse the LLM-provider refusal-classification configuration section.
+
+        Unknown keys are ignored like the sibling parse methods; validation is
+        delegated to the dataclass ``__post_init__``.  Bool only: a truthy string
+        is rejected rather than coerced (design D7).
+
+        Args:
+            data: Provider configuration data
+
+        Returns:
+            ProviderConfig: Parsed provider configuration
+        """
+        return ProviderConfig(
+            classify_refusals=data.get("classify_refusals", True),
+            max_refusal_wait_s=data.get("max_refusal_wait_s", 60.0),
         )
 
     # Dead adaptive coefficients removed by fix-credential-liveness (design D9).
