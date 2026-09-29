@@ -20,6 +20,11 @@ from core.types import IProvider
 
 REGISTRY_FILENAME = "registry.sqlite"
 
+# Session log sink created by ``pytest_configure`` and removed by
+# ``pytest_sessionfinish`` (AGENTS.md §1: ``/tmp`` is a small tmpfs, so a suite
+# run must not leave its logs behind).
+_SESSION_LOGS_DIR: Optional[Path] = None
+
 
 def pytest_configure(config):
     """Scope the log sink to this test session (ROI-S12/ROI-S13, design D10).
@@ -38,6 +43,8 @@ def pytest_configure(config):
     import tools.logger as lg
 
     session_logs = Path(tempfile.mkdtemp(prefix="pytest-logs-"))
+    global _SESSION_LOGS_DIR
+    _SESSION_LOGS_DIR = session_logs
     lg.Logger._logs_dir = session_logs
     lg.Logger._file_handler = None
     lg.Logger._module_handlers.clear()
@@ -51,6 +58,32 @@ def pytest_configure(config):
         for handler in list(logger_obj.handlers):
             if isinstance(handler, _logging.FileHandler):
                 logger_obj.removeHandler(handler)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Delete the session log sink so a suite run leaves nothing on the tmpfs.
+
+    ``/tmp`` on this host is a small tmpfs backed by RAM (AGENTS.md §1).  The
+    sink holds every per-module log file the suite produced — measured at ~5.5 MB
+    per full run — and nothing else reclaims it, so the directory is removed
+    here.  Deleting after the session is safe: the handlers are already closed by
+    ``shutdown_logging()`` in ``tests/test_roi_shutdown.py`` or are flushed by
+    ``logging``'s own atexit hook, and an unlink on an open descriptor is
+    harmless on Linux.
+    """
+    global _SESSION_LOGS_DIR
+
+    target, _SESSION_LOGS_DIR = _SESSION_LOGS_DIR, None
+    if target is None:
+        return
+
+    import shutil
+    import tempfile
+
+    # Defensive: only ever remove a directory this module created under the
+    # system temp dir with the expected prefix.
+    if target.name.startswith("pytest-logs-") and Path(tempfile.gettempdir()) in target.parents:
+        shutil.rmtree(target, ignore_errors=True)
 
 
 def _registry_path(workspace: str) -> str:

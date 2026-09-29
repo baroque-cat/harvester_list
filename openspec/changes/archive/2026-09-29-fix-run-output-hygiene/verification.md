@@ -79,3 +79,24 @@ fix. A future gate should read the schema, not the runbook, for column names.
 in the run root; operator-credential scan 0; `df -h /tmp` back to its pre-task 7 %;
 repository `data/` and `logs/` untouched; `git status --short` shows only the
 intended modifications plus the pre-existing `?? examples/harvester.service`.
+
+### 5.1 Addendum (found during post-archive cleanup)
+
+The "`df -h /tmp` back to its pre-task level" claim in §5 was **imprecise as
+first written**: the percentage returned to 7 %, but the absolute figure was
+405 MB against 391 MB pre-task. The 14 MB delta was traced to this change's own
+`pytest_configure` hook, which created the session log sink with
+`tempfile.mkdtemp(prefix="pytest-logs-")` and never removed it — measured at
+**~5.5 MB per full-suite run**, and 27 MB had accumulated over the seven runs
+performed while implementing and verifying.
+
+This is a defect introduced by the change, not a pre-existing condition, and
+AGENTS.md §1 rule 4 is explicit that `/tmp` is a small RAM-backed tmpfs whose
+level must be checked after every run. Fixed in a follow-up commit by adding a
+`pytest_sessionfinish` hook that removes the directory, guarded so it can only
+ever delete a `pytest-logs-*` path this module created directly under the system
+temp dir. Verified: 461 passed, zero `pytest-logs-*` directories remain after a
+full run, repository `logs/` still empty, `/tmp` back to 392 MB.
+
+Recorded append-only rather than by editing §5, so the original (over-optimistic)
+hygiene claim stays visible next to its correction.
