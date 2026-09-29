@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 
 from constant.system import DEFAULT_QUESTION
 from core.enums import ErrorReason
+from core.exceptions import RateLimitDeferral
 from core.models import CheckResult, Condition
 from search.client import chat, http_get
 from tools.logger import get_logger
@@ -322,6 +323,10 @@ class VertexProvider(AIBaseProvider):
                         elif display_name:
                             models.append(display_name)
 
+            except RateLimitDeferral:
+                # A typed capacity refusal must reach the stage, not be folded
+                # into "this publisher has no models" (PRT-S17, design D6).
+                raise
             except Exception as e:
                 logger.debug(f"Failed to get models from publisher {publisher}: {e}")
                 continue
@@ -350,6 +355,9 @@ class VertexProvider(AIBaseProvider):
                                 parts = name.split("/")
                                 if len(parts) >= 6 and parts[-2] == "models":
                                     models.append(parts[-1])
+            except RateLimitDeferral:
+                # Same contract as the publisher loop above (PRT-S17, design D6).
+                raise
             except Exception as e:
                 logger.error(f"Failed to get models from general endpoint: {e}")
 

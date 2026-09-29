@@ -10,6 +10,7 @@ real objects, network stubbed at the client seam only.
 """
 
 import json
+import queue
 import threading
 import time
 
@@ -171,21 +172,35 @@ def test_s18_a_deferred_task_is_never_executed_twice(tmp_path, monkeypatch):
             while True:
                 try:
                     t = stage.queue.get(timeout=0.2)
-                except Exception:
-                    return
-                snap = stage.queue._conn.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE state='claimed'"
-                ).fetchone()[0]
+                except queue.Empty:
+                    return  # the intended stop condition: nothing left to claim
+                # The snapshot must be taken under the queue's own condition: the
+                # consumer threads share ONE sqlite3 connection with the claim
+                # path, so a bare `_conn.execute` here could interleave with
+                # `_claim_locked()` in the other consumer.  That race killed a
+                # thread with an unhandled sqlite error and left the victim never
+                # executed, which surfaced as a mysterious `assert 0 >= 2`
+                # roughly one full-suite run in eight.
+                with stage.queue._cond:
+                    snap = stage.queue._conn.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE state='claimed'"
+                    ).fetchone()[0]
                 claimed_concurrently.append(snap)
+                deferred = None
                 try:
                     sc.fetch_gather_content(t.url, transport="raw", max_refusal_wait_s=0.5)
                 except RateLimitDeferral as d:
                     time.sleep(min(d.wait_s, 0.5))  # bounded sleep INSIDE the claim
                     # DEFER: dedicated seam - put_task's dedup gate rejects an
                     # attempts==0 re-enqueue, and a deferral must not touch attempts.
-                    assert stage.defer_task(t) is True
+                    deferred = stage.defer_task(t)
                 except Exception:
                     pass
+                # Asserted OUTSIDE the broad handler above: an AssertionError is an
+                # Exception, so leaving it inside meant a failed deferral was
+                # silently dropped along with the task.
+                if deferred is not None:
+                    assert deferred is True, "deferral failed; the victim would be lost"
                 stage.queue.task_done()
 
         threads = [threading.Thread(target=consumer, daemon=True) for _ in range(2)]

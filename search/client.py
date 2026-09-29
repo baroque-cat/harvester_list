@@ -11,6 +11,7 @@ import itertools
 import json
 import random
 import re
+import threading
 import time
 import traceback
 import urllib.parse
@@ -232,7 +233,13 @@ from core.exceptions import NetworkError, RateLimitDeferral, TransientFetchError
 from core.models import RateLimitConfig
 from core.types import IAuthProvider
 from tools.coordinator import get_user_agent
-from tools.http_signals import is_capacity_refusal, wait_from_content, wait_from_headers
+from tools.http_signals import (
+    LIMIT_MARKERS,
+    is_capacity_refusal,
+    is_quota_refusal,
+    wait_from_content,
+    wait_from_headers,
+)
 from tools.ratelimit import RateLimiter
 from tools.resources import managed_network
 from tools.retry import network_retry
@@ -628,12 +635,11 @@ class GitHubClient:
         except Exception:
             pass
 
-        patterns = [
-            r"rate limit",
-            r"secondary rate limit",
-            r"abuse detection",
-        ]
-        return any(re.search(pattern, text, flags=re.I) for pattern in patterns)
+        # One vocabulary, one definition: the markers the refusal classifier uses
+        # (``tools.http_signals.LIMIT_MARKERS``).  A private copy of these three
+        # phrases is how the two surfaces came to disagree in the first place, so
+        # keeping a second list here is a test failure (PRT-S16, design D7).
+        return bool(LIMIT_MARKERS.search(text))
 
     def _http_get(
         self,
@@ -804,7 +810,29 @@ def log_github_stats() -> None:
         )
 
 
-@network_retry
+def _tagged_refusal(error: BaseException, refusal_class: Optional[str]) -> BaseException:
+    """Mark an exception with its refusal class, or return it untouched.
+
+    The classification happens per attempt inside :func:`_http_get_once`, but a
+    refusal is a property of the CALL, not of the attempt: a 503 that the retry
+    policy burns three attempts on is one refusal, not three (PRT-S21).  Carrying
+    the class on the exception lets the outer :func:`http_get` count exactly the
+    outcome that escaped, whichever attempt produced it.
+
+    ``refusal_class`` is ``None`` whenever the rollback flag is off or the status
+    is not a refusal at all, which makes this a no-op on every legacy path
+    (design D1/D4).  Setting the attribute is guarded because an exception type
+    with ``__slots__`` would otherwise turn a counting concern into a failure.
+    """
+    if not refusal_class:
+        return error
+    try:
+        error.refusal_class = refusal_class
+    except Exception:  # pragma: no cover - exotic exception types
+        pass
+    return error
+
+
 def http_get(
     url: str,
     headers: Optional[Dict] = None,
@@ -813,7 +841,12 @@ def http_get(
     interval: float = 1.0,
     timeout: float = 10,
 ) -> str:
-    """HTTP GET request with configurable retry handling
+    """HTTP GET request with configurable retry handling — the PROVIDER transport.
+
+    GitHub traffic does not come through here: it uses ``GitHubClient._http_get``,
+    which has its own handler.  Every refusal class counted by this function is
+    therefore a provider refusal, which is what the rendered ``ProviderRefusals``
+    line claims (fix-provider-refusal-counters, design D5).
 
     Args:
         url: URL to request
@@ -832,12 +865,40 @@ def http_get(
         FileNotFoundError: For access resource not exists
         ConnectionError: For connection failures (will be retried)
         TimeoutError: For timeout errors (will be retried)
+        RateLimitDeferral: a capacity refusal that published a resumption time
 
     Note:
         The @network_retry decorator automatically extracts retries and interval
         parameters to configure retry behavior dynamically. Retry logic uses
         exponential backoff with jitter for optimal performance.
     """
+    # One refusal scope per call, so the stage can tell a refusal the provider's
+    # fail-open wrapper swallowed from a genuine empty answer (design D9), and so
+    # the class of the escaping exception is counted once (PRT-S21).
+    begin_refusal_scope()
+    try:
+        return _http_get_once(
+            url=url, headers=headers, params=params, retries=retries, interval=interval, timeout=timeout
+        )
+    except BaseException as error:
+        refusal_class = getattr(error, "refusal_class", None)
+        if refusal_class:
+            _provider_refusal_stat_inc(refusal_class)
+        raise
+    finally:
+        end_refusal_scope()
+
+
+@network_retry
+def _http_get_once(
+    url: str,
+    headers: Optional[Dict] = None,
+    params: Optional[Dict] = None,
+    retries: int = 3,
+    interval: float = 1.0,
+    timeout: float = 10,
+) -> str:
+    """One retry-governed attempt chain; see :func:`http_get` for the contract."""
 
     # Input validation
     if isblank(url):
@@ -885,41 +946,95 @@ def http_get(
         response = getattr(e, "response", None)
         response_headers = dict(response.headers) if response is not None else {}
 
-        # A capacity refusal carrying a PUBLISHED wait becomes a typed deferral,
-        # so the stage can hand the task back to the durable queue instead of
-        # hammering the remote or misreading a 403 as an auth failure (design
-        # D2/D4).  The transport never sleeps the wait itself (invariant 6).
-        if _configured_classify_refusals() and is_capacity_refusal(code, reason):
-            published = wait_from_headers(response_headers)
-            if published is None:
-                published = wait_from_content(reason)
-            if published is not None and published > 0:
-                wait = min(float(published), float(_configured_max_refusal_wait_s()))
-                _provider_refusal_stat_inc("refusals_rate_limit")
-                raise RateLimitDeferral(
+        # --- refusal classification (provider-refusal-taxonomy) ---------------
+        # This function is the PROVIDER transport: GitHub traffic goes through
+        # ``GitHubClient._http_get`` above, which has its own handler and never
+        # calls this one.  Every class counted here is therefore a provider
+        # refusal, and the rendered ``ProviderRefusals`` line means what it says
+        # (fix-provider-refusal-counters, design D5).
+        #
+        # Counting is strictly observational (design D1): each ``raise`` below
+        # keeps the type, message and position it had before the classes gained
+        # producers, so retry counts and deferral decisions are untouched.  The
+        # precedence is fixed so one outcome lands in exactly one class (D2), and
+        # the whole block rides the operator's rollback flag - with the flag off
+        # nothing is counted at all (D4/PRT-S23).
+        classify = _configured_classify_refusals()
+        refusal_class = None
+        capacity = False
+        published: Optional[float] = None
+        if classify:
+            capacity = is_capacity_refusal(code, reason)
+            if capacity:
+                published = wait_from_headers(response_headers)
+                if published is None:
+                    published = wait_from_content(reason)
+            if capacity and published is not None and published > 0:
+                # Row 1: the remote published a resumption time, so honouring it
+                # outranks every label - the counter must agree with the action.
+                refusal_class = "refusals_rate_limit"
+            elif is_quota_refusal(reason):
+                # Rows 2 and 4: credit exhaustion cannot be waited out, so it is
+                # the more precise diagnosis whenever no wait was published.
+                refusal_class = "refusals_quota"
+            elif capacity:
+                # Row 3: a capacity refusal with nothing to defer on keeps the
+                # legacy transient path (never the authentication classification).
+                refusal_class = "refusals_transient"
+            elif code in (401, 403):
+                # Row 5: the legacy authentication verdict, now visible as a
+                # class instead of collapsing into an empty model list.
+                refusal_class = "refusals_auth"
+            elif code >= 500:
+                # Row 6: the remote failed, which is a refusal to answer.
+                refusal_class = "refusals_transient"
+            # Row 7: 404, 400 and friends say nothing about provider capacity,
+            # credential health or credit, so they count no refusal class.
+
+        if refusal_class == "refusals_rate_limit":
+            # A capacity refusal carrying a PUBLISHED wait becomes a typed
+            # deferral, so the stage can hand the task back to the durable queue
+            # instead of hammering the remote or misreading a 403 as an auth
+            # failure (design D2/D4).  The transport never sleeps the wait itself
+            # (invariant 6).
+            wait = min(float(published), float(_configured_max_refusal_wait_s()))
+            raise _tagged_refusal(
+                RateLimitDeferral(
                     f"provider rate limit (HTTP {code}) for URL: {url}",
                     wait_s=wait,
                     reason=ErrorReason.RATE_LIMITED.name,
-                )
-            # A capacity refusal without a published wait keeps the legacy
-            # transient path (never the authentication classification): there is
-            # nothing to defer on (design D4/PRT-S2).
-            raise ConnectionError(f"Rate limit exceeded (HTTP {code})")
+                ),
+                refusal_class,
+            )
 
+        if capacity:
+            # A capacity refusal that published no wait keeps the legacy
+            # transient path and must NEVER fall through to the authentication
+            # branch below (PRT-S2, PRT-S15, PFC-D17).  Same type and message as
+            # the pre-existing ``code == 429`` branch, so a 429 is unaffected and
+            # a marked 403 stops being reported as an auth failure.
+            raise _tagged_refusal(ConnectionError(f"Rate limit exceeded (HTTP {code})"), refusal_class)
+
+        # The legacy classification, byte for byte: same types, same messages,
+        # same order, so the retry policy's decisions and the number of wire hits
+        # are untouched (design D1).  ``_tagged_refusal`` is a no-op when the flag
+        # is off or the status is not a refusal, and otherwise only marks the
+        # exception so the outer ``http_get`` call can count it ONCE however many
+        # attempts the retry policy burns (PRT-S21).
         if code == 429:
             # Rate limit errors should be retried
-            raise ConnectionError(f"Rate limit exceeded (HTTP {code})")
+            raise _tagged_refusal(ConnectionError(f"Rate limit exceeded (HTTP {code})"), refusal_class)
         elif code == 404:
             raise FileNotFoundError(f"File not found (HTTP {code}), url: {url}")
         elif code in (401, 403):
             # Auth errors should not be retried
-            raise NetworkError(f"Authentication failed (HTTP {code})")
+            raise _tagged_refusal(NetworkError(f"Authentication failed (HTTP {code})"), refusal_class)
         elif code >= 500:
             # Server errors should be retried
-            raise ConnectionError(f"Server error (HTTP {code}): {reason}")
+            raise _tagged_refusal(ConnectionError(f"Server error (HTTP {code}): {reason}"), refusal_class)
         else:
             # Client errors should not be retried
-            raise NetworkError(f"HTTP {code} error: {reason}")
+            raise _tagged_refusal(NetworkError(f"HTTP {code} error: {reason}"), refusal_class)
 
     except requests.exceptions.Timeout as e:
         raise TimeoutError(f"Request timeout: {e}")
@@ -1246,6 +1361,69 @@ def get_provider_refusal_stats() -> Dict[str, int]:
     return dict(_PROVIDER_REFUSAL_STATS)
 
 
+# ---------------------------------------------------------------------------
+# Refusal scope (fix-provider-refusal-counters, design D9)
+#
+# The fail-open wrapper on a provider's model fetch stays - it is the
+# repository's contract, and removing it would turn every provider auth failure
+# into a stage error - so a non-deferrable refusal (401, 503, quota) still
+# reaches ``InspectStage`` as ``[]``.  The stage must not read that ``[]`` as
+# "this provider has no models", so the transport records which class it counted
+# for the call in flight on THIS thread, and hands that reading back up when the
+# call ends.
+#
+# Thread-local because the provider call is synchronous inside one worker: the
+# scope is exactly as wide as the call and needs no lock, where diffing the
+# global counters would race between the configured inspect threads.
+# ---------------------------------------------------------------------------
+_REFUSAL_SCOPE = threading.local()
+
+#: Keys that name a refusal CLASS, as opposed to a stage-level outcome tally.
+#: ``inspect_*`` and ``deferred_provider_budget`` are the stage's own readings and
+#: must not be written into the scope.
+_REFUSAL_CLASS_KEYS = frozenset(
+    ("refusals_rate_limit", "refusals_quota", "refusals_auth", "refusals_transient")
+)
+
+
+def _refusal_stack() -> List[Optional[str]]:
+    """This thread's stack of open refusal scopes (innermost last)."""
+    stack = getattr(_REFUSAL_SCOPE, "stack", None)
+    if stack is None:
+        stack = []
+        _REFUSAL_SCOPE.stack = stack
+    return stack
+
+
+def begin_refusal_scope() -> None:
+    """Open a refusal scope for one provider call on this thread.
+
+    Scopes nest: the stage opens one around ``provider.inspect`` and the
+    transport opens one inside it around its own call, so each frame reads the
+    outcome of the call *it* made.  A stack rather than a single slot is what
+    stops the inner scope from clobbering the outer one's answer.
+    """
+    _refusal_stack().append(None)
+
+
+def end_refusal_scope() -> Optional[str]:
+    """Close the innermost scope and return the refusal class counted inside it.
+
+    The class is propagated to the enclosing scope as it is popped, so a refusal
+    counted by the transport is still readable by the stage that called it.
+    ``None`` means the call was not a refusal, so an empty answer really is a
+    genuine empty answer.  Callers use ``finally``, so a scope left open by an
+    exception can never leak into a later call on the same thread.
+    """
+    stack = _refusal_stack()
+    if not stack:
+        return None
+    value = stack.pop()
+    if value is not None and stack:
+        stack[-1] = value
+    return value
+
+
 def _provider_refusal_stat_inc(key: str, amount: int = 1) -> None:
     """Increment a declared provider-refusal counter, rejecting unknown keys.
 
@@ -1256,6 +1434,12 @@ def _provider_refusal_stat_inc(key: str, amount: int = 1) -> None:
     if key not in _PROVIDER_REFUSAL_STATS:
         raise ValueError(f"undeclared provider refusal counter: {key}")
     _PROVIDER_REFUSAL_STATS[key] = _PROVIDER_REFUSAL_STATS.get(key, 0) + int(amount)
+    if key in _REFUSAL_CLASS_KEYS:
+        # Remember the class for the call in flight on this thread, so the stage
+        # can tell a swallowed refusal from a genuine empty answer (design D9).
+        stack = _refusal_stack()
+        if stack:
+            stack[-1] = key
 
 
 def _split_blob_ref_path(parts: List[str]):

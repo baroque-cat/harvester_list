@@ -114,6 +114,16 @@ mix two pools in one line. *Naming:* `provider_refusal_metrics`, not `provider_m
 `state/display.py` already has `_format_provider_section` for the per-provider result table — a
 near-identical name there would invite confusion.
 
+**Amendment (fix-provider-refusal-counters, 2026-09-29).** The "loud `_stat_inc`-style guard" above
+— and task 6.1's parenthetical "rejecting an undeclared key loudly, **exactly like**
+`_gather_stat_inc`" — misdescribe what shipped, and the shipped behaviour is the better one.
+`_gather_stat_inc` (`search/client.py:1107-1113`) logs a WARNING and returns `None` for an undeclared
+key; `_provider_refusal_stat_inc` (`:1249-1256`) **raises `ValueError`**. The difference is
+deliberate: a missing gather counter degrades a metric, whereas an undeclared provider-refusal key is
+a programming error that would silently widen a published, rendered, completeness-registered surface.
+Raising is what the pin `pytest.raises(ValueError, match="undeclared_key")` requires. No code change;
+the prose is corrected here so the next reader is not misled.
+
 ### D7 — Rollback flag in a new `provider:` config section
 `provider.classify_refusals: bool = True` and `provider.max_refusal_wait_s: float = 60.0`, mirroring
 `gather:` exactly: parsed in `config/loader.py`, validated in both `GatherConfig`-style
@@ -235,6 +245,36 @@ that PRT-S12/D9 governs (that path is fixed and pinned), and fixing the logging
 stack is a separate blast radius. Recommended follow-up: give the console handler
 a redacting formatter, or attach `RedactionFilter` to handlers rather than to the
 root logger.
+
+### D17 — A marked 403 with no published wait is a transient error, not an authentication failure (deviation)
+
+Recorded post-archive by `fix-provider-refusal-counters`, which found this behaviour change shipped
+undocumented and unpinned.
+
+Task 4.1 said "everything else keeps its current exception type and message", while PRT-S2 said a 403
+carrying a limit marker is a capacity refusal and must **never** be classified as "Authentication
+failed". For one input the two instructions contradict each other: **HTTP 403 + a rate-limit marker +
+no published resumption time**. The conflict was resolved in favour of the specification, so the
+behaviour changed:
+
+| | exception | wire hits | retried |
+|---|---|---|---|
+| before this capability | `NetworkError("Authentication failed (HTTP 403)")` | 1 | no |
+| after | `ConnectionError("Rate limit exceeded (HTTP 403)")` | 3 | yes, by the retry policy |
+
+Measured on both revisions (`/tmp/opencode/pfc_probe_403b.py`, then re-measured by
+`/tmp/opencode/prc_baseline.py` against `698bbf5`). The resolution is correct on the merits — a
+throttled credential is not a dead credential, and treating it as dead is exactly the misdiagnosis
+PRT-S2 exists to prevent — but it was recorded only as a code comment near `search/client.py:901`, and
+no scenario pinned it: PRT-S2 used a 403 *with* `Retry-After`, PRT-S3 a 403 *without* a marker, so the
+third combination was free to regress silently.
+
+Now pinned by **PRT-S15** (`tests/test_prc_classes.py::
+test_s15_a_marked_403_with_no_published_wait_keeps_the_legacy_transient_exception`), which asserts the
+type, the message, the three wire hits and the `refusals_transient` counter; and the row is also a
+member of the PRT-S22 baseline table, so any further change to it fails a regression guard rather
+than passing unnoticed.
+
 
 ## Risks / Trade-offs
 

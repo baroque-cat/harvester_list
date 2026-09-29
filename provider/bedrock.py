@@ -490,6 +490,11 @@ class BedrockProvider(AIBaseProvider):
                 logger.error(f"Failed to list models: {code} - {response[:200]}...")
                 return []
 
+        except RateLimitDeferral:
+            # ``_send_request`` already re-raises the typed signal (PFC-D10);
+            # without this clause the caller's broad handler would swallow it one
+            # frame later and the stage would read "no models" (PRT-S17, D6).
+            raise
         except Exception as e:
             logger.error(f"Bedrock list_models failed: {e}")
             return []

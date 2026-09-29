@@ -21,8 +21,42 @@ from email.utils import parsedate_to_datetime
 from typing import Dict, Optional
 
 # The marker vocabulary proven on the GitHub surface, reused verbatim so the two
-# surfaces agree (design D1/D11).
-_LIMIT_MARKERS = re.compile(r"rate limit|abuse detection|secondary rate limit", re.I)
+# surfaces agree (design D1/D11).  PUBLIC: this is the one definition, consumed
+# by the refusal classifier here and by the credential-cooling content detector in
+# ``search.client``.  A fourth private copy of these three phrases is how the
+# original defect happened, so a second copy is a test failure (PRT-S16).
+LIMIT_MARKERS = re.compile(r"rate limit|abuse detection|secondary rate limit", re.I)
+
+# Kept as a private alias so the module's own references and the pins written
+# against the predecessor change keep working.
+_LIMIT_MARKERS = LIMIT_MARKERS
+
+# Quota / billing exhaustion, transcribed from the markers the shipped providers
+# already recognise on the ``check`` surface (design D3 of
+# fix-provider-refusal-counters):
+#   provider/openai_like.py:123 (403) and :127 (429)
+#   provider/anthropic.py:151
+#   provider/gemini.py:72 (the specific phrase only)
+# Deliberately EXCLUDED, because they are safe only inside a status-scoped
+# provider branch and would relabel an authentication refusal at transport level:
+#   bare "quota" / "billing" (provider/vertex.py:158)
+#   bare "Billing" / "purchase" (provider/anthropic.py:151)
+#   "RESOURCE_EXHAUSTED" (provider/gemini.py:72) - Google's code for rate limit
+#   AND quota; a 429 carrying it is already a capacity refusal, so importing it
+#   here would steal rate-limit outcomes into the quota class.
+QUOTA_MARKERS = re.compile(
+    r"exceeded_current_quota_error"
+    r"|insufficient_user_quota"
+    r"|insufficient_quota"
+    r"|billing_not_active"
+    r"|credit balance is too low"
+    r"|quota exceeded for quota metric"
+    r"|(?:额度|余额)(?:不足|过低)"
+    r"|欠费"
+    r"|请充值"
+    r"|recharge",
+    re.I,
+)
 
 # Human-readable wait embedded in a refusal body (fallback only).
 _WAIT_IN_CONTENT = re.compile(
@@ -32,6 +66,23 @@ _WAIT_IN_CONTENT = re.compile(
 # Conservative fallback for the "few minutes" phrasing (matches the pre-change
 # copies byte-for-byte).
 _FEW_MINUTES_WAIT_S = 180.0
+
+
+def is_quota_refusal(text: str) -> bool:
+    """True when ``text`` carries a recognised quota / billing-exhaustion marker.
+
+    Opportunistic and status-independent: the marker either is present or it is
+    not, and when it is absent the caller falls through to the classification it
+    already had.  Fail-open by contract - a classifier must never raise into a
+    worker loop - and it never changes an exception type on its own (design D1 of
+    ``fix-provider-refusal-counters``: counting is observational).
+    """
+    try:
+        if not isinstance(text, str) or not text:
+            return False
+        return bool(QUOTA_MARKERS.search(text))
+    except Exception:
+        return False
 
 
 def is_capacity_refusal(status: int, text: str) -> bool:

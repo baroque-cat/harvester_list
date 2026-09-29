@@ -972,10 +972,18 @@ class InspectStage(BasePipelineStage):
                 logger.error(f"[{self.name}] unknown provider: {task.provider}, type: {type(provider)}")
                 return None
 
-            # Get model list
-            models = provider.inspect(
-                token=task.service.key, address=task.service.address, endpoint=task.service.endpoint
-            )
+            # Get model list.  The refusal scope brackets the call so that a
+            # refusal the provider's fail-open wrapper swallows into ``[]`` is
+            # still read here as a refusal, never as "this provider has no
+            # models" (fix-provider-refusal-counters, design D9 / PRT-S24).  Read
+            # in a ``finally`` so the deferral path clears the scope too.
+            client.begin_refusal_scope()
+            try:
+                models = provider.inspect(
+                    token=task.service.key, address=task.service.address, endpoint=task.service.endpoint
+                )
+            finally:
+                refused = client.end_refusal_scope()
 
             # Create output object
             output = StageOutput(task=task)
@@ -983,6 +991,12 @@ class InspectStage(BasePipelineStage):
             # Add models to be saved
             if models:
                 output.add_models(task.provider, task.service.key, models)
+            elif refused is not None:
+                # The empty answer WAS a refusal.  Its class counter already
+                # names the reason; this records the stage's reading of the
+                # outcome so the two dimensions agree and the refusal is not
+                # indistinguishable from a provider with no models (D9).
+                client._provider_refusal_stat_inc("inspect_refused")
             else:
                 # A genuine empty answer is an outcome, not a silent drop: count
                 # it so an unrecognised refusal dialect shows up as an anomalous
