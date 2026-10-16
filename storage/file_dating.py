@@ -38,6 +38,15 @@ logger = get_logger("storage")
 # tighter because dating rides the search thread, not its own enricher thread.
 DEFAULT_DATING_BUDGET_SECONDS = 5.0
 
+# Opportunistic coalescing window (P21).  Small gather calls (one URL each)
+# wait up to this long for siblings to arrive so they can share a single
+# GraphQL POST.  The window is paid only by small calls; it is cheap next to
+# the github_graphql basket (base_rate 0.5 ⇒ one token per 2 s per credential),
+# which today serialises four independent POSTs from four gather threads.
+# Set coalesce_window_s=0 (or negative) to disable coalescing entirely — this
+# is the de-facto rollback knob.
+DEFAULT_COALESCE_WINDOW_SECONDS = 0.25
+
 
 class FileDater:
     """Cache-first, budgeted, fail-open per-file commit-date fetcher.
@@ -67,6 +76,7 @@ class FileDater:
         retries: int = 3,
         flush_timeout: float = 10.0,
         max_credential_retries: int = 3,
+        coalesce_window_s: Optional[float] = None,
     ):
         self.store = store
         self.enabled = bool(enabled)
@@ -83,6 +93,12 @@ class FileDater:
         self.flush_timeout = float(flush_timeout)
         self.max_credential_retries = max(1, int(max_credential_retries))
 
+        # Coalescing window: None → use default constant; 0 or negative → disabled.
+        if coalesce_window_s is None:
+            self.coalesce_window_s = DEFAULT_COALESCE_WINDOW_SECONDS
+        else:
+            self.coalesce_window_s = float(coalesce_window_s)
+
         self._lock = threading.Lock()
         self._counters_lock = threading.Lock()
         self._cached_hits = 0
@@ -90,6 +106,11 @@ class FileDater:
         self._requests_this_run = 0
         self._budget_stopped = 0
         self._time_stopped = 0
+
+        # Assembly state for coalescing (P21).  Only used when coalescing is
+        # enabled and transport is graphql.
+        self._assembly: Optional[Dict[str, Any]] = None
+        self._assembly_cond = threading.Condition(self._lock)
 
     # -- public API ----------------------------------------------------
     def date_urls_map(
@@ -175,7 +196,14 @@ class FileDater:
         # Phase 2: fetch stale-or-missing entries, honouring the per-run budget
         # and the wall-clock budget.
         if self.transport == "graphql":
-            self._fetch_graphql(stale, flush, deadline=deadline, result_map=result_map)
+            # P21: opportunistic coalescing for small calls.
+            if (
+                self.coalesce_window_s > 0
+                and len(stale) < self.graphql_batch_size
+            ):
+                self._fetch_graphql_coalesced(stale, flush, deadline=deadline, result_map=result_map)
+            else:
+                self._fetch_graphql(stale, flush, deadline=deadline, result_map=result_map)
         else:
             self._fetch_rest(stale, flush, deadline=deadline, result_map=result_map)
 
@@ -429,6 +457,205 @@ class FileDater:
                         if result_map is not None and idx < len(batch_urls):
                             result_map[batch_urls[idx]] = result.committed_date
                 break
+        return dated
+
+    def _fetch_graphql_coalesced(
+        self,
+        stale: List[Tuple[str, str, str, str, str]],
+        flush: bool,
+        deadline: Optional[float] = None,
+        result_map: Optional[Dict[str, Optional[float]]] = None,
+    ) -> int:
+        """Coalesce small concurrent GraphQL calls into a shared batch (P21).
+
+        Leader/follower pattern: the first caller creates an assembly and becomes
+        the leader; subsequent callers join as followers.  The leader waits for
+        the coalesce window or until the assembly reaches batch_size, then
+        executes the batch and distributes results.  Followers wait on an event
+        and read their own results.
+
+        Failure handling: the leader always sets the event in a finally block,
+        so followers are released even if the network call raises.  Followers
+        receive None for urls that got no date.
+        """
+        # Identify which urls this caller owns.
+        my_urls = {url for url, o, r, p, _ in stale}
+
+        # Check budget before entering the assembly.
+        if self._budget_exhausted():
+            with self._counters_lock:
+                self._budget_stopped += len(stale)
+            return 0
+
+        if self._time_exhausted(deadline):
+            with self._counters_lock:
+                self._time_stopped += 1
+            return 0
+
+        # Enter the assembly under the lock.
+        with self._assembly_cond:
+            # If no assembly or the current one is closed, create a new one.
+            if self._assembly is None or self._assembly["closed"]:
+                self._assembly = {
+                    "items": [],  # List of (url, owner, repo, path, ref)
+                    "keys": set(),  # Set of (owner, repo, path) for dedup
+                    "results": {},  # Dict[url, Optional[float]]
+                    "event": threading.Event(),
+                    "closed": False,
+                    "leader_done": False,
+                }
+                is_leader = True
+            else:
+                is_leader = False
+
+            # Add this caller's urls to the assembly (dedup by key).
+            assembly = self._assembly
+            for item in stale:
+                url, owner, repo, path, ref = item
+                key = (owner, repo, path)
+                if key not in assembly["keys"]:
+                    assembly["items"].append(item)
+                    assembly["keys"].add(key)
+            # Wake the leader: a full assembly is the only thing it waits for.
+            self._assembly_cond.notify_all()
+
+            if is_leader:
+                # Leader: will wait for window outside the lock, then snapshot.
+                pass
+            else:
+                # Follower: wait for the leader to finish.
+                # Compute bounded join timeout: window + client timeout + slack.
+                join_timeout = self.coalesce_window_s + self.timeout + 2.0
+                # Wait for leader to signal completion.
+                deadline_time = self._clock() + join_timeout
+                while not assembly["leader_done"]:
+                    remaining = deadline_time - self._clock()
+                    if remaining <= 0:
+                        break
+                    self._assembly_cond.wait(timeout=min(remaining, 0.5))
+                # Read results for my urls.
+                if result_map is not None:
+                    for url in my_urls:
+                        if url in assembly["results"]:
+                            result_map[url] = assembly["results"][url]
+                # Count filled for this caller.
+                filled = sum(
+                    1 for url in my_urls
+                    if assembly["results"].get(url) is not None
+                )
+                return filled
+
+        # Leader path: hold the assembly open for the coalesce window so that
+        # concurrent gather workers join it, but wake as soon as the assembly
+        # already holds a full batch -- there is nothing left to coalesce and
+        # the caller is waiting synchronously inside a gather worker (P21).
+        window_deadline = time.monotonic() + self.coalesce_window_s
+        with self._assembly_cond:
+            while len(assembly["items"]) < self.graphql_batch_size:
+                remaining = window_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._assembly_cond.wait(timeout=remaining)
+
+        # Re-acquire lock to close the assembly and snapshot.
+        with self._assembly_cond:
+            assembly["closed"] = True
+            snapshot_items = list(assembly["items"])
+            # Notify any followers that might be waiting.
+            self._assembly_cond.notify_all()
+
+        # Execute the batch outside the lock.
+        try:
+            dated = self._execute_coalesced_batch(snapshot_items, flush, deadline, result_map, assembly)
+        except Exception as exc:
+            # Fail-open: release followers with None.
+            logger.debug(f"[file_dating] Coalesced batch failed (fail-open): {exc}")
+            dated = 0
+        finally:
+            # Signal followers that we're done.
+            with self._assembly_cond:
+                assembly["leader_done"] = True
+                self._assembly_cond.notify_all()
+
+        return dated
+
+    def _execute_coalesced_batch(
+        self,
+        items: List[Tuple[str, str, str, str, str]],
+        flush: bool,
+        deadline: Optional[float],
+        result_map: Optional[Dict[str, Optional[float]]],
+        assembly: Dict[str, Any],
+    ) -> int:
+        """Execute the coalesced batch and populate assembly results."""
+        dated = 0
+
+        # Check budget again before executing.
+        if self._budget_exhausted():
+            with self._counters_lock:
+                self._budget_stopped += len(items)
+            return 0
+
+        if self._time_exhausted(deadline):
+            with self._counters_lock:
+                self._time_stopped += 1
+            return 0
+
+        # Cooling probe
+        if self._cooling_probe is not None:
+            try:
+                if bool(self._cooling_probe()):
+                    return 0
+            except Exception:
+                pass
+
+        # Build the batch items for the GraphQL call.
+        batch_items = [(o, r, p, ref) for _, o, r, p, ref in items if ref and len(ref) == 40]
+        batch_urls = [url for url, o, r, p, ref in items if ref and len(ref) == 40]
+
+        if not batch_items:
+            return 0
+
+        # Credential rotation loop.
+        for _ in range(self.max_credential_retries):
+            credential = self._next_credential()
+            if credential is None:
+                break
+            try:
+                results = fetch_file_commit_dates_batch(
+                    batch_items,
+                    credential=credential,
+                    client=self._client,
+                    timeout=self.timeout,
+                    retries=self.retries,
+                )
+            except GithubCredentialLimited:
+                continue
+            except Exception as exc:
+                logger.debug(f"[file_dating] Coalesced GraphQL batch failed (fail-open): {exc}")
+                break
+
+            with self._counters_lock:
+                self._requests_this_run += 1
+
+            # Distribute results to assembly and result_map.
+            for idx, ((owner, repo, path), result) in enumerate(results.items()):
+                ref = ""
+                for o, r, p, r_ref in batch_items:
+                    if (o, r, p) == (owner, repo, path):
+                        ref = r_ref
+                        break
+                self._apply_result(owner, repo, path, ref, result, flush)
+                if result.status == 200 and result.committed_date is not None:
+                    dated += 1
+                    # Find the URL for this (owner, repo, path).
+                    if idx < len(batch_urls):
+                        url = batch_urls[idx]
+                        assembly["results"][url] = result.committed_date
+                        if result_map is not None:
+                            result_map[url] = result.committed_date
+            break
+
         return dated
 
     def _apply_result(
