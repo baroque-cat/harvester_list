@@ -198,8 +198,8 @@ def test_s4_schema_v4_migrates_to_v5(workspace, db_rows, db_scalar, registry_pat
     registry.start()
     registry.stop()
 
-    # Schema version is now 5.
-    assert db_scalar(workspace, "PRAGMA user_version") == 5
+    # Schema version is now 6.
+    assert db_scalar(workspace, "PRAGMA user_version") == 6
 
     # New columns exist.
     columns = {row["name"] for row in db_rows(workspace, "PRAGMA table_info(links)")}
@@ -209,6 +209,7 @@ def test_s4_schema_v4_migrates_to_v5(workspace, db_rows, db_scalar, registry_pat
     # file_meta table exists.
     tables = {row["name"] for row in db_rows(workspace, "SELECT name FROM sqlite_master WHERE type='table'")}
     assert "file_meta" in tables
+    assert "key_sources" in tables
 
     # Pre-existing row kept its values.
     row = db_rows(workspace, "SELECT url, owner, repo, path, first_seen_ts, last_seen_ts, visit_status FROM links WHERE url_hash = ?", [digest])[0]
@@ -228,14 +229,14 @@ def test_s5_migration_is_idempotent_at_v5(workspace, db_scalar):
     """link-registry-S5: opening an already-migrated database raises nothing."""
     import sqlite3
 
-    # First open: bootstraps at v5.
+    # First open: bootstraps at v6.
     registry = Registry(workspace, enabled=True)
     registry.start()
     registry.stop()
-    assert db_scalar(workspace, "PRAGMA user_version") == 5
+    assert db_scalar(workspace, "PRAGMA user_version") == 6
 
     # Second open: migration guard runs again, must be a no-op.
     registry2 = Registry(workspace, enabled=True)
     registry2.start()
     registry2.stop()
-    assert db_scalar(workspace, "PRAGMA user_version") == 5
+    assert db_scalar(workspace, "PRAGMA user_version") == 6

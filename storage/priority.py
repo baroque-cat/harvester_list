@@ -15,9 +15,12 @@ already accumulated in the registry (key statuses, push freshness, size):
 ``age_days``       : (now - max(repo_pushed_at)) in days; NULL contributes 0
 ``size_kb``        : max(repo_size_kb); NULL contributes no penalty
 
-Key -> repo attribution is ``keys.source_url_hash -> links.url_hash ->
-(owner, repo)``.  Keys without an attributable source link (legacy imports)
-contribute only to global statistics, never to a repository score.
+Key -> repo attribution uses a UNION of two branches (P22 D5): one joining
+through the ``key_sources`` child table (every observed source), and one
+keeping the legacy ``keys.source_url_hash -> links.url_hash`` join (redundant
+after backfill but protective for databases written by an older build).  Keys
+without any attributable source link (legacy imports) contribute only to
+global statistics, never to a repository score.
 
 Missing inputs degrade neutrally: unknown dates/sizes and absent keys simply
 contribute zero; scoring never raises on sparse rows.
@@ -168,14 +171,20 @@ def score_repo(
     pushed_at = meta[0] if meta else None
     size_kb = meta[1] if meta else None
 
-    # Attribution: keys join links through their source URL hash.
+    # Attribution: keys join links through key_sources UNION legacy source_url_hash (P22 D5).
     valid_placeholder = ",".join("?" for _ in VALID_STATUSES)
     soft_placeholder = ",".join("?" for _ in SOFT_STATUSES)
     evidence = conn.execute(
         "SELECT "
         f"  MAX(CASE WHEN k.status IN ({valid_placeholder}) THEN 1 ELSE 0 END), "
         f"  MAX(CASE WHEN k.status IN ({soft_placeholder}) THEN 1 ELSE 0 END) "
-        "FROM keys k JOIN links l ON k.source_url_hash = l.url_hash "
+        "FROM keys k "
+        "JOIN (SELECT DISTINCT key_hash, url_hash FROM key_sources "
+        "      UNION "
+        "      SELECT key_hash, source_url_hash AS url_hash FROM keys "
+        "      WHERE source_url_hash IS NOT NULL AND source_url_hash <> '') ks "
+        "  ON ks.key_hash = k.key_hash "
+        "JOIN links l ON ks.url_hash = l.url_hash "
         "WHERE l.owner = ? AND l.repo = ?",
         (*VALID_STATUSES, *SOFT_STATUSES, owner, repo),
     ).fetchone()
@@ -225,11 +234,20 @@ def sweep(
 
 
 def status_counts_for_repos(conn: sqlite3.Connection) -> Dict[Tuple[str, str], Dict[str, int]]:
-    """Attribute ledger statuses to repositories for reporting surfaces."""
+    """Attribute ledger statuses to repositories for reporting surfaces.
+
+    Uses a UNION of ``key_sources`` and the legacy ``keys.source_url_hash``
+    join (P22 D5) so attribution covers every observed source.
+    """
     counts: Dict[Tuple[str, str], Dict[str, int]] = {}
     rows = conn.execute(
-        "SELECT l.owner, l.repo, k.status, COUNT(*) FROM keys k "
-        "JOIN links l ON k.source_url_hash = l.url_hash "
+        "SELECT l.owner, l.repo, k.status, COUNT(DISTINCT k.key_hash) FROM keys k "
+        "JOIN (SELECT DISTINCT key_hash, url_hash FROM key_sources "
+        "      UNION "
+        "      SELECT key_hash, source_url_hash AS url_hash FROM keys "
+        "      WHERE source_url_hash IS NOT NULL AND source_url_hash <> '') ks "
+        "  ON ks.key_hash = k.key_hash "
+        "JOIN links l ON ks.url_hash = l.url_hash "
         "WHERE k.status IS NOT NULL AND k.status != '' "
         "GROUP BY l.owner, l.repo, k.status"
     ).fetchall()

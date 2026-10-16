@@ -1307,6 +1307,36 @@ data accumulates safely. Flip `check_skip.mode` / `recheck.enabled` back to
 provider is still checked, a warning is logged once per error kind, and the run
 is marked degraded. A skip is never derived from an errored lookup.
 
+### Multi-source key recording (P22)
+
+The original `keys.source_url_hash` column recorded a single origin URL per key
+— the *last* non-empty observation. An empty observation (a check-skip path
+where the provider call was bypassed) could overwrite it with NULL, silently
+erasing provenance. P22 introduces a dedicated `key_sources(key_hash, url_hash,
+first_seen_ts, last_seen_ts)` table that records **every** file a given
+credential key was found in, answering the question "in which files did this key
+leak" without collapsing history.
+
+- **Schema version 6.** The migration adds the `key_sources` table and a
+  `key_sources_dated` view that joins `links` for per-file dates. A one-shot
+  backfill synthesises rows from the legacy `keys.source_url_hash` column; the
+  count is recorded in the `meta` table under the key
+  `key_sources_backfill` (format `<count>@<timestamp>`) and surfaced as
+  `key_sources_backfilled` in `Registry.get_stats()`.
+- **First-wins origin.** `keys.source_url_hash` is now set to the **first**
+  non-empty origin and is never erased by a subsequent empty observation. The
+  check-skip observation path (`record_key_observation(..., source_url_hash=...)`)
+  links a newly found file to the key even when the provider call is skipped,
+  so the `key_sources` table accumulates provenance regardless of skip state.
+- **Console line.** When the registry is enabled and available, the status
+  display emits a `Registry:` line:
+  `Registry: available=True degraded=False queued=0 dropped=0 metadata_noops=0 key_sources=<rows> multi_source_keys=<count> backfilled=<count>`.
+  A disabled or unavailable registry emits no line (no console noise).
+- **No feature flag.** This mechanism has no configuration switch — it is an
+  additive storage change that is always active once the registry is enabled.
+  A v6 database remains readable by the previous build (the new table and view
+  are simply ignored). No behavior change; purely observability.
+
 ### Target prioritization (`prioritization`)
 
 The registry answers not just *what* was found but *what to scan next*. Each

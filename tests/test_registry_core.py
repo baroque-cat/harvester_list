@@ -61,12 +61,12 @@ def test_s3_schema_bootstrap_on_empty_workspace(workspace, db_rows, db_scalar, r
     assert os.path.exists(registry_path(workspace))
 
     names = {row["name"] for row in db_rows(workspace, "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"links", "link_coverage", "keys", "runs", "repos", "meta", "file_meta"} <= names
+    assert {"links", "link_coverage", "keys", "runs", "repos", "meta", "file_meta", "key_sources"} <= names
 
     indexes = {row["name"] for row in db_rows(workspace, "SELECT name FROM sqlite_master WHERE type='index'")}
-    assert {"idx_links_repo", "idx_links_last_seen", "idx_file_meta_fetched"} <= indexes
+    assert {"idx_links_repo", "idx_links_last_seen", "idx_file_meta_fetched", "idx_key_sources_url"} <= indexes
 
-    assert db_scalar(workspace, "PRAGMA user_version") == 5
+    assert db_scalar(workspace, "PRAGMA user_version") == 6
 
 
 def test_s7_flag_off_behaves_exactly_as_today(workspace, registry_path):

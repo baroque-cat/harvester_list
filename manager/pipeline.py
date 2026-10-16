@@ -516,6 +516,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             file_dating_metrics=self.file_dating.to_stats() if hasattr(self, "file_dating") else {},
             early_stop_metrics=self.early_stop.to_stats(),
             key_ledger_metrics=self.key_ledger.to_stats(),
+            registry_metrics=self._registry_metrics(),
             recheck_metrics=self.recheck.to_stats(),
             prioritization_metrics=self._prioritization_metrics(),
             aggregation_metrics=get_aggregation_metrics(),
@@ -536,6 +537,22 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             return {"display_top_n": top_n, "candidates": top_candidates(self.link_registry.path, top_n)}
         except Exception as e:  # pragma: no cover - cosmetic best-effort
             logger.debug(f"Failed to build prioritization metrics: {e}")
+            return {}
+
+    def _registry_metrics(self) -> Dict[str, object]:
+        """Registry multi-source observability (P22 D7).
+
+        Defensive best-effort read from ``self.link_registry``: when the
+        attribute is missing or ``get_stats()`` raises, degrade to ``{}`` so
+        the status render never fails because of a registry defect.
+        """
+        registry = getattr(self, "link_registry", None)
+        if registry is None:
+            return {}
+        try:
+            return registry.get_stats()
+        except Exception as e:  # pragma: no cover - cosmetic best-effort
+            logger.debug(f"Failed to read registry metrics: {e}")
             return {}
 
     def add_initial_tasks(self, initial_tasks: List[ProviderTask]) -> None:

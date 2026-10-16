@@ -67,6 +67,9 @@ per run unless noted.
 | `cooling_skips` | **Diagnostic**: enrichment encounters yielded without requests because every API token was cooling down (non-blocking probe; transient — resumes in-run when a token recovers). Logged once at info level. | `add-repo-meta-enrichment` |
 | `prioritization.display_top_n` | Configured N for the optional status line (mirror of the config value; `0` disables). | `add-target-prioritization` |
 | `prioritization.candidates` | Flattened `[[owner, repo, priority], ...]` top-N list read from `links.priority` while `display_top_n > 0`. Empty otherwise. | `add-target-prioritization` |
+| `key_source_rows` | COUNT(\*) of the `key_sources` table — every file a given credential key was found in (P22 D7). Exposed by `Registry.get_stats()` and rendered on the `Registry:` console line. | P22 |
+| `multi_source_keys` | Distinct keys with more than one `key_sources` row — the number that quantifies the multi-source defect in production (P22 D7). Exposed by `Registry.get_stats()` and rendered on the `Registry:` console line. | P22 |
+| `key_sources_backfilled` | Rows synthesized by the one-shot v5→v6 migration backfill, parsed from the `meta` marker `key_sources_backfill` (P22 D7). Exposed by `Registry.get_stats()` and rendered on the `Registry:` console line. | P22 |
 
 `skip_known`, the four `regathered_*` counters and `push_signal_coverage` are
 flattened by `GatherSkipEngine.to_stats()` into `PipelineStatus.skip_metrics`
@@ -217,6 +220,24 @@ monitor the `early_stop_fired` vs novel-links trend.
   `Pipeline._prioritization_metrics()` into `PipelineStatus.prioritization_metrics`
   (rendered only when `display_top_n > 0`); the export tool reads the same column
   read-only.
+- `key_sources(key_hash, url_hash, first_seen_ts, last_seen_ts)` is the
+  multi-source provenance table (P22 D7, schema version 6). It records every
+  file a given credential key was found in, answering "in which files did this
+  key leak" without collapsing history into the single-column
+  `keys.source_url_hash`. A `key_sources_dated` view joins `links` for
+  per-file dates. The one-shot v5→v6 migration backfill synthesises rows from
+  the legacy column; the count is recorded in `meta(key='key_sources_backfill',
+  value='<count>@<timestamp>')` and surfaced as `key_sources_backfilled` in
+  `Registry.get_stats()`. `keys.source_url_hash` is now set to the **first**
+  non-empty origin and is never erased by a subsequent empty observation. The
+  check-skip observation path (`record_key_observation(...,
+  source_url_hash=...)`) links a newly found file even when the provider call
+  is skipped. No feature flag exists for this mechanism — it is an additive
+  storage change always active once the registry is enabled; a v6 database
+  remains readable by the previous build. The three aggregate counters
+  (`key_source_rows`, `multi_source_keys`, `key_sources_backfilled`) are
+  rendered on the `Registry:` console line when the registry is enabled and
+  available.
 
 ## Key-ledger semantics (`add-key-ledger`)
 
@@ -244,6 +265,15 @@ monitor the `early_stop_fired` vs novel-links trend.
 - **Trust/degradation.** A ledger read error warns once per error kind, marks
   the run degraded, and forces checks for the affected batch. `off` flags
   restore pre-change behavior exactly.
+- **Multi-source recording (P22).** Every file in which a key is discovered is
+  recorded in the `key_sources` table as a distinct `(key_hash, url_hash)` row
+  with `first_seen_ts`/`last_seen_ts`. The original `keys.source_url_hash`
+  column is now the **first** non-empty origin and is never overwritten by a
+  subsequent empty observation. The check-skip observation path
+  (`record_key_observation(..., source_url_hash=...)`) links a newly found file
+  to the key even when the provider call is skipped, so provenance accumulates
+  regardless of skip state. No feature flag exists for this mechanism — it is
+  an additive storage change always active once the registry is enabled.
 
 ## Prioritization semantics (`add-target-prioritization`)
 

@@ -241,6 +241,13 @@ class PipelineStatus:
     # Per-file commit-dating counters (add-file-commit-dating D12; empty while disabled).
     file_dating_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Registry multi-source observability (P22 D7): key_sources row count,
+    # multi-source key count, and backfill marker.  Empty while the registry is
+    # disabled/unavailable — a write-only subsystem cannot be discovered
+    # through metrics (lesson Н6), so this surface makes multi-source keys
+    # visible to the operator without opening sqlite.
+    registry_metrics: Dict[str, Any] = field(default_factory=dict)
+
     def queue_size(self) -> int:
         """Get total queue size across all stages"""
         return sum(stage.queue_size for stage in self.stages.values())

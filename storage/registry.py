@@ -37,7 +37,7 @@ from tools.logger import get_logger
 logger = get_logger("storage")
 
 # Bump when the schema changes; later changes may only ADD columns/tables.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 REGISTRY_FILENAME = "registry.sqlite"
 
 # Operations understood by the writer thread.
@@ -51,6 +51,7 @@ _OP_REPO_GONE = "repo_gone"
 _OP_REPO_LINKS = "repo_links"
 _OP_KEY_UPSERT = "key_upsert"
 _OP_KEY_OBSERVE = "key_observe"
+_OP_KEY_SOURCE = "key_source"
 _OP_FILE_UPSERT = "file_upsert"
 _OP_FILE_TOUCH = "file_touch"
 _OP_FILE_GONE = "file_gone"
@@ -150,6 +151,24 @@ CREATE INDEX IF NOT EXISTS idx_links_last_seen ON links(last_seen_ts);
 CREATE INDEX IF NOT EXISTS idx_links_provider ON links(provider);
 CREATE INDEX IF NOT EXISTS idx_keys_recheck ON keys(status, last_recheck_ts);
 CREATE INDEX IF NOT EXISTS idx_file_meta_fetched ON file_meta(fetched_at);
+
+-- Additive child table for multi-source key attribution (P22 D1).  Records
+-- every (key_hash, url_hash) pair a key has been observed with, so the link
+-- to an earlier source file is never lost when the key is re-found elsewhere.
+CREATE TABLE IF NOT EXISTS key_sources(
+  key_hash TEXT NOT NULL,
+  url_hash TEXT NOT NULL,
+  first_seen_ts REAL,
+  last_seen_ts REAL,
+  PRIMARY KEY(key_hash, url_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_key_sources_url ON key_sources(url_hash);
+
+-- Dated view joining key_sources to links for per-file freshness (P22 D4).
+CREATE VIEW IF NOT EXISTS key_sources_dated AS
+SELECT ks.key_hash, ks.url_hash, l.url, l.owner, l.repo, l.path,
+       l.file_commit_date, l.visit_status, ks.first_seen_ts, ks.last_seen_ts
+FROM key_sources ks JOIN links l ON l.url_hash = ks.url_hash;
 """
 
 _DISCOVER_SQL = """
@@ -214,7 +233,10 @@ ON CONFLICT(key_hash) DO UPDATE SET
   status = excluded.status,
   last_recheck_ts = excluded.last_recheck_ts,
   last_seen_ts = MAX(COALESCE(keys.last_seen_ts, excluded.last_seen_ts), excluded.last_seen_ts),
-  source_url_hash = COALESCE(excluded.source_url_hash, keys.source_url_hash)
+  -- Same discipline as _DISCOVER_SQL's provider = COALESCE(links.provider, excluded.provider)
+  -- (first wins forever) and as the immutable first_seen_ts; deterministic
+  -- regardless of check order, so links.priority stays reproducible (P22 D2).
+  source_url_hash = COALESCE(NULLIF(keys.source_url_hash, ''), NULLIF(excluded.source_url_hash, ''))
 """
 
 # Observation-only update for a skipped check (add-key-ledger D4): the status
@@ -223,6 +245,16 @@ ON CONFLICT(key_hash) DO UPDATE SET
 _KEY_OBSERVE_SQL = """
 UPDATE keys SET last_seen_ts = MAX(COALESCE(last_seen_ts, ?), ?)
 WHERE key_hash = ?
+"""
+
+# Key-source attribution upsert (P22 D3).  first_seen_ts is immutable on
+# conflict — mirrors the links.first_seen_ts discipline.  last_seen_ts uses
+# MAX to never regress.
+_KEY_SOURCE_SQL = """
+INSERT INTO key_sources (key_hash, url_hash, first_seen_ts, last_seen_ts)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(key_hash, url_hash) DO UPDATE SET
+  last_seen_ts = MAX(COALESCE(key_sources.last_seen_ts, excluded.last_seen_ts), excluded.last_seen_ts)
 """
 
 # Non-regressing metadata merge: a NULL observation never erases a known value;
@@ -364,6 +396,11 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     ``etag`` and ``etag_transport`` columns to ``links``; the ``file_meta``
     table needs no guard because ``CREATE TABLE IF NOT EXISTS`` in ``_DDL``
     already handles it.
+
+    schema_version < 6 (P22 D6): backfill ``key_sources`` from existing
+    ``keys`` rows that have a non-empty ``source_url_hash``.  Gated on the
+    absence of a ``meta`` marker so reopening is O(1) and the original
+    provenance is preserved.
     """
     columns = {row[1] for row in conn.execute("PRAGMA table_info(keys)")}
     if "last_seen_ts" not in columns:
@@ -375,6 +412,23 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE links ADD COLUMN etag TEXT")
     if "etag_transport" not in link_columns:
         conn.execute("ALTER TABLE links ADD COLUMN etag_transport TEXT")
+
+    # schema_version < 6 (P22 D6): backfill key_sources from keys.
+    marker_row = conn.execute(
+        "SELECT value FROM meta WHERE key = 'key_sources_backfill'"
+    ).fetchone()
+    if marker_row is None:
+        before = conn.total_changes
+        conn.execute(
+            "INSERT OR IGNORE INTO key_sources (key_hash, url_hash, first_seen_ts, last_seen_ts) "
+            "SELECT key_hash, source_url_hash, first_seen_ts, last_seen_ts FROM keys "
+            "WHERE source_url_hash IS NOT NULL AND source_url_hash <> ''"
+        )
+        inserted = conn.total_changes - before
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('key_sources_backfill', ?)",
+            (f"{inserted}@{time.time()}",)
+        )
 
 
 def canonical_url(url: str) -> str:
@@ -615,8 +669,18 @@ class Registry:
             logger.warning(f"[registry] dropped {self.dropped} operations due to a full queue")
 
     def get_stats(self) -> Dict[str, Any]:
-        """Expose registry counters/metrics (safe to call at any time)."""
-        return {
+        """Expose registry counters/metrics (safe to call at any time).
+
+        Includes three ``key_sources`` aggregates (P22 D7): ``key_source_rows``
+        (COUNT of ``key_sources``), ``multi_source_keys`` (COUNT of key_hash
+        groups having >1 row), and ``key_sources_backfilled`` (the integer
+        parsed from the ``meta`` marker prefix before ``@``; 0 when absent or
+        unparsable).  Cost: two small aggregates per status render (~30 s
+        cadence).  Read through a dedicated read-only connection following the
+        house pattern of ``get_link_fetch_state()``; ANY exception degrades to
+        zeros and never raises into a caller.
+        """
+        base = {
             "path": self.path,
             "enabled": self.enabled,
             "available": self._available,
@@ -625,6 +689,44 @@ class Registry:
             "metadata_noops": self._metadata_noops,
             "queued": self._queue.qsize(),
         }
+        # P22 D7: key_sources counters (fail-open, read-only).
+        if not self.enabled or not self._available:
+            base["key_source_rows"] = 0
+            base["multi_source_keys"] = 0
+            base["key_sources_backfilled"] = 0
+            return base
+        try:
+            uri = f"file:{self.path}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM key_sources) AS key_source_rows, "
+                    "(SELECT COUNT(*) FROM (SELECT key_hash FROM key_sources GROUP BY key_hash HAVING COUNT(*) > 1)) AS multi_source_keys"
+                ).fetchone()
+                key_source_rows = row["key_source_rows"] if row else 0
+                multi_source_keys = row["multi_source_keys"] if row else 0
+
+                marker_row = conn.execute(
+                    "SELECT value FROM meta WHERE key = 'key_sources_backfill'"
+                ).fetchone()
+                key_sources_backfilled = 0
+                if marker_row and marker_row["value"]:
+                    try:
+                        key_sources_backfilled = int(str(marker_row["value"]).split("@")[0])
+                    except (ValueError, IndexError):
+                        key_sources_backfilled = 0
+            finally:
+                conn.close()
+            base["key_source_rows"] = key_source_rows
+            base["multi_source_keys"] = multi_source_keys
+            base["key_sources_backfilled"] = key_sources_backfilled
+        except Exception:  # pragma: no cover - defensive fail-open
+            base["key_source_rows"] = 0
+            base["multi_source_keys"] = 0
+            base["key_sources_backfilled"] = 0
+        return base
 
     # ------------------------------------------------------------------
     # Write hooks (all fail-open)
@@ -881,6 +983,9 @@ class Registry:
         never pass a plaintext secret (secret hygiene, key-ledger-S9).  On an
         existing row ``first_seen_ts`` is preserved and ``last_recheck_ts`` /
         ``last_seen_ts`` advance with the check.
+
+        Additionally enqueues a ``key_sources`` row when both ``key_hash`` and
+        ``source_url_hash`` are non-empty (P22 D3).
         """
         if not key_hash:
             return
@@ -898,9 +1003,24 @@ class Registry:
                 "ts": moment,
             },
         )
+        # P22 D3: also record the (key, source) pair for multi-source tracking.
+        if source_url_hash:
+            self._enqueue(
+                _OP_KEY_SOURCE,
+                {
+                    "key_hash": key_hash,
+                    "url_hash": source_url_hash,
+                    "ts": moment,
+                },
+            )
 
-    def record_key_observation(self, key_hash: str, ts: Optional[float] = None) -> None:
-        """Advance ``last_seen_ts`` for a skipped observation (UPDATE-only)."""
+    def record_key_observation(self, key_hash: str, ts: Optional[float] = None, source_url_hash: str = "") -> None:
+        """Advance ``last_seen_ts`` for a skipped observation (UPDATE-only).
+
+        When ``source_url_hash`` is non-empty, also enqueues a ``key_sources``
+        row so the observation hook can link a new file even when the check
+        was skipped (P22 D3).
+        """
         if not key_hash:
             return
         moment = time.time() if ts is None else float(ts)
@@ -911,6 +1031,16 @@ class Registry:
                 "ts": moment,
             },
         )
+        # P22 D3: also record the (key, source) pair when known.
+        if source_url_hash:
+            self._enqueue(
+                _OP_KEY_SOURCE,
+                {
+                    "key_hash": key_hash,
+                    "url_hash": source_url_hash,
+                    "ts": moment,
+                },
+            )
 
     # ------------------------------------------------------------------
     # Run journaling (low frequency, written synchronously)
@@ -1083,6 +1213,7 @@ class Registry:
         repo_links = [payload for op, payload in batch if op == _OP_REPO_LINKS]
         key_upserts = [payload for op, payload in batch if op == _OP_KEY_UPSERT]
         key_observes = [payload for op, payload in batch if op == _OP_KEY_OBSERVE]
+        key_sources = [payload for op, payload in batch if op == _OP_KEY_SOURCE]
         file_upserts = [payload for op, payload in batch if op == _OP_FILE_UPSERT]
         file_touches = [payload for op, payload in batch if op == _OP_FILE_TOUCH]
         file_gones = [payload for op, payload in batch if op == _OP_FILE_GONE]
@@ -1126,6 +1257,8 @@ class Registry:
                 conn.executemany(_KEY_UPSERT_SQL, [self._key_upsert_row(payload) for payload in key_upserts])
             if key_observes:
                 conn.executemany(_KEY_OBSERVE_SQL, [self._key_observe_row(payload) for payload in key_observes])
+            if key_sources:
+                conn.executemany(_KEY_SOURCE_SQL, [self._key_source_row(payload) for payload in key_sources])
             if file_upserts:
                 conn.executemany(_FILE_UPSERT_SQL, [self._file_upsert_row(payload) for payload in file_upserts])
             if file_touches:
@@ -1142,6 +1275,10 @@ class Registry:
             if key_upserts:
                 dirty_repos |= repos_for_url_hashes(
                     conn, (payload["source_url_hash"] for payload in key_upserts)
+                )
+            if key_sources:
+                dirty_repos |= repos_for_url_hashes(
+                    conn, (payload["url_hash"] for payload in key_sources)
                 )
             if metadatas:
                 dirty_repos |= repos_for_url_hashes(conn, (row[7] for row in rows))
@@ -1269,6 +1406,10 @@ class Registry:
     @staticmethod
     def _key_observe_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
         return (payload["ts"], payload["ts"], payload["key_hash"])
+
+    @staticmethod
+    def _key_source_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (payload["key_hash"], payload["url_hash"], payload["ts"], payload["ts"])
 
     @staticmethod
     def _file_upsert_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:

@@ -40,6 +40,7 @@ _RENDERED_METRIC_SURFACES = (
     "credential_metrics",
     "prioritization_metrics",
     "provider_refusal_metrics",
+    "registry_metrics",
 )
 
 
@@ -357,6 +358,7 @@ class StatusDisplayEngine:
         file_dating_line = self._format_file_dating_metrics_line(status)
         early_stop_line = self._format_early_stop_metrics_line(status)
         key_ledger_line = self._format_key_ledger_metrics_line(status)
+        registry_line = self._format_registry_metrics_line(status)
         recheck_line = self._format_recheck_metrics_line(status)
         prioritization_line = self._format_prioritization_metrics_line(status)
         gather_line = self._format_gather_transport_metrics_line(status)
@@ -379,6 +381,8 @@ class StatusDisplayEngine:
                 lines.append(early_stop_line)
             if key_ledger_line:
                 lines.append(key_ledger_line)
+            if registry_line:
+                lines.append(registry_line)
             if recheck_line:
                 lines.append(recheck_line)
             if prioritization_line:
@@ -433,6 +437,9 @@ class StatusDisplayEngine:
 
         if key_ledger_line:
             lines.append(key_ledger_line)
+
+        if registry_line:
+            lines.append(registry_line)
 
         if recheck_line:
             lines.append(recheck_line)
@@ -556,6 +563,39 @@ class StatusDisplayEngine:
             f"KeyLedger: mode={metrics.get('mode', 'off')} "
             f"skipped[{rendered}] "
             f"saved={metrics.get('provider_calls_saved', 0)}"
+        )
+
+    @staticmethod
+    def _format_registry_metrics_line(status: SystemStatus) -> str:
+        """Render the registry multi-source observability line (P22 D7).
+
+        Emitted ONLY when the registry reports itself enabled AND available —
+        a disabled registry must not add console noise (mirrors the key-ledger
+        line which renders only in ``on`` mode).  Reads only declared keys via
+        ``metrics.get(...)``, degrades malformed/missing figures fail-open with
+        ``_metric_int``, and returns ``""`` when there is nothing honest to show.
+
+        Exact token order and spellings (pinned contract):
+        ``Registry: available=<bool> degraded=<bool> queued=<int> dropped=<int>
+        metadata_noops=<int> key_sources=<int> multi_source_keys=<int>
+        backfilled=<int>``
+        """
+        metrics = getattr(status.pipeline, "registry_metrics", None)
+        if not metrics:
+            return ""
+        # Only render when the registry is enabled AND available.
+        if not metrics.get("enabled", False) or not metrics.get("available", False):
+            return ""
+        metric_int = StatusDisplayEngine._metric_int
+        return (
+            f"Registry: available={metrics.get('available', False)} "
+            f"degraded={metrics.get('degraded', False)} "
+            f"queued={metric_int(metrics.get('queued'))} "
+            f"dropped={metric_int(metrics.get('dropped'))} "
+            f"metadata_noops={metric_int(metrics.get('metadata_noops'))} "
+            f"key_sources={metric_int(metrics.get('key_source_rows'))} "
+            f"multi_source_keys={metric_int(metrics.get('multi_source_keys'))} "
+            f"backfilled={metric_int(metrics.get('key_sources_backfilled'))}"
         )
 
     @staticmethod
