@@ -98,4 +98,5 @@ NO_RETRY_ERROR_CODES: Set[int] = {400, 401, 402, 404, 422}
 SERVICE_TYPE_GITHUB_API: str = "github_api"
 SERVICE_TYPE_GITHUB_WEB: str = "github_web"
 SERVICE_TYPE_GITHUB_RAW: str = "github_raw"
+SERVICE_TYPE_GITHUB_GRAPHQL: str = "github_graphql"  # add-file-commit-dating D4
 PROVIDER_SERVICE_PREFIX: str = "provider"

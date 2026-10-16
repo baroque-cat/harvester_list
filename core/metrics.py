@@ -238,6 +238,9 @@ class PipelineStatus:
     # Optional top-N priority candidates (empty while display_top_n == 0).
     prioritization_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Per-file commit-dating counters (add-file-commit-dating D12; empty while disabled).
+    file_dating_metrics: Dict[str, Any] = field(default_factory=dict)
+
     def queue_size(self) -> int:
         """Get total queue size across all stages"""
         return sum(stage.queue_size for stage in self.stages.values())

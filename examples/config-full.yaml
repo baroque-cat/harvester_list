@@ -224,6 +224,38 @@ enrichment:
   # Cache freshness TTL in hours before a conditional (If-None-Match) refresh
   ttl_hours: 24
 
+# Per-file commit dating (add-file-commit-dating). Answers "is this leak new or
+# old" for a file already listed in the registry: fetches the last commit that
+# touched one specific path and stores it in links.file_commit_date.
+# Measured price (live probe 2026-10-14, four files across four repositories):
+#   rest    GET /repos/{o}/{r}/commits?path=&per_page=1  -> 1 request + 1 core unit per file
+#   graphql one POST with N aliases                      -> rateLimit.cost = 1 for N = 4
+# The binding constraint is the basket, not the quota: 3 029 distinct files sit in
+# 2 524 repositories, so through github_api (~9 req/min, shared with code search)
+# full dating costs ~5.6 h and one 300 s run reaches ~1.8 % of them. Hence the
+# separate github_graphql bucket below plus a hard per-run request ceiling.
+# Requires registry.enabled for a durable cache. Default is off (inert).
+file_dating:
+  # Master switch; rollback is flipping this back to false, no code removal
+  enabled: false
+  # Acquisition transport: "rest" (one file per request, cost fully measured)
+  # or "graphql" (batched aliases; cost scaling above 4 is unmeasured, so the
+  # batch ceiling below bounds the unknown)
+  transport: "rest"
+  # Which files to date: "keyed" (only files where a credential was found --
+  # 225 keys vs 3 029 files measured, i.e. ~7 % of the request cost),
+  # "gathered" (every successfully fetched file) or "discovered" (every link)
+  scope: "keyed"
+  # Cache freshness TTL in hours before a conditional refresh is attempted
+  ttl_hours: 24
+  # Hard per-run request ceiling; reaching it stops dating quietly (counted as
+  # file_dating_budget_stopped) and never fails the run
+  max_requests_per_run: 200
+  # Aliases per GraphQL POST (transport: graphql only)
+  graphql_batch_size: 4
+  # Enforced ceiling for graphql_batch_size; rejected loudly at load time
+  graphql_batch_max: 50
+
 # Frontier-based API pagination early-stop configuration
 # (add-search-early-stop; API transport only, gated by registry trust)
 early_stop:
@@ -397,6 +429,13 @@ gather:
   #          the failure reported to the adaptive budget. Config-flip rollback;
   #          no code change or data migration.
   defer_local_suppression: true
+  # Conditional re-gather rollback flag (add-file-commit-dating D6).
+  #   true  (default): send If-None-Match when a stored etag exists and the
+  #          transport matches.  Measured: anonymous, empty body, ~150-180 ms,
+  #          zero quota on the contents API.
+  #   false: never send the precondition, byte-for-byte pre-change behavior
+  #          (etag storage may continue).  Config-flip rollback.
+  conditional_refetch: true
 
 # LLM-provider refusal classification (fix-provider-failure-classification)
 # A capacity refusal on the provider surface (check/inspect stages) is a typed
@@ -468,6 +507,22 @@ ratelimits:
   github_raw:
     # Base rate in requests per second
     base_rate: 2.0
+    # Maximum burst size
+    burst_limit: 4
+    # Enable adaptive rate limiting
+    adaptive: true
+  # Batched GraphQL dating traffic (file_dating.transport: graphql). Its own
+  # bucket on purpose: api.github.com/graphql would otherwise be matched by the
+  # generic api.github.com rule and compete with code search for the ~9 req/min
+  # github_api budget. The GraphQL pool was measured completely idle
+  # (5000 points/h, remaining 5000/5000) while a batch of 4 files cost 1 point.
+  github_graphql:
+    # Base rate in requests per second.
+    # Raised from 0.2 to 0.5 (gate arm C): at 0.2 s⁻¹ a batch costs 5 s of
+    # wall clock, which starved the single search thread in the 300 s gate run
+    # (one search task completed in 300 s).  0.5 s⁻¹ (30/min) is still far
+    # below the measured idle 5000 points/h pool.
+    base_rate: 0.5
     # Maximum burst size
     burst_limit: 4
     # Enable adaptive rate limiting

@@ -30,6 +30,7 @@ _RENDERED_METRIC_SURFACES = (
     "date_metrics",
     "skip_metrics",
     "enrichment_metrics",
+    "file_dating_metrics",
     "early_stop_metrics",
     "key_ledger_metrics",
     "aggregation_metrics",
@@ -353,6 +354,7 @@ class StatusDisplayEngine:
         date_line = self._format_date_metrics_line(status)
         skip_line = self._format_skip_metrics_line(status)
         enrichment_line = self._format_enrichment_metrics_line(status)
+        file_dating_line = self._format_file_dating_metrics_line(status)
         early_stop_line = self._format_early_stop_metrics_line(status)
         key_ledger_line = self._format_key_ledger_metrics_line(status)
         recheck_line = self._format_recheck_metrics_line(status)
@@ -371,6 +373,8 @@ class StatusDisplayEngine:
                 lines.append(skip_line)
             if enrichment_line:
                 lines.append(enrichment_line)
+            if file_dating_line:
+                lines.append(file_dating_line)
             if early_stop_line:
                 lines.append(early_stop_line)
             if key_ledger_line:
@@ -420,6 +424,9 @@ class StatusDisplayEngine:
 
         if enrichment_line:
             lines.append(enrichment_line)
+
+        if file_dating_line:
+            lines.append(file_dating_line)
 
         if early_stop_line:
             lines.append(early_stop_line)
@@ -494,6 +501,34 @@ class StatusDisplayEngine:
             f"fail={metrics.get('enrichment_failures', 0)} "
             f"cached={metrics.get('repos_cached', 0)} "
             f"gone={metrics.get('gone', 0)}{suffix}"
+        )
+
+    @staticmethod
+    def _format_file_dating_metrics_line(status: SystemStatus) -> str:
+        """Render the per-file commit-dating counter line (enabled only; spec S25/S26).
+
+        Disabled → no line at all.  Enabled with zero evidence → line present
+        with ``fill=0.0000`` and non-zero ``req``/``absent`` so the run is
+        visibly distinct from a disabled run.
+        """
+        metrics = getattr(status.pipeline, "file_dating_metrics", None)
+        if not metrics or not metrics.get("enabled", False):
+            return ""
+        metric_int = StatusDisplayEngine._metric_int
+        metric_rate = StatusDisplayEngine._metric_rate
+        return (
+            f"Dating: scope={metrics.get('scope', 'keyed')} "
+            f"transport={metrics.get('transport', 'rest')} "
+            f"req={metric_int(metrics.get('file_dating_requests'))} "
+            f"304={metric_int(metrics.get('file_dating_304s'))} "
+            f"filled={metric_int(metrics.get('file_dating_filled'))} "
+            f"absent={metric_int(metrics.get('file_dating_absent'))} "
+            f"batches={metric_int(metrics.get('file_dating_batches'))} "
+            f"cost={metric_int(metrics.get('file_dating_graphql_cost'))} "
+            f"refusals={metric_int(metrics.get('file_dating_refusals'))} "
+            f"budget_stop={metric_int(metrics.get('file_dating_budget_stopped'))} "
+            f"cached={metric_int(metrics.get('cached_hits'))} "
+            f"fill={metric_rate(metrics.get('fill_rate')):.4f}"
         )
 
     @staticmethod
@@ -635,7 +670,12 @@ class StatusDisplayEngine:
 
         body = (" ".join(segments) + " ") if segments else ""
         tail = f"head={head} trunc={truncated} badlink={badlinks}"
-        return f"Gather: {body}{deferred} {dropped} {tail}"
+        # F5: render gather_304 (add-file-commit-dating D6/D12) so conditional
+        # re-gathers are observable (gate arm B2: no way to tell whether any
+        # conditional 304 happened).
+        gather_304 = metric_int(metrics.get("gather_304"))
+        conditional = f"304={gather_304}"
+        return f"Gather: {body}{deferred} {dropped} {tail} {conditional}"
 
     @staticmethod
     def _format_aggregation_metrics_line(status: SystemStatus) -> str:

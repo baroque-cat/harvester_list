@@ -37,7 +37,7 @@ from tools.logger import get_logger
 logger = get_logger("storage")
 
 # Bump when the schema changes; later changes may only ADD columns/tables.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 REGISTRY_FILENAME = "registry.sqlite"
 
 # Operations understood by the writer thread.
@@ -51,6 +51,10 @@ _OP_REPO_GONE = "repo_gone"
 _OP_REPO_LINKS = "repo_links"
 _OP_KEY_UPSERT = "key_upsert"
 _OP_KEY_OBSERVE = "key_observe"
+_OP_FILE_UPSERT = "file_upsert"
+_OP_FILE_TOUCH = "file_touch"
+_OP_FILE_GONE = "file_gone"
+_OP_FILE_LINKS = "file_links"
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS links(
@@ -69,7 +73,9 @@ CREATE TABLE IF NOT EXISTS links(
   repo_pushed_at REAL,
   repo_size_kb INTEGER,
   file_commit_date REAL,
-  priority REAL
+  priority REAL,
+  etag TEXT,
+  etag_transport TEXT
 );
 
 CREATE TABLE IF NOT EXISTS link_coverage(
@@ -124,10 +130,26 @@ CREATE TABLE IF NOT EXISTS meta(
   value TEXT
 );
 
+-- Per-file freshness evidence cache (add-file-commit-dating D1/D2).  Keyed by
+-- (owner, repo, path) with a resolved_sha for cache invalidation.  Writes go
+-- through the single registry writer thread; always fail-open.
+CREATE TABLE IF NOT EXISTS file_meta(
+  owner TEXT NOT NULL,
+  repo TEXT NOT NULL,
+  path TEXT NOT NULL,
+  resolved_sha TEXT,
+  committed_date REAL,
+  etag TEXT,
+  fetched_at REAL NOT NULL,
+  gone INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(owner, repo, path)
+);
+
 CREATE INDEX IF NOT EXISTS idx_links_repo ON links(owner, repo);
 CREATE INDEX IF NOT EXISTS idx_links_last_seen ON links(last_seen_ts);
 CREATE INDEX IF NOT EXISTS idx_links_provider ON links(provider);
 CREATE INDEX IF NOT EXISTS idx_keys_recheck ON keys(status, last_recheck_ts);
+CREATE INDEX IF NOT EXISTS idx_file_meta_fetched ON file_meta(fetched_at);
 """
 
 _DISCOVER_SQL = """
@@ -143,8 +165,9 @@ ON CONFLICT(url_hash) DO UPDATE SET
 
 _GATHER_SQL = """
 INSERT INTO links (url_hash, url, owner, repo, path, first_seen_ts, last_seen_ts,
-                   gathered_ts, visit_status, transport, query_origin, provider)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   gathered_ts, visit_status, transport, query_origin, provider,
+                   etag, etag_transport)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(url_hash) DO UPDATE SET
   gathered_ts = CASE
       WHEN excluded.visit_status = 'gathered_ok' THEN excluded.gathered_ts
@@ -157,7 +180,15 @@ ON CONFLICT(url_hash) DO UPDATE SET
   END,
   last_seen_ts = MAX(COALESCE(links.last_seen_ts, excluded.last_seen_ts), excluded.last_seen_ts),
   transport = COALESCE(excluded.transport, links.transport),
-  provider = COALESCE(links.provider, excluded.provider)
+  provider = COALESCE(links.provider, excluded.provider),
+  etag = CASE
+      WHEN excluded.etag IS NOT NULL AND excluded.etag != '' THEN excluded.etag
+      ELSE links.etag
+  END,
+  etag_transport = CASE
+      WHEN excluded.etag IS NOT NULL AND excluded.etag != '' THEN excluded.etag_transport
+      ELSE links.etag_transport
+  END
 """
 
 _COVERAGE_SQL = """
@@ -195,26 +226,30 @@ WHERE key_hash = ?
 """
 
 # Non-regressing metadata merge: a NULL observation never erases a known value;
-# a non-NULL observation replaces the stored one (dates grow monotonically).
+# a non-NULL observation replaces the stored one only when strictly newer
+# (design D7: monotonic maximum).  repo_size_kb keeps COALESCE because size is
+# not a timestamp.
 # UPDATE-only on purpose: metadata must never fabricate a link row for an
 # unknown url_hash (verification finding S2 -- an INSERT would invent
 # first_seen_ts phantom links). Unknown hashes simply affect zero rows.
 _METADATA_SQL = """
 UPDATE links SET
-  repo_pushed_at = COALESCE(?, repo_pushed_at),
+  repo_pushed_at = CASE WHEN ? IS NULL THEN repo_pushed_at WHEN repo_pushed_at IS NULL THEN ? ELSE MAX(repo_pushed_at, ?) END,
   repo_size_kb = COALESCE(?, repo_size_kb),
-  file_commit_date = COALESCE(?, file_commit_date)
+  file_commit_date = CASE WHEN ? IS NULL THEN file_commit_date WHEN file_commit_date IS NULL THEN ? ELSE MAX(file_commit_date, ?) END
 WHERE url_hash = ?
 """
 
 # Repo-scoped metadata merge (add-repo-meta-enrichment D3/D2).  Same
 # non-regression contract as `_METADATA_SQL` but keyed by (owner, repo) so a
 # single successful fetch propagates to every link of the repository.
+# Date columns use a monotonic maximum (design D7): a NULL never overwrites a
+# known value, and a non-NULL replaces only when strictly newer.
 # UPDATE-only on purpose: unknown repositories affect zero rows and never
 # fabricate phantom link rows.
 _REPO_LINKS_SQL = """
 UPDATE links SET
-  repo_pushed_at = COALESCE(?, repo_pushed_at),
+  repo_pushed_at = CASE WHEN ? IS NULL THEN repo_pushed_at WHEN repo_pushed_at IS NULL THEN ? ELSE MAX(repo_pushed_at, ?) END,
   repo_size_kb = COALESCE(?, repo_size_kb)
 WHERE owner = ? AND repo = ?
 """
@@ -253,6 +288,56 @@ ON CONFLICT(owner, repo) DO UPDATE SET
   gone = 1
 """
 
+# Per-file cache upsert (add-file-commit-dating D1/D2).  committed_date uses
+# a monotonic maximum so a stale re-propagation never regresses the stored
+# value (design D7).
+_FILE_UPSERT_SQL = """
+INSERT INTO file_meta (owner, repo, path, resolved_sha, committed_date, etag, fetched_at, gone)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(owner, repo, path) DO UPDATE SET
+  resolved_sha = excluded.resolved_sha,
+  committed_date = CASE
+      WHEN excluded.committed_date IS NULL THEN file_meta.committed_date
+      WHEN file_meta.committed_date IS NULL THEN excluded.committed_date
+      ELSE MAX(file_meta.committed_date, excluded.committed_date)
+  END,
+  etag = excluded.etag,
+  fetched_at = excluded.fetched_at,
+  gone = excluded.gone
+"""
+
+# Touch-only refresh for a file cache 304: bump fetched_at and optionally
+# refresh the etag without touching committed_date.
+_FILE_TOUCH_SQL = """
+UPDATE file_meta SET
+  fetched_at = COALESCE(?, fetched_at),
+  etag = COALESCE(?, etag)
+WHERE owner = ? AND repo = ? AND path = ?
+"""
+
+# Takedown marker for a file path: records gone=1 while keeping any previously
+# known values, so a temporary 404 never erases evidence.
+_FILE_GONE_SQL = """
+INSERT INTO file_meta (owner, repo, path, resolved_sha, committed_date, etag, fetched_at, gone)
+VALUES (?, ?, ?, NULL, NULL, NULL, ?, 1)
+ON CONFLICT(owner, repo, path) DO UPDATE SET
+  fetched_at = excluded.fetched_at,
+  gone = 1
+"""
+
+# Propagate a known committed_date to every links row of (owner, repo, path).
+# Monotonic maximum (design D7): a NULL never overwrites, a non-NULL replaces
+# only when strictly newer.  UPDATE-only: unknown paths affect zero rows.
+_FILE_LINKS_SQL = """
+UPDATE links SET
+  file_commit_date = CASE
+      WHEN ? IS NULL THEN links.file_commit_date
+      WHEN links.file_commit_date IS NULL THEN ?
+      ELSE MAX(links.file_commit_date, ?)
+  END
+WHERE owner = ? AND repo = ? AND path = ?
+"""
+
 _RUN_UPSERT_SQL = """
 INSERT INTO runs (run_id, started_at, finished_at, config_digest, degraded)
 VALUES (?, ?, ?, ?, ?)
@@ -275,11 +360,21 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
 
     ``CREATE TABLE IF NOT EXISTS`` does not add columns to an existing table, so
     databases created at schema_version < 4 need an explicit, idempotent ALTER
-    guard (design D6: additive columns only).
+    guard (design D6: additive columns only).  schema_version < 5 adds the
+    ``etag`` and ``etag_transport`` columns to ``links``; the ``file_meta``
+    table needs no guard because ``CREATE TABLE IF NOT EXISTS`` in ``_DDL``
+    already handles it.
     """
     columns = {row[1] for row in conn.execute("PRAGMA table_info(keys)")}
     if "last_seen_ts" not in columns:
         conn.execute("ALTER TABLE keys ADD COLUMN last_seen_ts REAL")
+
+    # schema_version < 5: add etag/etag_transport to links (design D10).
+    link_columns = {row[1] for row in conn.execute("PRAGMA table_info(links)")}
+    if "etag" not in link_columns:
+        conn.execute("ALTER TABLE links ADD COLUMN etag TEXT")
+    if "etag_transport" not in link_columns:
+        conn.execute("ALTER TABLE links ADD COLUMN etag_transport TEXT")
 
 
 def canonical_url(url: str) -> str:
@@ -563,8 +658,15 @@ class Registry:
         success: bool = True,
         ts: Optional[float] = None,
         transport: str = "",
+        etag: Optional[str] = None,
+        etag_transport: str = "",
     ) -> None:
-        """Record a gather outcome; successful gathers also write coverage."""
+        """Record a gather outcome; successful gathers also write coverage.
+
+        ``etag`` and ``etag_transport`` carry the conditional-revalidation
+        token returned by the transport (design D6/link-registry-S10).  An
+        empty/None ``etag`` leaves any previously stored token untouched.
+        """
         self._enqueue(
             _OP_GATHER,
             {
@@ -574,6 +676,8 @@ class Registry:
                 "success": bool(success),
                 "transport": transport or "",
                 "ts": time.time() if ts is None else float(ts),
+                "etag": etag,
+                "etag_transport": etag_transport or "",
             },
         )
 
@@ -601,8 +705,10 @@ class Registry:
         ``metadata`` maps URL -> object carrying ``repo_pushed_at``,
         ``repo_size_kb`` and/or ``file_commit_date`` (for example a
         :class:`core.models.LinkMetadata`).  Missing attributes are treated as
-        NULL.  Merge policy: NULL never overwrites a known value; a non-NULL
-        value replaces the stored one.
+        NULL.  Merge policy (design D7): NULL never overwrites a known value;
+        a non-NULL date replaces the stored one only when strictly newer
+        (monotonic maximum).  ``repo_size_kb`` keeps COALESCE semantics
+        because size is not a timestamp.
         """
         if not metadata:
             return
@@ -685,6 +791,76 @@ class Registry:
                 "repo": repo or "",
                 "pushed_at": pushed_at,
                 "size_kb": size_kb,
+            },
+        )
+
+    def record_file_upsert(
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        resolved_sha: Optional[str] = None,
+        committed_date: Optional[float] = None,
+        etag: Optional[str] = None,
+        ts: Optional[float] = None,
+        gone: int = 0,
+    ) -> None:
+        """Replace the cached file metadata from a full response (design D1/D2)."""
+        self._enqueue(
+            _OP_FILE_UPSERT,
+            {
+                "owner": owner or "",
+                "repo": repo or "",
+                "path": path or "",
+                "resolved_sha": resolved_sha,
+                "committed_date": committed_date,
+                "etag": etag,
+                "ts": time.time() if ts is None else float(ts),
+                "gone": 1 if gone else 0,
+            },
+        )
+
+    def record_file_touch(
+        self, owner: str, repo: str, path: str, ts: Optional[float] = None, etag: Optional[str] = None
+    ) -> None:
+        """Touch-only refresh after a 304 (fetched_at bump, values preserved)."""
+        self._enqueue(
+            _OP_FILE_TOUCH,
+            {
+                "owner": owner or "",
+                "repo": repo or "",
+                "path": path or "",
+                "ts": time.time() if ts is None else float(ts),
+                "etag": etag,
+            },
+        )
+
+    def record_file_gone(self, owner: str, repo: str, path: str, ts: Optional[float] = None) -> None:
+        """Record a not-found target without erasing previously known values."""
+        self._enqueue(
+            _OP_FILE_GONE,
+            {
+                "owner": owner or "",
+                "repo": repo or "",
+                "path": path or "",
+                "ts": time.time() if ts is None else float(ts),
+            },
+        )
+
+    def record_file_link_metadata(
+        self, owner: str, repo: str, path: str, committed_date: Optional[float] = None
+    ) -> None:
+        """Propagate a known committed_date to every link of (owner, repo, path).
+
+        UPDATE-only: never fabricates link rows.  Monotonic maximum (design D7).
+        """
+        self._enqueue(
+            _OP_FILE_LINKS,
+            {
+                "owner": owner or "",
+                "repo": repo or "",
+                "path": path or "",
+                "committed_date": committed_date,
             },
         )
 
@@ -806,6 +982,42 @@ class Registry:
         return result["count"]
 
     # ------------------------------------------------------------------
+    # Read-side helpers (fail-open, read-only)
+    # ------------------------------------------------------------------
+
+    def get_link_fetch_state(self, url: str) -> Optional[Dict[str, Any]]:
+        """Read-only lookup of a link's gather status and conditional-revalidation token.
+
+        Returns ``{"visit_status": str, "etag": str, "etag_transport": str}``
+        when the link exists, or ``None`` when absent.  Uses a dedicated
+        read-only connection so it never enqueues a write and never raises
+        into a stage worker loop (design D6, mirrors ``FileMetaStore._conn``).
+        """
+        if not url or not self.enabled:
+            return None
+        try:
+            h = url_hash(url)
+            uri = f"file:{self.path}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT visit_status, etag, etag_transport FROM links WHERE url_hash = ?",
+                    (h,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is None:
+                return None
+            return {
+                "visit_status": row["visit_status"] or "",
+                "etag": row["etag"] or "",
+                "etag_transport": row["etag_transport"] or "",
+            }
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+    # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
@@ -871,6 +1083,10 @@ class Registry:
         repo_links = [payload for op, payload in batch if op == _OP_REPO_LINKS]
         key_upserts = [payload for op, payload in batch if op == _OP_KEY_UPSERT]
         key_observes = [payload for op, payload in batch if op == _OP_KEY_OBSERVE]
+        file_upserts = [payload for op, payload in batch if op == _OP_FILE_UPSERT]
+        file_touches = [payload for op, payload in batch if op == _OP_FILE_TOUCH]
+        file_gones = [payload for op, payload in batch if op == _OP_FILE_GONE]
+        file_links = [payload for op, payload in batch if op == _OP_FILE_LINKS]
 
         with self._write_lock:
             conn = self._conn
@@ -910,6 +1126,14 @@ class Registry:
                 conn.executemany(_KEY_UPSERT_SQL, [self._key_upsert_row(payload) for payload in key_upserts])
             if key_observes:
                 conn.executemany(_KEY_OBSERVE_SQL, [self._key_observe_row(payload) for payload in key_observes])
+            if file_upserts:
+                conn.executemany(_FILE_UPSERT_SQL, [self._file_upsert_row(payload) for payload in file_upserts])
+            if file_touches:
+                conn.executemany(_FILE_TOUCH_SQL, [self._file_touch_row(payload) for payload in file_touches])
+            if file_gones:
+                conn.executemany(_FILE_GONE_SQL, [self._file_gone_row(payload) for payload in file_gones])
+            if file_links:
+                conn.executemany(_FILE_LINKS_SQL, [self._file_links_row(payload) for payload in file_links])
 
             # Priority denormalization (add-target-prioritization D3): evidence
             # changes mark their owning repositories dirty; the same transaction
@@ -920,7 +1144,7 @@ class Registry:
                     conn, (payload["source_url_hash"] for payload in key_upserts)
                 )
             if metadatas:
-                dirty_repos |= repos_for_url_hashes(conn, (row[3] for row in rows))
+                dirty_repos |= repos_for_url_hashes(conn, (row[7] for row in rows))
             if repo_links:
                 dirty_repos |= {
                     (payload["owner"], payload["repo"])
@@ -971,6 +1195,8 @@ class Registry:
             payload["transport"],
             "",
             payload["provider"],
+            payload.get("etag"),
+            payload.get("etag_transport", ""),
         )
 
     @staticmethod
@@ -984,8 +1210,14 @@ class Registry:
         url, repo_pushed_at, repo_size_kb, file_commit_date = item
         canon = canonical_url(url)
         digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()
-        # Keyed by url_hash: metadata only updates rows already discovered.
-        return (repo_pushed_at, repo_size_kb, file_commit_date, digest)
+        # Monotonic maximum (design D7): each date parameter is bound three
+        # times for the CASE expression (NULL check, NULL-col check, MAX).
+        return (
+            repo_pushed_at, repo_pushed_at, repo_pushed_at,
+            repo_size_kb,
+            file_commit_date, file_commit_date, file_commit_date,
+            digest,
+        )
 
     @staticmethod
     def _repo_upsert_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
@@ -1010,7 +1242,13 @@ class Registry:
 
     @staticmethod
     def _repo_links_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
-        return (payload["pushed_at"], payload["size_kb"], payload["owner"], payload["repo"])
+        # Monotonic maximum (design D7): pushed_at is bound three times for the
+        # CASE expression (NULL check, NULL-col check, MAX).
+        return (
+            payload["pushed_at"], payload["pushed_at"], payload["pushed_at"],
+            payload["size_kb"],
+            payload["owner"], payload["repo"],
+        )
 
     @staticmethod
     def _key_upsert_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
@@ -1031,6 +1269,33 @@ class Registry:
     @staticmethod
     def _key_observe_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
         return (payload["ts"], payload["ts"], payload["key_hash"])
+
+    @staticmethod
+    def _file_upsert_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (
+            payload["owner"],
+            payload["repo"],
+            payload["path"],
+            payload["resolved_sha"],
+            payload["committed_date"],
+            payload["etag"],
+            payload["ts"],
+            payload["gone"],
+        )
+
+    @staticmethod
+    def _file_touch_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (payload["ts"], payload["etag"], payload["owner"], payload["repo"], payload["path"])
+
+    @staticmethod
+    def _file_gone_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (payload["owner"], payload["repo"], payload["path"], payload["ts"])
+
+    @staticmethod
+    def _file_links_row(payload: Dict[str, Any]) -> Tuple[Any, ...]:
+        # Monotonic maximum (design D7): committed_date bound three times.
+        cd = payload["committed_date"]
+        return (cd, cd, cd, payload["owner"], payload["repo"], payload["path"])
 
     def _enqueue(self, op: str, payload: Dict[str, Any]) -> None:
         if not self.enabled or not self._available or self._suppress_writes:

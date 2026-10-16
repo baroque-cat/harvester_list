@@ -1,0 +1,84 @@
+[
+  {
+    "sha": "d3f1f785e98e25eb3300a913193ef6e9aa0b5cac",
+    "node_id": "MDY6Q29tbWl0MzM3Njk3OTc6ZDNmMWY3ODVlOThlMjVlYjMzMDBhOTEzMTkzZWY2ZTlhYTBiNWNhYw==",
+    "commit": {
+      "author": {
+        "name": "bg_one@mail.ru",
+        "email": "bg111@users.noreply.github.com",
+        "date": "2011-06-30T19:18:15Z"
+      },
+      "committer": {
+        "name": "bg_one@mail.ru",
+        "email": "bg111@users.noreply.github.com",
+        "date": "2011-06-30T19:18:15Z"
+      },
+      "message": "fix typo in INSTALL",
+      "tree": {
+        "sha": "4f61e260acfb95c04b19010eddef4c7b1f52e3b6",
+        "url": "https://api.github.com/repos/bg111/asterisk-chan-dongle/git/trees/4f61e260acfb95c04b19010eddef4c7b1f52e3b6"
+      },
+      "url": "https://api.github.com/repos/bg111/asterisk-chan-dongle/git/commits/d3f1f785e98e25eb3300a913193ef6e9aa0b5cac",
+      "comment_count": 0,
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null,
+        "verified_at": null
+      }
+    },
+    "url": "https://api.github.com/repos/bg111/asterisk-chan-dongle/commits/d3f1f785e98e25eb3300a913193ef6e9aa0b5cac",
+    "html_url": "https://github.com/bg111/asterisk-chan-dongle/commit/d3f1f785e98e25eb3300a913193ef6e9aa0b5cac",
+    "comments_url": "https://api.github.com/repos/bg111/asterisk-chan-dongle/commits/d3f1f785e98e25eb3300a913193ef6e9aa0b5cac/comments",
+    "author": {
+      "login": "bg111",
+      "id": 11898185,
+      "node_id": "MDQ6VXNlcjExODk4MTg1",
+      "avatar_url": "https://avatars.githubusercontent.com/u/11898185?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/bg111",
+      "html_url": "https://github.com/bg111",
+      "followers_url": "https://api.github.com/users/bg111/followers",
+      "following_url": "https://api.github.com/users/bg111/following{/other_user}",
+      "gists_url": "https://api.github.com/users/bg111/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/bg111/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/bg111/subscriptions",
+      "organizations_url": "https://api.github.com/users/bg111/orgs",
+      "repos_url": "https://api.github.com/users/bg111/repos",
+      "events_url": "https://api.github.com/users/bg111/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/bg111/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "committer": {
+      "login": "bg111",
+      "id": 11898185,
+      "node_id": "MDQ6VXNlcjExODk4MTg1",
+      "avatar_url": "https://avatars.githubusercontent.com/u/11898185?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/bg111",
+      "html_url": "https://github.com/bg111",
+      "followers_url": "https://api.github.com/users/bg111/followers",
+      "following_url": "https://api.github.com/users/bg111/following{/other_user}",
+      "gists_url": "https://api.github.com/users/bg111/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/bg111/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/bg111/subscriptions",
+      "organizations_url": "https://api.github.com/users/bg111/orgs",
+      "repos_url": "https://api.github.com/users/bg111/repos",
+      "events_url": "https://api.github.com/users/bg111/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/bg111/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "parents": [
+      {
+        "sha": "1fb461484f8af87fecac8c06983b79f54e6be27a",
+        "url": "https://api.github.com/repos/bg111/asterisk-chan-dongle/commits/1fb461484f8af87fecac8c06983b79f54e6be27a",
+        "html_url": "https://github.com/bg111/asterisk-chan-dongle/commit/1fb461484f8af87fecac8c06983b79f54e6be27a"
+      }
+    ]
+  }
+]

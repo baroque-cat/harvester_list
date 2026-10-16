@@ -1098,6 +1098,65 @@ the status display when enabled (nothing is emitted while `off`).
 **Rollback:** set `enrichment.enabled: false` — a config flip; the `repos`
 cache simply stops being consulted and no code is removed.
 
+### Per-file commit dating
+
+`file_dating` answers the question repository-level metadata cannot: **is this
+leak new or old?** A repository's `pushed_at` is not a proxy for a file's own
+freshness — measured gaps against the file's last commit were 11, 35, 311 and
+**4 561 days**, uncorrelated with commit count. Dating therefore asks for the
+last commit that touched one specific path and writes it into
+`links.file_commit_date`, which lets a later run tell a fresh leak from one
+already recorded, sort candidates by age, and eventually stop searching when
+only old repositories keep appearing.
+
+Two interchangeable transports sit behind one switch: `rest` issues
+`GET /repos/{owner}/{repo}/commits?path=<file>&per_page=1` (one file per
+request, one `core` unit), while `graphql` batches several files into a single
+POST using `Commit.history(first: 1, path: …)` aliases — measured
+`rateLimit.cost = 1` for a batch of four files across four repositories, with
+dates byte-identical to the REST form. Batched traffic rides its own
+`ratelimits.github_graphql` bucket so it never competes with code search for
+the ~9 req/min `github_api` budget, and `max_requests_per_run` caps the whole
+subsystem per run: reaching the ceiling stops dating quietly and never fails
+the run.
+
+Evidence is cached per file in the registry's `file_meta` table keyed by
+`(owner, repo, path)` with the revision it was resolved against, so a fresh
+entry costs nothing, an expired one is revalidated conditionally, a target
+reported missing is marked gone and never retried, and the same path observed
+at a different revision invalidates the entry. Dates merge **monotonically**:
+a NULL never overwrites a known value and a known value is replaced only by a
+strictly newer one, so re-propagating a cached value can never move a recorded
+date backwards. Failures are typed signals, including the case GitHub reports
+inside a successful status — a `200` carrying `errors` is classified as a
+deferral, a permanent outcome or a transient failure rather than being returned
+as an empty answer.
+
+The same conditional-request mechanism also short-circuits gather: a link
+already gathered successfully keeps its response ETag (with the transport that
+produced it), and re-gathering it sends `If-None-Match`. A `304` transfers no
+payload, runs no extraction, appends no shard record and produces no key rows —
+prior findings stay exactly as they were — while recency still advances and
+`gather_304` counts the exchange. Tokens are never replayed across transports,
+because `raw.githubusercontent.com` and the contents API issue different ETags
+for the same file.
+
+**Metrics.** `file_dating_requests`, `file_dating_304s`, `file_dating_filled`,
+`file_dating_absent`, `file_dating_batches`, `file_dating_graphql_cost`,
+`file_dating_refusals` and `file_dating_budget_stopped` are exposed in
+`PipelineStatus.file_dating_metrics` and rendered as a single
+`Dating: scope=… transport=… req=… 304=… filled=… absent=… batches=… cost=… refusals=… budget_stop=… fill=0.0000`
+line when enabled (nothing is emitted while disabled). An enabled run that
+obtained no usable dates renders `fill=0.0000` with non-zero `req`/`absent`, so
+it stays visibly distinct from a run where dating never happened.
+
+**Rollback:** set `file_dating.enabled: false` — a config flip. The schema
+migration to version 5 is additive, so an older build still reads the database
+and no data rollback is needed. Conditional re-gathering (the `If-None-Match`
+precondition on already-gathered links) can be disabled independently with
+`gather.conditional_refetch: false` — a config flip that restores the
+pre-change byte-for-byte behavior without touching the dating subsystem.
+
 See `docs/specs/registry_flags_metrics.md` for the flag/metrics dictionary and
 the enrichment semantics.
 

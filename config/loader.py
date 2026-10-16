@@ -32,6 +32,7 @@ from .schemas import (
     DisplayContextConfig,
     EarlyStopConfig,
     EnrichmentConfig,
+    FileDatingConfig,
     GatherConfig,
     GlobalConfig,
     LoadBalanceStrategy,
@@ -141,6 +142,10 @@ class ConfigLoader:
         # Parse repository metadata enrichment configuration
         if "enrichment" in data:
             config.enrichment = self._parse_enrichment_config(data["enrichment"])
+
+        # Parse file commit-date acquisition configuration
+        if "file_dating" in data:
+            config.file_dating = self._parse_file_dating_config(data["file_dating"])
 
         # Parse frontier-based early-stop configuration
         if "early_stop" in data:
@@ -391,6 +396,25 @@ class ConfigLoader:
             ttl_hours=data.get("ttl_hours", 24.0),
         )
 
+    def _parse_file_dating_config(self, data: Dict[str, Any]) -> FileDatingConfig:
+        """Parse file commit-date acquisition configuration section
+
+        Args:
+            data: File-dating configuration data
+
+        Returns:
+            FileDatingConfig: Parsed file-dating configuration
+        """
+        return FileDatingConfig(
+            enabled=data.get("enabled", False),
+            transport=data.get("transport", "rest"),
+            scope=data.get("scope", "keyed"),
+            ttl_hours=data.get("ttl_hours", 24.0),
+            max_requests_per_run=data.get("max_requests_per_run", 200),
+            graphql_batch_size=data.get("graphql_batch_size", 4),
+            graphql_batch_max=data.get("graphql_batch_max", 50),
+        )
+
     def _parse_early_stop_config(self, data: Dict[str, Any]) -> EarlyStopConfig:
         """Parse frontier-based early-stop configuration section
 
@@ -526,6 +550,8 @@ class ConfigLoader:
             # Bool only: ``__post_init__``/validator reject a truthy string rather
             # than coercing it (design D5).
             defer_local_suppression=data.get("defer_local_suppression", True),
+            # F5: conditional re-gather rollback flag; no coercion.
+            conditional_refetch=data.get("conditional_refetch", True),
         )
 
     def _parse_credential_liveness_config(self, data: Dict[str, Any]) -> CredentialLivenessConfig:

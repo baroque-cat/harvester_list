@@ -41,6 +41,7 @@ class _FakeResponse:
         self.content = text.encode("utf-8")
         self.headers = headers or {}
         self.ok = 200 <= status < 300
+        self.reason = "OK" if self.ok else f"HTTP {status}"
 
     def json(self):
         import json
@@ -525,3 +526,162 @@ def test_configured_transport_lookup_degrades_instead_of_raising(monkeypatch):
 
     monkeypatch.setattr(config_pkg, "_config_instance", _Broken(), raising=False)
     assert sc._configured_gather_transport() == "raw"
+
+
+# ---------------------------------------------------------------------------
+# gather-transport-S30: unchanged content short-circuits the download
+# ---------------------------------------------------------------------------
+def test_s30_unchanged_content_short_circuits(stub_http):
+    """304 answer transfers no payload, completes as success, increments counter."""
+    stored_etag = 'W/"abc123"'
+    sess = stub_http(_FakeResponse(304, "", {}))
+
+    result = sc.fetch_gather_content(
+        BLOB,
+        transport="raw",
+        max_payload_bytes=1 << 20,
+        max_refusal_wait_s=5,
+        etag=stored_etag,
+        etag_transport="raw",
+    )
+
+    assert result == ""  # no payload transferred
+    stats = sc.get_gather_transport_stats()
+    assert stats["gather_304"] == 1
+    assert stats["requests_raw"] == 1
+    # Verify If-None-Match was sent
+    assert len(sess.calls) == 1
+    headers_sent = sess.calls[0].get("headers", {})
+    assert headers_sent.get("If-None-Match") == stored_etag
+
+
+# ---------------------------------------------------------------------------
+# gather-transport-S31: unchanged content preserves prior findings and advances recency
+# ---------------------------------------------------------------------------
+def test_s31_unchanged_preserves_findings(stub_http):
+    """304 returns empty content; caller (collect) returns empty service list."""
+    stored_etag = 'W/"def456"'
+    sess = stub_http(_FakeResponse(304, "", {}))
+
+    metadata = {}
+    services = sc.collect(
+        key_pattern=r"AKIA[0-9A-Z]{16}",
+        url=BLOB,
+        transport="raw",
+        metadata=metadata,
+        etag=stored_etag,
+        etag_transport="raw",
+    )
+
+    assert services == []  # no extraction ran
+    assert metadata.get("not_modified") is True
+    assert metadata.get("etag") == stored_etag
+    assert metadata.get("etag_transport") == "raw"
+
+
+# ---------------------------------------------------------------------------
+# gather-transport-S32: a token is never replayed across transports
+# ---------------------------------------------------------------------------
+def test_s32_token_never_replayed_across_transports(stub_http):
+    """An etag captured on 'rest' must NOT be sent when gathering via 'raw'."""
+    stored_etag = 'W/"rest-etag"'
+    sess = stub_http(_FakeResponse(200, "APP_KEY=hello"))
+
+    # etag was captured on 'rest', but we're gathering via 'raw'
+    result = sc.fetch_gather_content(
+        BLOB,
+        transport="raw",
+        max_payload_bytes=1 << 20,
+        max_refusal_wait_s=5,
+        etag=stored_etag,
+        etag_transport="rest",  # different transport!
+    )
+
+    assert result == "APP_KEY=hello"  # full fetch, not conditional
+    assert len(sess.calls) == 1
+    headers_sent = sess.calls[0].get("headers", {})
+    assert "If-None-Match" not in headers_sent  # no precondition sent
+
+
+# ---------------------------------------------------------------------------
+# gather-transport-S33: first gathering sends no conditional header
+# ---------------------------------------------------------------------------
+def test_s33_first_gathering_no_conditional(stub_http):
+    """A never-gathered link sends no If-None-Match."""
+    sess = stub_http(_FakeResponse(200, "APP_KEY=world", {"etag": 'W/"new-etag"'}))
+
+    response_info = {}
+    result = sc.fetch_gather_content(
+        BLOB,
+        transport="raw",
+        max_payload_bytes=1 << 20,
+        max_refusal_wait_s=5,
+        etag=None,  # no stored etag
+        etag_transport="",
+        out_response_info=response_info,
+    )
+
+    assert result == "APP_KEY=world"
+    assert len(sess.calls) == 1
+    headers_sent = sess.calls[0].get("headers", {})
+    assert "If-None-Match" not in headers_sent
+    # The response etag is available for storage
+    assert response_info.get("etag") == 'W/"new-etag"'
+    assert response_info.get("etag_transport") == "raw"
+
+
+# ---------------------------------------------------------------------------
+# gather-transport-S34: changed content falls through to a full fetch
+# ---------------------------------------------------------------------------
+def test_s34_changed_content_full_fetch(stub_http):
+    """A non-304 answer is processed exactly like an unconditional fetch."""
+    stored_etag = 'W/"old-etag"'
+    new_content = "APP_KEY=new_value"
+    sess = stub_http(_FakeResponse(200, new_content, {"etag": 'W/"new-etag"'}))
+
+    response_info = {}
+    result = sc.fetch_gather_content(
+        BLOB,
+        transport="raw",
+        max_payload_bytes=1 << 20,
+        max_refusal_wait_s=5,
+        etag=stored_etag,
+        etag_transport="raw",
+        out_response_info=response_info,
+    )
+
+    assert result == new_content  # full payload processed
+    assert response_info.get("status") == 200
+    assert response_info.get("etag") == 'W/"new-etag"'  # etag updated
+    stats = sc.get_gather_transport_stats()
+    assert stats["gather_304"] == 0  # not counted as unchanged
+
+
+# ---------------------------------------------------------------------------
+# gather-transport-S35: unusable revalidation answer degrades without losing findings
+# ---------------------------------------------------------------------------
+def test_s35_unusable_revalidation_degrades(stub_http):
+    """A conditional request that fails (e.g., 500) is classified by ordinary rules."""
+    stored_etag = 'W/"stored-etag"'
+    sess = stub_http(
+        _FakeResponse(503, "unavailable"),
+        _FakeResponse(503, "unavailable"),
+        _FakeResponse(503, "unavailable"),
+    )
+
+    with pytest.raises(TransientFetchError):
+        sc.fetch_gather_content(
+            BLOB,
+            transport="raw",
+            max_payload_bytes=1 << 20,
+            max_refusal_wait_s=5,
+            retries=1,
+            etag=stored_etag,
+            etag_transport="raw",
+        )
+
+    stats = sc.get_gather_transport_stats()
+    assert stats["gather_304"] == 0  # not counted as successful unchanged
+    # The failure is classified by ordinary rules (not a 304)
+    assert len(sess.calls) == 1  # single attempt with retries=1
+

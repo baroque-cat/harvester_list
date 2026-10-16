@@ -75,6 +75,9 @@ class ConfigValidator:
         # Validate repository metadata enrichment configuration
         self._validate_enrichment_config(config)
 
+        # Validate file commit-date acquisition configuration
+        self._validate_file_dating_config(config)
+
         # Validate frontier-based early-stop configuration
         self._validate_early_stop_config(config)
 
@@ -380,6 +383,56 @@ class ConfigValidator:
                 "(no persistent repo cache; all fetches would be retried every encounter)"
             )
 
+    def _validate_file_dating_config(self, config: Config) -> None:
+        """Validate file commit-date acquisition configuration section.
+
+        Mirrors FileDatingConfig.__post_init__ (deliberate duplication): the
+        validator collects errors instead of raising so an operator sees every
+        misconfiguration in one load.
+        """
+        fd = config.file_dating
+
+        if not isinstance(fd.enabled, bool):
+            self.errors.append("file_dating.enabled must be a boolean")
+
+        transport = str(fd.transport).strip().lower()
+        if transport not in ("rest", "graphql"):
+            self.errors.append("file_dating.transport must be one of: rest, graphql")
+
+        scope = str(fd.scope).strip().lower()
+        if scope not in ("keyed", "gathered", "discovered"):
+            self.errors.append("file_dating.scope must be one of: keyed, gathered, discovered")
+
+        ttl = float(fd.ttl_hours)
+        if ttl <= 0:
+            self.errors.append("file_dating.ttl_hours must be positive")
+
+        max_req = int(fd.max_requests_per_run)
+        if max_req < 0:
+            self.errors.append("file_dating.max_requests_per_run must be non-negative")
+
+        batch_size = int(fd.graphql_batch_size)
+        if batch_size < 1:
+            self.errors.append("file_dating.graphql_batch_size must be at least 1")
+
+        batch_max = int(fd.graphql_batch_max)
+        if batch_max < 1:
+            self.errors.append("file_dating.graphql_batch_max must be at least 1")
+
+        if batch_size > batch_max:
+            self.errors.append(
+                "file_dating.graphql_batch_size must not exceed file_dating.graphql_batch_max"
+            )
+
+        # Cross-check: dating results live in the registry; without it the
+        # cache has nowhere durable to read/write and silently degrades to
+        # re-fetching on every encounter.
+        if fd.enabled and not config.registry.enabled:
+            self.warnings.append(
+                "file_dating.enabled=true has no effect while registry.enabled is false "
+                "(no persistent date cache; all fetches would be retried every encounter)"
+            )
+
     def _validate_early_stop_config(self, config: Config) -> None:
         """Validate frontier-based early-stop configuration section
 
@@ -572,6 +625,10 @@ class ConfigValidator:
                 f"gather.defer_local_suppression must be a boolean "
                 f"(got: {gather_config.defer_local_suppression!r})"
             )
+
+        # F5: conditional_refetch — no coercion, mirrored from __post_init__.
+        if not isinstance(gather_config.conditional_refetch, bool):
+            self.errors.append("gather.conditional_refetch must be a boolean")
 
         wait_cap = float(gather_config.max_refusal_wait_s)
         if wait_cap <= 0:

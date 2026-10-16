@@ -27,6 +27,8 @@ from storage.key_ledger import KeyLedger
 from storage.registry import Registry, config_digest as build_config_digest, init_registry
 from storage.priority import top_candidates
 from storage.repo_meta import RepoMetaEnricher, RepoMetaStore, tokens_cooling_down
+from storage.file_dating import FileDater
+from storage.file_meta import FileMetaStore
 from tools.coordinator import get_session, get_token, get_user_agent
 from tools.logger import get_logger
 from tools.ratelimit import RateLimiter
@@ -154,6 +156,27 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             client=client.get_github_client(),
             enabled=config.enrichment.enabled,
             ttl_hours=config.enrichment.ttl_hours,
+            cooling_probe=tokens_cooling_down,
+        )
+
+        # Per-file commit-date dating (off by default; add-file-commit-dating D9).
+        # Mirrors the enrichment construction: the cache is the registry, the
+        # dater rides the shared github_api client/buckets.
+        self.file_meta_store = FileMetaStore(
+            workspace=config.global_config.workspace,
+            ttl_hours=config.file_dating.ttl_hours,
+            registry=self.link_registry,
+            registry_path=self.link_registry.path,
+        )
+        self.file_dating = FileDater(
+            self.file_meta_store,
+            auth=get_auth_provider(),
+            client=client.get_github_client(),
+            enabled=config.file_dating.enabled,
+            transport=config.file_dating.transport,
+            scope=config.file_dating.scope,
+            max_requests_per_run=config.file_dating.max_requests_per_run,
+            graphql_batch_size=config.file_dating.graphql_batch_size,
             cooling_probe=tokens_cooling_down,
         )
 
@@ -313,6 +336,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             early_stop=self.early_stop,
             key_ledger=self.key_ledger,
             refine_governor=self.refine_governor,
+            file_dating=self.file_dating,
         )
 
         # Create stages in dependency order
@@ -401,6 +425,8 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         self.link_registry.stop()
         self.gather_skip.close()
         self.enrichment.close()
+        if hasattr(self, "file_dating"):
+            self.file_dating.close()
         self.early_stop.close()
         self.key_ledger.close()
         self.recheck.close()
@@ -487,6 +513,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             date_metrics=self.date_metrics.to_stats(),
             skip_metrics=self.gather_skip.to_stats(),
             enrichment_metrics=self.enrichment.to_stats(),
+            file_dating_metrics=self.file_dating.to_stats() if hasattr(self, "file_dating") else {},
             early_stop_metrics=self.early_stop.to_stats(),
             key_ledger_metrics=self.key_ledger.to_stats(),
             recheck_metrics=self.recheck.to_stats(),

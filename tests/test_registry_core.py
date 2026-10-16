@@ -61,12 +61,12 @@ def test_s3_schema_bootstrap_on_empty_workspace(workspace, db_rows, db_scalar, r
     assert os.path.exists(registry_path(workspace))
 
     names = {row["name"] for row in db_rows(workspace, "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"links", "link_coverage", "keys", "runs"} <= names
+    assert {"links", "link_coverage", "keys", "runs", "repos", "meta", "file_meta"} <= names
 
     indexes = {row["name"] for row in db_rows(workspace, "SELECT name FROM sqlite_master WHERE type='index'")}
-    assert {"idx_links_repo", "idx_links_last_seen"} <= indexes
+    assert {"idx_links_repo", "idx_links_last_seen", "idx_file_meta_fetched"} <= indexes
 
-    assert db_scalar(workspace, "PRAGMA user_version") >= 1
+    assert db_scalar(workspace, "PRAGMA user_version") == 5
 
 
 def test_s7_flag_off_behaves_exactly_as_today(workspace, registry_path):
@@ -297,3 +297,46 @@ def test_pipeline_run_journaling_is_wired(workspace, db_rows):
     row = db_rows(workspace, "SELECT started_at, finished_at FROM runs")[0]
     assert row["started_at"] is not None
     assert row["finished_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# link-registry-S10: revalidation token stored with transport
+# ---------------------------------------------------------------------------
+def test_s10_gather_stores_etag_and_transport(workspace, db_rows):
+    """link-registry-S10: a successful gather with etag stores both values."""
+    registry = _open(workspace)
+    registry.record_link(URL, ts=1.0)
+    registry.record_gather(URL, provider="openai", patterns_hash="ph", success=True, ts=5.0, etag="abc", etag_transport="raw")
+    registry.flush(5.0)
+
+    # Recording again with a different transport replaces both.
+    registry.record_gather(URL, provider="openai", patterns_hash="ph", success=True, ts=10.0, etag="def", etag_transport="rest")
+    registry.flush(5.0)
+
+    # Recording with no etag arguments leaves the stored pair untouched.
+    registry.record_gather(URL, provider="openai", patterns_hash="ph", success=True, ts=15.0)
+    registry.flush(5.0)
+    registry.stop()
+
+    row = db_rows(workspace, "SELECT etag, etag_transport, visit_status FROM links WHERE url = ?", [URL])[0]
+    assert row["etag"] == "def"
+    assert row["etag_transport"] == "rest"
+    assert row["visit_status"] == "gathered_ok"
+
+
+# ---------------------------------------------------------------------------
+# link-registry-S11: absent token leaves the row usable
+# ---------------------------------------------------------------------------
+def test_s11_gather_without_token_records_normally(workspace, db_rows):
+    """link-registry-S11: a gather with no token records status normally."""
+    registry = _open(workspace)
+    registry.record_link(URL, ts=1.0)
+    registry.record_gather(URL, provider="openai", patterns_hash="ph", success=True, ts=5.0)
+    registry.flush(5.0)
+    registry.stop()
+
+    row = db_rows(workspace, "SELECT visit_status, gathered_ts, etag, etag_transport FROM links WHERE url = ?", [URL])[0]
+    assert row["visit_status"] == "gathered_ok"
+    assert row["gathered_ts"] == 5.0
+    assert row["etag"] is None
+    assert row["etag_transport"] is None or row["etag_transport"] == ""

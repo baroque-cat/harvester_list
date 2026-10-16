@@ -61,6 +61,33 @@ def _refresh_repo_meta(resources: StageResources, urls: List[str]) -> None:
         logger.debug(f"[enrichment] repository metadata refresh failed (fail-open): {e}")
 
 
+def _date_file_links(resources: StageResources, urls: List[str]) -> Dict[str, Optional[float]]:
+    """Lazily fetch per-file commit dates for discovered/gathered links (fail-open).
+
+    Mirrors ``_refresh_repo_meta``: inert when the resource is absent or
+    disabled.  The dater's scope determines which URLs are actually dated;
+    the hook simply passes the available population and lets the orchestrator
+    decide (design D8).
+
+    Returns the ``date_urls_map`` result (``{url: date_or_None}``) so the
+    caller can merge API-obtained dates into the URL-keyed metadata channel
+    (F1: the ``(owner, repo, path)``-keyed ``_FILE_LINKS_SQL`` never matches
+    because ``links.path`` carries the ``blob/<ref>/…`` prefix while
+    ``file_meta.path`` is clean — gate arm B finding).
+    """
+    dater = getattr(resources, "file_dating", None)
+    if dater is None or not getattr(dater, "enabled", False):
+        return {}
+    try:
+        # F3: pass the default wall-clock budget so dating cannot starve the
+        # search thread for an entire run (gate arm C).
+        from storage.file_dating import DEFAULT_DATING_BUDGET_SECONDS
+        return dater.date_urls_map(urls, budget=DEFAULT_DATING_BUDGET_SECONDS)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"[file_dating] per-file dating failed (fail-open): {e}")
+        return {}
+
+
 @register_stage(
     name=PipelineStage.SEARCH.value,
     depends_on=[],
@@ -235,6 +262,14 @@ class SearchStage(BasePipelineStage):
             return {}
         # Refresh stale repository metadata before evaluating push evidence.
         _refresh_repo_meta(self.resources, links)
+        # Dating hook for scope="discovered" ONLY (F2, spec S23):
+        # date every discovered link.  Other scopes are enforced at the
+        # gather-worker call sites.
+        dater = getattr(self.resources, "file_dating", None)
+        if dater is not None and getattr(dater, "enabled", False):
+            scope = getattr(dater, "scope", "keyed")
+            if scope == "discovered":
+                _date_file_links(self.resources, links)
         try:
             digest = patterns_hash(
                 key_pattern=patterns.key_pattern,
@@ -553,6 +588,17 @@ class AcquisitionStage(BasePipelineStage):
         """Pure functional acquisition worker implementation"""
         mode = self._failure_handling_mode()
         try:
+            # Conditional re-gather (design D6): look up the stored etag and
+            # pass it only when the link is already gathered_ok and the token's
+            # transport matches the currently configured gather transport.
+            # F5: gated by gather.conditional_refetch flag (rollback: set false
+            # to restore pre-change behavior — no If-None-Match sent).
+            etag, etag_transport = self._lookup_etag(task.url)
+            current_transport = self.resources.config.gather.transport
+            conditional_refetch = getattr(self.resources.config.gather, "conditional_refetch", True)
+            if not conditional_refetch or not etag or etag_transport != current_transport:
+                etag, etag_transport = None, ""
+
             # Execute acquisition using global collect function
             metadata: Dict[str, Any] = {}
             try:
@@ -564,7 +610,9 @@ class AcquisitionStage(BasePipelineStage):
                     endpoint_pattern=task.endpoint_pattern,
                     model_pattern=task.model_pattern,
                     metadata=metadata,
-                    transport=self.resources.config.gather.transport,
+                    transport=current_transport,
+                    etag=etag,
+                    etag_transport=etag_transport,
                 )
             except RateLimitDeferral:
                 # A deferral records NO gather outcome at all: no visit_status
@@ -584,12 +632,43 @@ class AcquisitionStage(BasePipelineStage):
                     self._detect_failure_empty(task, e)
                 services = []
 
+            # add-file-commit-dating D6: a 304 means unchanged content.  Skip
+            # extraction-dependent output (no add_result, no check tasks, no
+            # shard record), still add_links and record gather success so
+            # recency advances.  Persist the returned etag.
+            not_modified = bool(metadata.get("not_modified"))
+            returned_etag = metadata.get("etag") or ""
+            returned_etag_transport = metadata.get("etag_transport") or ""
+
             # Lazily enrich the gathered repository's metadata (cache-first;
             # fail-open) so link rows carry repository push evidence.
             _refresh_repo_meta(self.resources, [task.url])
 
             # Create output object
             output = StageOutput(task=task)
+
+            if not_modified:
+                # 304: no extraction ran, no findings to propagate.
+                # Still record the gather as successful (recency advances).
+                output.add_links(task.provider, [task.url])
+                self._record_gathered(
+                    task, success=True,
+                    etag=returned_etag, etag_transport=returned_etag_transport,
+                )
+                # Dating hook for scope="gathered" (304 still counts as gathered).
+                dater = getattr(self.resources, "file_dating", None)
+                if dater is not None and getattr(dater, "enabled", False):
+                    scope = getattr(dater, "scope", "keyed")
+                    if scope in ("gathered", "discovered"):
+                        api_dates = _date_file_links(self.resources, [task.url])
+                        # F1: merge API date into the URL-keyed metadata channel.
+                        api_date = api_dates.get(task.url)
+                        if api_date is not None:
+                            output.add_link_metadata(
+                                task.provider,
+                                {task.url: LinkMetadata(file_commit_date=api_date, transport=self._transport(task))},
+                            )
+                return output
 
             # Carry the gathered page's file-commit date to the registry writer
             # and feed the web fill-rate drift monitor.
@@ -612,11 +691,42 @@ class AcquisitionStage(BasePipelineStage):
                 # Add material keys to be saved
                 output.add_result(task.provider, ResultType.MATERIAL.value, services)
 
+                # Dating hook for scope="keyed": only files that produced services.
+                dater = getattr(self.resources, "file_dating", None)
+                if dater is not None and getattr(dater, "enabled", False):
+                    scope = getattr(dater, "scope", "keyed")
+                    if scope == "keyed":
+                        api_dates = _date_file_links(self.resources, [task.url])
+                        # F1: API date takes precedence over markup-derived date.
+                        api_date = api_dates.get(task.url)
+                        if api_date is not None:
+                            output.add_link_metadata(
+                                task.provider,
+                                {task.url: LinkMetadata(file_commit_date=api_date, transport=self._transport(task))},
+                            )
+
             # Add the processed link to be saved
             output.add_links(task.provider, [task.url])
 
+            # Dating hook for scope="gathered": after any successful gather.
+            dater = getattr(self.resources, "file_dating", None)
+            if dater is not None and getattr(dater, "enabled", False):
+                scope = getattr(dater, "scope", "keyed")
+                if scope == "gathered":
+                    api_dates = _date_file_links(self.resources, [task.url])
+                    # F1: API date takes precedence over markup-derived date.
+                    api_date = api_dates.get(task.url)
+                    if api_date is not None:
+                        output.add_link_metadata(
+                            task.provider,
+                            {task.url: LinkMetadata(file_commit_date=api_date, transport=self._transport(task))},
+                        )
+
             # Write-only hook: record successful gather + coverage
-            self._record_gathered(task, success=True)
+            self._record_gathered(
+                task, success=True,
+                etag=returned_etag, etag_transport=returned_etag_transport,
+            )
 
             return output
 
@@ -640,7 +750,24 @@ class AcquisitionStage(BasePipelineStage):
         config = self.resources.task_configs.get(task.provider)
         return "api" if getattr(config, "use_api", False) else "web"
 
-    def _record_gathered(self, task: AcquisitionTask, success: bool) -> None:
+    def _lookup_etag(self, url: str) -> Tuple[Optional[str], str]:
+        """Read-only lookup of a link's stored etag and its transport (design D6).
+
+        Returns ``(etag, etag_transport)``; both empty when the link is unknown
+        or the lookup fails.  Never raises and never enqueues a write.
+        """
+        registry = getattr(self.resources, "registry", None)
+        if registry is None or not getattr(registry, "available", False):
+            return None, ""
+        try:
+            state = registry.get_link_fetch_state(url)
+        except Exception:  # pragma: no cover - defensive
+            return None, ""
+        if state is None:
+            return None, ""
+        return state.get("etag") or None, state.get("etag_transport") or ""
+
+    def _record_gathered(self, task: AcquisitionTask, success: bool, etag: Optional[str] = None, etag_transport: str = "") -> None:
         """Write-only hook: record a gather outcome (and coverage on success)."""
         registry = getattr(self.resources, "registry", None)
         if registry is None:
@@ -663,6 +790,8 @@ class AcquisitionStage(BasePipelineStage):
                 patterns_hash=digest,
                 success=success,
                 transport=transport,
+                etag=etag,
+                etag_transport=etag_transport,
             )
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(f"[{self.name}] registry gather hook failed: {e}")

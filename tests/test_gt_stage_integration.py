@@ -273,6 +273,7 @@ def test_s21_transport_economics_are_observable(monkeypatch):
         "head_fallback",
         "unparseable_link",
         "truncated",
+        "gather_304",  # add-file-commit-dating D12
         "latency_samples_raw",
         "latency_p50_ms_raw",
         "latency_p99_ms_raw",

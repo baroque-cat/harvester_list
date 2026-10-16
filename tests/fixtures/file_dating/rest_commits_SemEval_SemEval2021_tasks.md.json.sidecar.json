@@ -1,0 +1,9 @@
+{
+  "endpoint": "GET https://api.github.com/repos/SemEval/SemEval2021/commits?path=tasks.md&per_page=1",
+  "http_status": 200,
+  "captured_at": "2026-10-16T03:19:33.062853+00:00",
+  "auth_mode": "pat",
+  "etag": "",
+  "x_ratelimit_remaining": "",
+  "x_ratelimit_limit": ""
+}

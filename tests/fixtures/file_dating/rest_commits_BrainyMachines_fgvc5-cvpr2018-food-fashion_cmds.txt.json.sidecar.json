@@ -1,0 +1,9 @@
+{
+  "endpoint": "GET https://api.github.com/repos/BrainyMachines/fgvc5-cvpr2018-food-fashion/commits?path=cmds.txt&per_page=1",
+  "http_status": 200,
+  "captured_at": "2026-10-16T03:19:26.169643+00:00",
+  "auth_mode": "pat",
+  "etag": "",
+  "x_ratelimit_remaining": "",
+  "x_ratelimit_limit": ""
+}

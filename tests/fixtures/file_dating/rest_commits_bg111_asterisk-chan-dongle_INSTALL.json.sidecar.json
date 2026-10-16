@@ -1,0 +1,9 @@
+{
+  "endpoint": "GET https://api.github.com/repos/bg111/asterisk-chan-dongle/commits?path=INSTALL&per_page=1",
+  "http_status": 200,
+  "captured_at": "2026-10-16T03:19:29.602076+00:00",
+  "auth_mode": "pat",
+  "etag": "",
+  "x_ratelimit_remaining": "",
+  "x_ratelimit_limit": ""
+}

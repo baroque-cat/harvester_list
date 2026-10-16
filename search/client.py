@@ -15,8 +15,9 @@ import threading
 import time
 import traceback
 import urllib.parse
+from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import requests
 
@@ -225,6 +226,7 @@ from constant.system import (
     GITHUB_WEB_COUNT_DELAY_MAX,
     NO_RETRY_ERROR_CODES,
     SERVICE_TYPE_GITHUB_API,
+    SERVICE_TYPE_GITHUB_GRAPHQL,
     SERVICE_TYPE_GITHUB_RAW,
     SERVICE_TYPE_GITHUB_WEB,
 )
@@ -291,6 +293,12 @@ class GitHubClient:
             return None
 
         url_lower = url.lower()
+        # add-file-commit-dating D4: GraphQL must precede the generic API match,
+        # otherwise batched dating would compete with code search for the ~9/min
+        # ``github_api`` budget.  The path check is narrow enough to match only
+        # the GraphQL endpoint.
+        if "api.github.com" in url_lower and url_lower.rstrip("/").endswith("/graphql"):
+            return SERVICE_TYPE_GITHUB_GRAPHQL
         if "api.github.com" in url_lower:
             return SERVICE_TYPE_GITHUB_API
         if "raw.githubusercontent.com" in url_lower:
@@ -480,6 +488,113 @@ class GitHubClient:
             github_credential_state.mark_success(service, credential)
 
         return status, content, response_headers
+
+    def post_with_status(
+        self,
+        url: str,
+        headers: Optional[Dict] = None,
+        json_data: Optional[Any] = None,
+        retries: int = 3,
+        interval: float = 0,
+        timeout: float = 10,
+        credential: Optional[str] = None,
+    ) -> Tuple[int, str, Dict[str, str]]:
+        """Rate-limited POST that surfaces the HTTP status (add-file-commit-dating D3).
+
+        Mirrors :meth:`get_with_status` exactly: same ``_service``/``_limit``/
+        ``_report`` discipline, same ``ok = status in (200, 304, 404)`` handling
+        extended to POST semantics, ``GithubCredentialLimited`` propagating.
+        """
+        service = self._service(url)
+
+        if service and not self._limit(service, credential):
+            logger.debug(f"Rate limit acquisition failed for {service}")
+            return 0, "", {}
+
+        status, content, response_headers = self._http_post_status(url, headers, json_data, retries, interval, timeout)
+        ok = status in (200, 304, 404)
+
+        self._report(service, ok, credential)
+
+        if (
+            service
+            and credential
+            and status not in (304, 404)
+            and self.is_rate_limited_content(service, content)
+        ):
+            self.mark_credential_limited(
+                service=service,
+                credential=credential,
+                headers=response_headers,
+                content=content,
+                reason="response content indicates rate limit",
+            )
+
+        if service and credential and ok:
+            github_credential_state.mark_success(service, credential)
+
+        return status, content, response_headers
+
+    def _http_post_status(
+        self,
+        url: str,
+        headers: Optional[Dict] = None,
+        json_data: Optional[Any] = None,
+        retries: int = 3,
+        interval: float = 1.0,
+        timeout: float = 10,
+    ) -> Tuple[int, str, Dict[str, str]]:
+        """HTTP POST preserving the status code (mirrors ``_http_get_status`` retries)."""
+        if isblank(url):
+            raise ValidationError("URL cannot be empty", field="url")
+
+        headers = headers or {"Content-Type": "application/json"}
+        timeout = max(1, timeout)
+        retries = max(1, retries)
+        interval = max(0.1, interval)
+        last_error: Optional[Exception] = None
+
+        for attempt in range(retries):
+            try:
+                with managed_network(
+                    request("POST", url, headers=headers, json=json_data, timeout=timeout), "http_connection"
+                ) as response:
+                    status = int(getattr(response, "status_code", 200) or 200)
+                    return status, self._decode_response(response.content), dict(response.headers)
+            except GithubCredentialLimited:
+                raise
+            except requests.exceptions.HTTPError as e:
+                code = http_error_status(e)
+                reason = http_error_message(e)
+                response_headers = dict(e.response.headers) if e.response is not None else {}
+                if self._is_http_rate_limited(code, reason):
+                    service = self._service(url)
+                    credential = self._credential_from_headers(headers or {}, service)
+                    if service and credential:
+                        self.mark_credential_limited(service, credential, response_headers, reason, reason)
+
+                if code == 429 or code >= 500:
+                    last_error = ConnectionError(f"HTTP {code} error: {reason}")
+                elif code in (401, 402, 403):
+                    raise NetworkError(f"Authentication failed (HTTP {code})")
+                else:
+                    return code, "", response_headers
+            except requests.exceptions.Timeout as e:
+                last_error = TimeoutError(f"Request timeout: {e}")
+            except requests.exceptions.RequestException as e:
+                last_error = ConnectionError(f"Request error: {e}")
+            except Exception as e:
+                if "timeout" in str(e).lower():
+                    last_error = TimeoutError(f"Request timeout: {e}")
+                else:
+                    raise NetworkError(f"Unexpected error: {e}")
+
+            if attempt + 1 < retries:
+                time.sleep(interval)
+
+        if last_error is not None:
+            raise last_error
+        return 0, "", {}
 
     def _http_get_status(
         self,
@@ -1090,6 +1205,7 @@ _GATHER_TRANSPORT_STAT_KEYS: Tuple[str, ...] = (
     "head_fallback",
     "unparseable_link",
     "truncated",
+    "gather_304",  # add-file-commit-dating D6/D12
 )
 
 _GATHER_TRANSPORT_STATS: Dict[str, int] = {key: 0 for key in _GATHER_TRANSPORT_STAT_KEYS}
@@ -1674,6 +1790,9 @@ def fetch_gather_content(
     retries: int = 3,
     timeout: float = 10,
     defer_local_suppression: Optional[bool] = None,
+    etag: Optional[str] = None,
+    etag_transport: str = "",
+    out_response_info: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Fetch gathered file content through the configured transport (design D6).
 
@@ -1690,6 +1809,13 @@ def fetch_gather_content(
     overrides that classification; ``None`` resolves the operator flag through
     :func:`_configured_defer_local_suppression`, and ``False`` restores the
     legacy failure-empty byte-for-byte (design D5/D13).
+
+    add-file-commit-dating D6: when ``etag`` is non-empty and ``etag_transport``
+    equals the transport actually in use, the underlying request sends
+    ``If-None-Match: <etag>``.  On a 304 answer, no payload is transferred, the
+    counter ``gather_304`` increments, and an empty string is returned.  The
+    caller can detect this via ``out_response_info["status"] == 304``.  A 304
+    is a successful fetch outcome, not a failure.
     """
     kind = str(transport).strip().lower()
     if kind not in ("html", "raw", "rest"):
@@ -1727,6 +1853,16 @@ def fetch_gather_content(
             )
         if credential:
             headers["Authorization"] = f"Bearer {credential}"
+
+    # add-file-commit-dating D6: conditional re-gather.  Send If-None-Match
+    # only when the link holds a stored etag captured on the SAME transport.
+    # A 304 is a successful outcome (no payload, counter increments, empty
+    # string returned).  The raw transport stays anonymous (no credential
+    # attached that today's raw path does not attach).
+    conditional = False
+    if etag and etag_transport and etag_transport == kind:
+        headers["If-None-Match"] = etag
+        conditional = True
 
     attempts = max(1, int(retries))
     cap = max(1, int(max_payload_bytes))
@@ -1776,6 +1912,20 @@ def fetch_gather_content(
             response_headers = dict(e.response.headers) if e.response is not None else {}
             if client is not None:
                 client._report(service, False, credential)
+
+            # add-file-commit-dating D6: a 304 arriving as an HTTPError (some
+            # request libraries raise on non-2xx) is still a successful
+            # unchanged-content outcome, not a failure.
+            if status == 304 and conditional:
+                _gather_stat_inc("gather_304")
+                if client is not None:
+                    client._report(service, True, credential)
+                _gather_latency_observe(kind, (time.perf_counter() - started) * 1000.0)
+                if out_response_info is not None:
+                    out_response_info["status"] = 304
+                    out_response_info["etag"] = _header(response_headers, "etag") or etag
+                    out_response_info["etag_transport"] = kind
+                return ""
 
             # A rate-limit signal must be checked BEFORE the bare 403/401 branch:
             # GitHub delivers secondary limits as 403 (the misclassification fix).
@@ -1831,6 +1981,20 @@ def fetch_gather_content(
                 continue
             raise last_error
 
+        # add-file-commit-dating D6: check for 304 on the successful response path.
+        response_status = int(getattr(response, "status_code", 200) or 200)
+        if response_status == 304 and conditional:
+            _gather_stat_inc("gather_304")
+            if client is not None:
+                client._report(service, True, credential)
+            _gather_latency_observe(kind, (time.perf_counter() - started) * 1000.0)
+            response_headers = dict(getattr(response, "headers", {}) or {})
+            if out_response_info is not None:
+                out_response_info["status"] = 304
+                out_response_info["etag"] = _header(response_headers, "etag") or etag
+                out_response_info["etag_transport"] = kind
+            return ""
+
         try:
             text, delivered = _read_capped_payload(response, kind, cap)
         except Exception as e:
@@ -1846,11 +2010,414 @@ def fetch_gather_content(
         if client is not None:
             client._report(service, True, credential)
         _gather_stat_inc(f"bytes_{kind}", delivered)
+        if out_response_info is not None:
+            response_headers = dict(getattr(response, "headers", {}) or {})
+            out_response_info["status"] = response_status
+            out_response_info["etag"] = _header(response_headers, "etag")
+            out_response_info["etag_transport"] = kind
         return text
 
     if last_error is not None:
         raise last_error
     raise TransientFetchError(f"gather fetch failed for url: {target}")
+
+
+# ---------------------------------------------------------------------------
+# Per-file commit-date fetchers (add-file-commit-dating D3/D5/D11/D12)
+#
+# Two transports behind one interface: REST (one file per request) and batched
+# GraphQL (N files per request).  Every external shape is pinned to a captured
+# fixture; every fault degrades to "no evidence" plus a counter, and nothing
+# here may fabricate a date.  ``GithubCredentialLimited`` propagates so callers
+# can rotate credentials; every other failure degrades to status=0 (fail-open).
+# ---------------------------------------------------------------------------
+
+_FILE_DATE_STAT_KEYS: Tuple[str, ...] = (
+    "file_dating_requests",
+    "file_dating_304s",
+    "file_dating_filled",
+    "file_dating_absent",
+    "file_dating_batches",
+    "file_dating_graphql_cost",
+    "file_dating_refusals",
+    "file_dating_budget_stopped",
+)
+
+_FILE_DATE_STATS: Dict[str, int] = {key: 0 for key in _FILE_DATE_STAT_KEYS}
+
+
+def _file_date_stat_inc(key: str, amount: int = 1) -> None:
+    """Increment a declared file-dating counter; undeclared keys are logged and dropped."""
+    if key not in _FILE_DATE_STATS:
+        logger.warning(f"undeclared file dating counter ignored: {key}")
+        return
+    _FILE_DATE_STATS[key] = _FILE_DATE_STATS.get(key, 0) + int(amount)
+
+
+def get_file_date_stats() -> Dict[str, int]:
+    """Expose file-dating counters as a flat copy (design D12)."""
+    return dict(_FILE_DATE_STATS)
+
+
+def reset_file_date_stats() -> None:
+    """Reset file-dating counters (tests / fresh runs)."""
+    for key in _FILE_DATE_STAT_KEYS:
+        _FILE_DATE_STATS[key] = 0
+
+
+@dataclass
+class FileDateResult:
+    """Outcome of one per-file commit-date fetch (add-file-commit-dating D3).
+
+    ``status`` mirrors the house pattern in ``fetch_repo_metadata``: 200 for a
+    full response, 304 for unchanged, 404 for gone, 0 for fail-open network
+    failure.  ``committed_date`` is UTC epoch seconds when known, else None
+    (NEVER fabricated).  ``error`` carries the exception text for status=0.
+    """
+
+    owner: str
+    repo: str
+    path: str
+    status: int
+    committed_date: Optional[float] = None
+    sha: str = ""
+    etag: Optional[str] = None
+    cost: int = 0
+    error: str = ""
+
+
+def _header(headers: Any, name: str) -> str:
+    """Case-insensitive header lookup; returns empty string when absent."""
+    if not headers:
+        return ""
+    target = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == target:
+            return str(value)
+    return ""
+
+
+def _load_json(content: str) -> Any:
+    """Parse JSON from a response body; returns None on failure."""
+    try:
+        return json.loads(content)
+    except Exception:
+        return None
+
+
+def fetch_file_commit_date(
+    owner: str,
+    repo: str,
+    path: str,
+    sha: Optional[str] = None,
+    credential: Optional[str] = None,
+    client: Any = None,
+    timeout: float = GITHUB_API_TIMEOUT,
+    retries: int = 3,
+) -> FileDateResult:
+    """Fetch one file's last-commit date via the REST commits endpoint (design D3).
+
+    URL: ``GET /repos/{owner}/{repo}/commits?path={path}&per_page=1[&sha={sha}]``.
+    Mirrors ``fetch_repo_metadata`` precisely: ``GithubCredentialLimited``
+    propagates; every other failure degrades to status=0 (fail-open).  304
+    preserves the previous etag; 404 marks the target gone.  200 parses
+    ``commit.committer.date`` with ``commit.author.date`` as fallback.
+
+    A non-list body, an empty list, a missing ``commit`` object, or an
+    unparseable date yields ``committed_date=None`` and increments
+    ``file_dating_absent`` — it NEVER fabricates a date and NEVER raises.
+    """
+    from storage.file_meta import COMMITS_API_BASE
+
+    if client is None:
+        client = get_github_client()
+
+    _file_date_stat_inc("file_dating_requests")
+
+    url = f"{COMMITS_API_BASE}/{owner}/{repo}/commits"
+    params: Dict[str, str] = {"path": path, "per_page": "1"}
+    if sha and _HEX40_RE.match(sha):
+        params["sha"] = sha
+
+    headers: Dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if credential:
+        headers["Authorization"] = f"Bearer {credential}"
+
+    try:
+        status, content, response_headers = client.get_with_status(
+            url,
+            headers=headers,
+            params=params,
+            retries=retries,
+            interval=0,
+            timeout=timeout,
+            credential=credential,
+        )
+    except GithubCredentialLimited:
+        raise
+    except Exception as exc:
+        return FileDateResult(owner, repo, path, 0, error=str(exc))
+
+    status = int(status or 0)
+    response_etag = _header(response_headers, "etag")
+
+    if status == 304:
+        _file_date_stat_inc("file_dating_304s")
+        return FileDateResult(owner, repo, path, 304, etag=response_etag)
+    if status == 404:
+        return FileDateResult(owner, repo, path, 404)
+    if status == 200:
+        body = _load_json(content)
+        if not isinstance(body, list) or len(body) == 0:
+            _file_date_stat_inc("file_dating_absent")
+            return FileDateResult(owner, repo, path, 200, etag=response_etag)
+        commit_obj = body[0].get("commit") if isinstance(body[0], dict) else None
+        if not isinstance(commit_obj, dict):
+            _file_date_stat_inc("file_dating_absent")
+            return FileDateResult(owner, repo, path, 200, etag=response_etag)
+        date_str = (
+            commit_obj.get("committer", {}).get("date")
+            if isinstance(commit_obj.get("committer"), dict)
+            else None
+        )
+        if not date_str:
+            date_str = (
+                commit_obj.get("author", {}).get("date")
+                if isinstance(commit_obj.get("author"), dict)
+                else None
+            )
+        committed_date = parse_iso_epoch(date_str)
+        if committed_date is None:
+            _file_date_stat_inc("file_dating_absent")
+        else:
+            _file_date_stat_inc("file_dating_filled")
+        return FileDateResult(
+            owner,
+            repo,
+            path,
+            200,
+            committed_date=committed_date,
+            sha=body[0].get("sha", "") if isinstance(body[0], dict) else "",
+            etag=response_etag,
+        )
+    return FileDateResult(owner, repo, path, status, error=f"unexpected status {status}")
+
+
+# Recognised GraphQL error extension codes for classification (design D5).
+_GQL_RATE_LIMIT_CODES = frozenset({
+    "RATE_LIMITED",
+    "SECONDARY_RATE_LIMIT",
+    "FORBIDDEN",  # when combined with rate-limit wording
+})
+_GQL_NOT_FOUND_CODES = frozenset({
+    "NOT_FOUND",
+})
+
+
+def _classify_graphql_error(error: Dict[str, Any]) -> str:
+    """Classify one GraphQL error into ``'rate_limit'``, ``'not_found'``, or ``'transient'``.
+
+    Design D5: errors inside a 200 are classified into the existing typed
+    signals.  The classification is driven by ``extensions.code`` first, then
+    by message content as a fallback.
+    """
+    extensions = error.get("extensions") or {}
+    code = str(extensions.get("code", "")).upper()
+    message = str(error.get("message", ""))
+
+    if code in _GQL_RATE_LIMIT_CODES:
+        return "rate_limit"
+    if code in _GQL_NOT_FOUND_CODES:
+        return "not_found"
+    # Fallback: check message content for rate-limit markers
+    if LIMIT_MARKERS.search(message):
+        return "rate_limit"
+    return "transient"
+
+
+def _escape_graphql_string(value: str) -> str:
+    """Escape a value for embedding in a GraphQL string literal.
+
+    Rejects values containing characters that could break the query structure.
+    Returns the escaped value, or raises ValueError for unsafe input.
+    """
+    if "\\" in value or '"' in value:
+        raise ValueError(f"unsafe characters in GraphQL string: {value!r}")
+    return value
+
+
+def fetch_file_commit_dates_batch(
+    items: Sequence[Tuple[str, str, str, str]],
+    credential: Optional[str] = None,
+    client: Any = None,
+    timeout: float = GITHUB_API_TIMEOUT,
+    retries: int = 3,
+) -> Dict[Tuple[str, str, str], FileDateResult]:
+    """Fetch several files' last-commit dates in one GraphQL request (design D3/D5).
+
+    ``items`` is a sequence of ``(owner, repo, path, sha)`` tuples.  One POST
+    to the GraphQL endpoint with N aliases resolves all files in a single
+    request.  ``rateLimit.cost`` is recorded; errors inside a 200 are classified
+    (design D5): rate-limit → ``RateLimitDeferral``; not-found → 404 semantics;
+    unrecognised → ``TransientFetchError``.  Partial success is preserved:
+    aliases that returned data are delivered even when others errored.
+
+    Returns a dict keyed by ``(owner, repo, path)`` → ``FileDateResult``.
+    """
+    from storage.file_meta import GRAPHQL_API_URL
+
+    if client is None:
+        client = get_github_client()
+
+    _file_date_stat_inc("file_dating_batches")
+
+    # Build the query with aliases
+    aliases = []
+    valid_items = []
+    for i, (owner, repo, path, sha) in enumerate(items):
+        if not sha or not _HEX40_RE.match(sha):
+            # Skip items without a usable sha
+            continue
+        try:
+            safe_owner = _escape_graphql_string(owner)
+            safe_repo = _escape_graphql_string(repo)
+            safe_path = _escape_graphql_string(path)
+        except ValueError:
+            # Reject this item individually rather than failing the batch
+            continue
+        aliases.append(
+            f'f{i}: repository(owner:"{safe_owner}", name:"{safe_repo}")'
+            f'{{object(expression:"{sha}")'
+            f'{{... on Commit{{history(first:1,path:"{safe_path}")'
+            f'{{nodes{{committedDate}}}}}}}}}}'
+        )
+        valid_items.append((owner, repo, path, sha))
+
+    if not aliases:
+        return {}
+
+    # F4: count one HTTP request per batch POST so get_file_date_stats()
+    # agrees with the dater's _requests_this_run (gate arm C: req=0 despite
+    # 25 HTTP POSTs).  Placed after the alias check so empty batches (no POST)
+    # do not inflate the counter.
+    _file_date_stat_inc("file_dating_requests")
+
+    query = "{ " + " ".join(aliases) + " rateLimit{cost remaining} }"
+
+    headers: Dict[str, str] = {
+        "Content-Type": "application/json",
+    }
+    if credential:
+        headers["Authorization"] = f"Bearer {credential}"
+
+    try:
+        status, content, response_headers = client.post_with_status(
+            GRAPHQL_API_URL,
+            headers=headers,
+            json_data={"query": query},
+            retries=retries,
+            interval=0,
+            timeout=timeout,
+            credential=credential,
+        )
+    except GithubCredentialLimited:
+        raise
+    except Exception as exc:
+        # Fail-open: return empty results for all items
+        return {
+            (owner, repo, path): FileDateResult(owner, repo, path, 0, error=str(exc))
+            for owner, repo, path, _ in valid_items
+        }
+
+    status = int(status or 0)
+    body = _load_json(content)
+
+    if status != 200 or not isinstance(body, dict):
+        return {
+            (owner, repo, path): FileDateResult(owner, repo, path, status, error=f"unexpected status {status}")
+            for owner, repo, path, _ in valid_items
+        }
+
+    data = body.get("data") or {}
+    errors = body.get("errors") or []
+
+    # Record rateLimit.cost
+    rate_limit = data.get("rateLimit") or {}
+    cost = int(rate_limit.get("cost", 0))
+    _file_date_stat_inc("file_dating_graphql_cost", cost)
+
+    # Classify errors (design D5)
+    rate_limit_error = None
+    not_found_aliases = set()
+    transient_aliases = []
+    for err in errors:
+        if not isinstance(err, dict):
+            continue
+        classification = _classify_graphql_error(err)
+        if classification == "rate_limit":
+            _file_date_stat_inc("file_dating_refusals")
+            rate_limit_error = err
+        elif classification == "not_found":
+            _file_date_stat_inc("file_dating_refusals")
+            # Try to extract the alias from the error path
+            path_list = err.get("path") or []
+            if path_list and isinstance(path_list, list) and len(path_list) > 0:
+                alias = str(path_list[0])
+                not_found_aliases.add(alias)
+        else:
+            _file_date_stat_inc("file_dating_refusals")
+            transient_aliases.append(err)
+
+    # If there's a rate-limit error, raise RateLimitDeferral
+    if rate_limit_error is not None:
+        from tools.http_signals import wait_from_headers
+        wait = wait_from_headers(response_headers)
+        if wait is None:
+            wait = 60.0  # default bounded wait
+        wait = min(wait, 60.0)  # cap at 60s
+        raise RateLimitDeferral(
+            f"GraphQL rate limit: {rate_limit_error.get('message', 'unknown')}",
+            wait_s=wait,
+        )
+
+    # If there are transient errors, raise TransientFetchError
+    if transient_aliases:
+        raise TransientFetchError(
+            f"GraphQL transient error: {transient_aliases[0].get('message', 'unknown')}"
+        )
+
+    # Parse successful results
+    results: Dict[Tuple[str, str, str], FileDateResult] = {}
+    for i, (owner, repo, path, sha) in enumerate(valid_items):
+        alias_key = f"f{i}"
+        if alias_key in not_found_aliases:
+            results[(owner, repo, path)] = FileDateResult(owner, repo, path, 404)
+            continue
+
+        alias_data = data.get(alias_key) or {}
+        obj = alias_data.get("object") or {}
+        history = obj.get("history") or {}
+        nodes = history.get("nodes") or []
+
+        if nodes and isinstance(nodes, list) and len(nodes) > 0:
+            date_str = nodes[0].get("committedDate")
+            committed_date = parse_iso_epoch(date_str)
+            if committed_date is not None:
+                _file_date_stat_inc("file_dating_filled")
+                results[(owner, repo, path)] = FileDateResult(
+                    owner, repo, path, 200, committed_date=committed_date, sha=sha, cost=cost
+                )
+            else:
+                _file_date_stat_inc("file_dating_absent")
+                results[(owner, repo, path)] = FileDateResult(owner, repo, path, 200, sha=sha, cost=cost)
+        else:
+            _file_date_stat_inc("file_dating_absent")
+            results[(owner, repo, path)] = FileDateResult(owner, repo, path, 200, sha=sha, cost=cost)
+
+    return results
 
 
 def chat(
@@ -2419,6 +2986,8 @@ def collect(
     text: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     transport: Optional[str] = None,
+    etag: Optional[str] = None,
+    etag_transport: str = "",
 ) -> List[Service]:
     """Extract API keys and related information from URLs or text content
 
@@ -2432,11 +3001,21 @@ def collect(
         text: Text content to search (if provided, url is ignored)
         metadata: Optional out-mapping; receives ``file_commit_date`` (epoch
             float or ``None``) extracted from the already-downloaded page.
+            add-file-commit-dating D6: also receives ``not_modified`` (bool),
+            ``etag`` (str or empty), and ``etag_transport`` (str) so the stage
+            layer can skip shard writes on a 304 and store the new token.
         transport: Gather transport (``html``/``raw``/``rest``).  When ``None``
             the URL path resolves against the operator configuration
             (``gather.transport``, see ``_configured_gather_transport``) and an
             explicit-text payload keeps the historical rendered-page date
             parsing.  An explicit argument always wins over configuration.
+        etag: add-file-commit-dating D6.  When non-empty and ``etag_transport``
+            equals the transport actually in use, the underlying request sends
+            ``If-None-Match: <etag>``.  On a 304 answer, no extraction runs,
+            an empty service list is returned, and ``metadata["not_modified"]``
+            is set to True.
+        etag_transport: The transport that captured the stored etag.  Must
+            match the current transport for the conditional header to be sent.
 
     Returns:
         List[Service]: List of Service objects with extracted information
@@ -2459,17 +3038,38 @@ def collect(
         # fail-open.
         fetch_transport = resolved or _configured_gather_transport()
         parse_file_date = fetch_transport == "html"
+        response_info: Dict[str, Any] = {}
         try:
             content = fetch_gather_content(
                 url=url,
                 transport=fetch_transport,
                 retries=retries,
                 defer_local_suppression=_configured_defer_local_suppression(),
+                etag=etag,
+                etag_transport=etag_transport,
+                out_response_info=response_info,
             )
         except (TransientFetchError, RateLimitDeferral):
             raise
         except Exception as e:
             raise TransientFetchError(f"gather fetch failed for url: {url}: {e}") from e
+
+        # add-file-commit-dating D6: a 304 is a successful unchanged-content
+        # outcome.  No extraction runs, no shard write, return empty.
+        if response_info.get("status") == 304:
+            if metadata is not None:
+                metadata["not_modified"] = True
+                metadata["etag"] = response_info.get("etag", "")
+                metadata["etag_transport"] = response_info.get("etag_transport", "")
+                metadata["file_commit_date"] = None
+            return []
+
+        # Publish the response etag/transport so the caller can store them.
+        if metadata is not None:
+            metadata["not_modified"] = False
+            metadata["etag"] = response_info.get("etag", "")
+            metadata["etag_transport"] = response_info.get("etag_transport", "")
+
         if not content:
             raise TransientFetchError(f"empty gather payload for url: {url}")
 

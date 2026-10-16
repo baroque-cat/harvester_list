@@ -58,6 +58,7 @@ class StageResources:
     early_stop: Any = None  # EarlyStopEngine (add-search-early-stop; off by default)
     key_ledger: Any = None  # KeyLedger (add-key-ledger; check-skip off by default)
     refine_governor: Any = None  # RefineGovernor (add-refine-fanout-governor; fail-open None == off)
+    file_dating: Any = None  # FileDater (add-file-commit-dating; inert when disabled)
 
     def is_enabled(self, provider: str, stage: str) -> bool:
         """Check if stage is enabled for provider"""

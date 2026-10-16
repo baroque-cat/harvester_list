@@ -266,3 +266,96 @@ def test_s9_stage_workers_feed_fill_rate_counters(monkeypatch):
             )
         )
     assert metrics.date_fill_rate_web == pytest.approx(0.80)
+
+
+# ---------------------------------------------------------------------------
+# date-extraction-S12: monotonic date writes — stale cached date does not regress
+# ---------------------------------------------------------------------------
+def test_s12_monotonic_date_writes_never_regress(workspace, db_scalar):
+    """S12: a newer stored date is preserved when a stale value is propagated."""
+    url = "https://github.com/acme/widgets/blob/main/config.py"
+    registry = _registry(workspace)
+    assert registry.start() is True
+    try:
+        registry.record_link(url, transport="api", provider="openai")
+        registry.flush(2.0)
+
+        # Write a fresh date.
+        registry.record_metadata({url: LinkMetadata(file_commit_date=2_000.0)})
+        registry.flush(2.0)
+
+        # A stale re-propagation (e.g. from a 304 cached value) must NOT regress.
+        registry.record_metadata({url: LinkMetadata(file_commit_date=1_000.0)})
+        registry.flush(2.0)
+
+        assert db_scalar(workspace, "SELECT file_commit_date FROM links LIMIT 1") == pytest.approx(2_000.0)
+
+        # Same for repo_pushed_at.
+        registry.record_metadata({url: LinkMetadata(repo_pushed_at=5_000.0)})
+        registry.flush(2.0)
+        registry.record_metadata({url: LinkMetadata(repo_pushed_at=3_000.0)})
+        registry.flush(2.0)
+
+        assert db_scalar(workspace, "SELECT repo_pushed_at FROM links LIMIT 1") == pytest.approx(5_000.0)
+
+        # NULL propagation still never erases a known value (re-pin S7).
+        registry.record_metadata({url: LinkMetadata(transport="web")})
+        registry.flush(2.0)
+
+        assert db_scalar(workspace, "SELECT file_commit_date FROM links LIMIT 1") == pytest.approx(2_000.0)
+        assert db_scalar(workspace, "SELECT repo_pushed_at FROM links LIMIT 1") == pytest.approx(5_000.0)
+    finally:
+        registry.stop()
+
+
+# ---------------------------------------------------------------------------
+# date-extraction-S7 (delta): markup silence does not block API-sourced evidence
+# ---------------------------------------------------------------------------
+def test_s7_delta_markup_silence_does_not_block_api_evidence(workspace, db_scalar):
+    """S7-delta: markup yields no date but API evidence for the same path fills file_commit_date."""
+    url = "https://github.com/acme/widgets/blob/main/config.py"
+    registry = _registry(workspace)
+    assert registry.start() is True
+    try:
+        # Record a link (discovered via web, no markup date).
+        registry.record_link(url, transport="web", provider="openai")
+        registry.flush(2.0)
+
+        # Markup yielded NULL — file_commit_date is NULL.
+        assert db_scalar(workspace, "SELECT file_commit_date FROM links LIMIT 1") is None
+
+        # API evidence arrives for the same path (via the file-dating subsystem).
+        registry.record_metadata({url: LinkMetadata(file_commit_date=1_700_000_000.0, transport="api")})
+        registry.flush(2.0)
+
+        # file_commit_date is now populated from the API evidence.
+        assert db_scalar(workspace, "SELECT file_commit_date FROM links LIMIT 1") == pytest.approx(1_700_000_000.0)
+    finally:
+        registry.stop()
+
+
+# ---------------------------------------------------------------------------
+# date-extraction-S9 (delta): web-discovered link is still dateable
+# ---------------------------------------------------------------------------
+def test_s9_delta_web_discovered_link_is_still_dateable(workspace, db_scalar):
+    """S9-delta: a link discovered with use_api=False is still dateable through API evidence."""
+    url = "https://github.com/acme/widgets/blob/main/config.py"
+    registry = _registry(workspace)
+    assert registry.start() is True
+    try:
+        # Discovered through web transport (use_api=False).
+        registry.record_link(url, transport="web", provider="openai")
+        registry.flush(2.0)
+
+        # No date at discovery time.
+        assert db_scalar(workspace, "SELECT file_commit_date FROM links LIMIT 1") is None
+
+        # Per-file API evidence arrives later (from the file-dating subsystem).
+        registry.record_metadata({url: LinkMetadata(file_commit_date=1_700_000_000.0, transport="api")})
+        registry.flush(2.0)
+
+        # file_commit_date is recorded even though no date was ever parsed
+        # from a search-results page.
+        assert db_scalar(workspace, "SELECT file_commit_date FROM links LIMIT 1") == pytest.approx(1_700_000_000.0)
+    finally:
+        registry.stop()

@@ -1,0 +1,84 @@
+[
+  {
+    "sha": "af6de88309f158d86a101f7ba45e5a77c7df0e2d",
+    "node_id": "MDY6Q29tbWl0MjQ0NTA1NDg5OmFmNmRlODgzMDlmMTU4ZDg2YTEwMWY3YmE0NWU1YTc3YzdkZjBlMmQ=",
+    "commit": {
+      "author": {
+        "name": "Guy Emerson",
+        "email": "gete2@cam.ac.uk",
+        "date": "2021-07-09T18:30:09Z"
+      },
+      "committer": {
+        "name": "GitHub",
+        "email": "noreply@github.com",
+        "date": "2021-07-09T18:30:09Z"
+      },
+      "message": "Update tasks.md\n\n(typo)",
+      "tree": {
+        "sha": "4190ce8d26e1743b256d6175cf209cbfb3fd0d69",
+        "url": "https://api.github.com/repos/SemEval/SemEval2021/git/trees/4190ce8d26e1743b256d6175cf209cbfb3fd0d69"
+      },
+      "url": "https://api.github.com/repos/SemEval/SemEval2021/git/commits/af6de88309f158d86a101f7ba45e5a77c7df0e2d",
+      "comment_count": 0,
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\nwsBcBAABCAAQBQJg6JWxCRBK7hj4Ov3rIwAAusoIAC7NwRqt5stTeQL83i8vPI8V\ntnvI0EeWYq8WKFMLPl/SmbZxGdhedo5hZCc/n+fFHW6tYibuM7rdODydv6Mdbb9I\n/md4Ta6VtZrPqJBGYw+ZaJUQbSC+goGahz2McNb6n/YjjAIpmdq64SSUENbtthBk\nTXPKjns6uOPPaKQZe484pVOwgACFJ7L8zAWPhOMhnVgWtO+9wMScHKmCbZHVn1kl\nH/rdF4YrtrQ5U3GIkl7oxVFYj5AHcb4czB6yBc2uxM5hZ2rjpLzus4LQCooDiPuK\n0h3BDa1azhpmB8sXiRS03nrvRqTKg8bd9QbTN54qh/tmdXC1KpqeTMxxte6nODU=\n=o1Yf\n-----END PGP SIGNATURE-----\n",
+        "payload": "tree 4190ce8d26e1743b256d6175cf209cbfb3fd0d69\nparent 9c7d6bd4a6cc39558ef3eae967c0f798d6ed3f60\nauthor Guy Emerson <gete2@cam.ac.uk> 1625855409 +0100\ncommitter GitHub <noreply@github.com> 1625855409 +0100\n\nUpdate tasks.md\n\n(typo)",
+        "verified_at": "2024-01-16T19:59:59Z"
+      }
+    },
+    "url": "https://api.github.com/repos/SemEval/SemEval2021/commits/af6de88309f158d86a101f7ba45e5a77c7df0e2d",
+    "html_url": "https://github.com/SemEval/SemEval2021/commit/af6de88309f158d86a101f7ba45e5a77c7df0e2d",
+    "comments_url": "https://api.github.com/repos/SemEval/SemEval2021/commits/af6de88309f158d86a101f7ba45e5a77c7df0e2d/comments",
+    "author": {
+      "login": "guyemerson",
+      "id": 5824426,
+      "node_id": "MDQ6VXNlcjU4MjQ0MjY=",
+      "avatar_url": "https://avatars.githubusercontent.com/u/5824426?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/guyemerson",
+      "html_url": "https://github.com/guyemerson",
+      "followers_url": "https://api.github.com/users/guyemerson/followers",
+      "following_url": "https://api.github.com/users/guyemerson/following{/other_user}",
+      "gists_url": "https://api.github.com/users/guyemerson/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/guyemerson/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/guyemerson/subscriptions",
+      "organizations_url": "https://api.github.com/users/guyemerson/orgs",
+      "repos_url": "https://api.github.com/users/guyemerson/repos",
+      "events_url": "https://api.github.com/users/guyemerson/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/guyemerson/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "committer": {
+      "login": "web-flow",
+      "id": 19864447,
+      "node_id": "MDQ6VXNlcjE5ODY0NDQ3",
+      "avatar_url": "https://avatars.githubusercontent.com/u/19864447?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/web-flow",
+      "html_url": "https://github.com/web-flow",
+      "followers_url": "https://api.github.com/users/web-flow/followers",
+      "following_url": "https://api.github.com/users/web-flow/following{/other_user}",
+      "gists_url": "https://api.github.com/users/web-flow/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/web-flow/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/web-flow/subscriptions",
+      "organizations_url": "https://api.github.com/users/web-flow/orgs",
+      "repos_url": "https://api.github.com/users/web-flow/repos",
+      "events_url": "https://api.github.com/users/web-flow/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/web-flow/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "parents": [
+      {
+        "sha": "9c7d6bd4a6cc39558ef3eae967c0f798d6ed3f60",
+        "url": "https://api.github.com/repos/SemEval/SemEval2021/commits/9c7d6bd4a6cc39558ef3eae967c0f798d6ed3f60",
+        "html_url": "https://github.com/SemEval/SemEval2021/commit/9c7d6bd4a6cc39558ef3eae967c0f798d6ed3f60"
+      }
+    ]
+  }
+]

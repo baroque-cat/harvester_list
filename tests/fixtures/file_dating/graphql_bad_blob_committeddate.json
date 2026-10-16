@@ -1,0 +1,52 @@
+{
+  "errors": [
+    {
+      "path": [
+        "query",
+        "bad",
+        "object",
+        "... on Commit",
+        "history",
+        "nodes",
+        "... on Blob"
+      ],
+      "extensions": {
+        "code": "cannotSpreadFragment",
+        "typeName": "Blob",
+        "fragmentName": "unknown",
+        "parentName": "Commit"
+      },
+      "locations": [
+        {
+          "line": 1,
+          "column": 203
+        }
+      ],
+      "message": "Fragment on Blob can't be spread inside Commit"
+    },
+    {
+      "path": [
+        "query",
+        "bad",
+        "object",
+        "... on Commit",
+        "history",
+        "nodes",
+        "... on Blob",
+        "committedDate"
+      ],
+      "extensions": {
+        "code": "undefinedField",
+        "typeName": "Blob",
+        "fieldName": "committedDate"
+      },
+      "locations": [
+        {
+          "line": 1,
+          "column": 217
+        }
+      ],
+      "message": "Field 'committedDate' doesn't exist on type 'Blob'"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "endpoint": "POST https://api.github.com/graphql",
+  "http_status": 200,
+  "captured_at": "2026-10-16T03:19:40.111006+00:00",
+  "auth_mode": "pat",
+  "query_shape": "{ bad: repository(owner:\"AP-Skill-Development-Corporation\", name:\"AAD-Internship-2k21\"){object(expression:\"829b4f81a9a9489d5229fd7ec64592a9cabfa094\"){... on Commit{history(first:1,path:\"Task.md\"){node...",
+  "expected_errors": true
+}

@@ -362,6 +362,64 @@ class EnrichmentConfig:
 
 
 @dataclass
+class FileDatingConfig:
+    """File commit-date acquisition configuration (add-file-commit-dating).
+
+    ``enabled`` defaults to off so the subsystem is byte-for-byte inert until an
+    operator opts in.  ``transport`` selects between the REST and GraphQL
+    acquisition paths; ``scope`` controls which files are dated; ``ttl_hours``
+    bounds how long a cached commit-date is trusted before a re-fetch.
+    ``graphql_batch_size`` / ``graphql_batch_max`` bound the GraphQL batching
+    (design D3: the ceiling bounds the unmeasured cost of larger batches).
+    """
+
+    enabled: bool = False
+    transport: str = "rest"
+    scope: str = "keyed"
+    ttl_hours: float = 24.0
+    max_requests_per_run: int = 200
+    graphql_batch_size: int = 4
+    graphql_batch_max: int = 50
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_file_dating_config on purpose: this
+        # guards direct (non-loader) construction in tests and embedding.
+        if not isinstance(self.enabled, bool):
+            raise ValueError("file_dating.enabled must be a boolean")
+
+        transport = str(self.transport).strip().lower()
+        if transport not in ("rest", "graphql"):
+            raise ValueError("file_dating.transport must be one of: rest, graphql")
+        self.transport = transport
+
+        scope = str(self.scope).strip().lower()
+        if scope not in ("keyed", "gathered", "discovered"):
+            raise ValueError("file_dating.scope must be one of: keyed, gathered, discovered")
+        self.scope = scope
+
+        self.ttl_hours = float(self.ttl_hours)
+        if self.ttl_hours <= 0:
+            raise ValueError("file_dating.ttl_hours must be positive")
+
+        self.max_requests_per_run = int(self.max_requests_per_run)
+        if self.max_requests_per_run < 0:
+            raise ValueError("file_dating.max_requests_per_run must be non-negative")
+
+        self.graphql_batch_size = int(self.graphql_batch_size)
+        if self.graphql_batch_size < 1:
+            raise ValueError("file_dating.graphql_batch_size must be at least 1")
+
+        self.graphql_batch_max = int(self.graphql_batch_max)
+        if self.graphql_batch_max < 1:
+            raise ValueError("file_dating.graphql_batch_max must be at least 1")
+
+        if self.graphql_batch_size > self.graphql_batch_max:
+            raise ValueError(
+                "file_dating.graphql_batch_size must not exceed file_dating.graphql_batch_max"
+            )
+
+
+@dataclass
 class EarlyStopConfig:
     """Frontier-based API pagination early-stop configuration.
 
@@ -657,6 +715,13 @@ class GatherConfig:
     max_payload_bytes: int = 8 * 1024 * 1024
     max_refusal_wait_s: float = 60.0
     defer_local_suppression: bool = True
+    # F5: conditional re-gather rollback flag (add-file-commit-dating D6).
+    # True (default): send If-None-Match when a stored etag exists and the
+    # transport matches.  False: never send the precondition, byte-for-byte
+    # pre-change behavior (etag storage may continue).  No coercion — a
+    # non-bool raises loudly (house doctrine: behavioral changes ship behind
+    # flags, rollback is a config flip).
+    conditional_refetch: bool = True
 
     def __post_init__(self):
         # Mirrors ConfigValidator._validate_gather_config on purpose: this
@@ -681,6 +746,11 @@ class GatherConfig:
             raise ValueError(
                 f"gather.defer_local_suppression must be a boolean (got: {self.defer_local_suppression!r})"
             )
+
+        # F5: no coercion — bool("false") is True, which would silently invert
+        # the operator's rollback (house doctrine).
+        if not isinstance(self.conditional_refetch, bool):
+            raise ValueError("gather.conditional_refetch must be a boolean")
 
 
 @dataclass
@@ -882,6 +952,7 @@ class Config:
     registry: RegistryConfig = field(default_factory=RegistryConfig)
     skip: SkipConfig = field(default_factory=SkipConfig)
     enrichment: EnrichmentConfig = field(default_factory=EnrichmentConfig)
+    file_dating: FileDatingConfig = field(default_factory=FileDatingConfig)
     early_stop: EarlyStopConfig = field(default_factory=EarlyStopConfig)
     check_skip: CheckSkipConfig = field(default_factory=CheckSkipConfig)
     recheck: RecheckConfig = field(default_factory=RecheckConfig)
@@ -920,6 +991,7 @@ class Config:
             "registry": self._dataclass_to_dict(self.registry),
             "skip": self._dataclass_to_dict(self.skip),
             "enrichment": self._dataclass_to_dict(self.enrichment),
+            "file_dating": self._dataclass_to_dict(self.file_dating),
             "early_stop": self._dataclass_to_dict(self.early_stop),
             "check_skip": self._dataclass_to_dict(self.check_skip),
             "recheck": self._dataclass_to_dict(self.recheck),

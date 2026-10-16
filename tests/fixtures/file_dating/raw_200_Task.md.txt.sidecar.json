@@ -1,0 +1,9 @@
+{
+  "endpoint": "GET https://raw.githubusercontent.com/AP-Skill-Development-Corporation/AAD-Internship-2k21/829b4f81a9a9489d5229fd7ec64592a9cabfa094/Task.md",
+  "http_status": 200,
+  "captured_at": "2026-10-16T03:20:33.357587+00:00",
+  "auth_mode": "anonymous",
+  "etag": "W/\"147a5e57041dc76a09c9c9b1b6fb292494d74ddfc41c0b6c85dafbb0876a7d24\"",
+  "last_modified": "",
+  "body_bytes": 210
+}
