@@ -8,7 +8,7 @@ by upper layers and used by lower layers without creating circular dependencies.
 """
 
 import threading
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from .types import IAuthProvider
 
@@ -35,6 +35,7 @@ class GithubAuthProvider(IAuthProvider):
     _session_provider: Optional[Callable[[], Optional[str]]] = None
     _token_provider: Optional[Callable[[], Optional[str]]] = None
     _user_agent_provider: Optional[Callable[[], str]] = None
+    _pool_provider: Optional[Callable[[], Any]] = None
 
     def __init__(self):
         """Initialize with default implementations."""
@@ -54,6 +55,10 @@ class GithubAuthProvider(IAuthProvider):
         """Reset singleton instance (mainly for testing)."""
         with cls._lock:
             cls._instance = None
+            cls._session_provider = None
+            cls._token_provider = None
+            cls._user_agent_provider = None
+            cls._pool_provider = None
 
     @classmethod
     def configure(
@@ -61,6 +66,7 @@ class GithubAuthProvider(IAuthProvider):
         session_provider: Callable[[], Optional[str]],
         token_provider: Callable[[], Optional[str]],
         user_agent_provider: Callable[[], str],
+        pool_provider: Optional[Callable[[], Any]] = None,
     ):
         """Configure authentication providers.
 
@@ -68,11 +74,14 @@ class GithubAuthProvider(IAuthProvider):
             session_provider: Function to get GitHub session token
             token_provider: Function to get GitHub API token
             user_agent_provider: Function to get User-Agent string
+            pool_provider: Optional function to get the credentials manager
+                          (exposes .sessions and .tokens lists)
         """
         _ = cls.get_instance()
         cls._session_provider = session_provider
         cls._token_provider = token_provider
         cls._user_agent_provider = user_agent_provider
+        cls._pool_provider = pool_provider
 
     def get_session(self) -> Optional[str]:
         """Get GitHub web session token.
@@ -143,6 +152,26 @@ class GithubAuthProvider(IAuthProvider):
                 pass
         return "DefaultUserAgent/1.0"
 
+    def get_pool(self, kind: str) -> list:
+        """Get credential pool values for the given kind.
+
+        Args:
+            kind: "tokens" or "sessions"
+
+        Returns:
+            list: credential values, or [] on any failure (fail-open)
+        """
+        if kind not in ("tokens", "sessions"):
+            return []
+        if self.__class__._pool_provider is None:
+            return []
+        try:
+            mgr = self.__class__._pool_provider()
+            items = getattr(mgr, kind, None)
+            return [item for item in (items or []) if item]
+        except Exception:
+            return []
+
 
 # Convenience functions for easy access
 def get_auth_provider() -> IAuthProvider:
@@ -154,9 +183,10 @@ def configure_auth(
     session_provider: Callable[[], Optional[str]],
     token_provider: Callable[[], Optional[str]],
     user_agent_provider: Callable[[], str],
+    pool_provider: Optional[Callable[[], Any]] = None,
 ):
     """Configure the global authentication service.
 
     This should be called by the manager layer during initialization.
     """
-    GithubAuthProvider.configure(session_provider, token_provider, user_agent_provider)
+    GithubAuthProvider.configure(session_provider, token_provider, user_agent_provider, pool_provider=pool_provider)

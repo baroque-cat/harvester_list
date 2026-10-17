@@ -1776,9 +1776,15 @@ gather:
 An 80-URL anonymous `raw` burst completed 80/80 with zero refusals at
 3.03 req/s (latency-bound); a 12-URL `html` control managed 1.23 req/s and
 **523 KiB/file** against `raw`'s **17.1 KiB/file** — the **30.6×** ratio that
-motivates the `raw` default. `raw` consumes no `core` quota; the authenticated
-code-search budget (`code_search`, exactly **10/min** per token) is isolated
-under its own resource class, so gather traffic can never starve search.
+motivates the `raw` default. `raw` is the default transport: anonymous, consumes
+no `core` quota, and transfers far less traffic per file. The authenticated
+`rest` transport rotates through a PAT from the configured credential pool,
+consumes `core` quota, and shares the `github_api` rate-limit basket with
+search. A secondary-rate-limit episode on `rest` cools every credential in the
+service pool (not just the one that received the refusal), so the whole pool
+backs off together. The isolated code-search budget (`code_search`, exactly
+**10/min** per token) remains under its own resource class, so gather traffic
+can never starve search.
 
 **How an address is derived.** Persisted acquisition tasks keep the discovered
 `https://github.com/<owner>/<repo>/blob/<ref>/<path>` link unchanged; the

@@ -404,8 +404,11 @@ queue:
 gather:
   # html = legacy anonymous rendered blob page (rollback value)
   # raw  = plain-content host derived from the blob link (default)
-  # rest = authenticated REST contents endpoint (full x-ratelimit-* headers,
-  #        costs 1 core unit per file; ~5000 files/h ceiling)
+  # rest = authenticated REST contents endpoint using a rotating PAT from the
+  #        configured credential pool (full x-ratelimit-* headers,
+  #        costs 1 core unit per file; ~5000 files/h ceiling; shares the
+  #        github_api basket with search; a secondary-limit episode cools
+  #        every credential in the service pool)
   transport: "raw"
   # Streaming byte cap for plain-content payloads (> 0). An oversized payload is
   # truncated, counted, and its retained prefix is still searched.

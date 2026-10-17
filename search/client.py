@@ -728,10 +728,20 @@ class GitHubClient:
         provider = self.resource_provider
         if provider is None:
             return []
-        if service == SERVICE_TYPE_GITHUB_WEB:
-            items = getattr(provider, "sessions", None)
+        # Prefer the get_pool accessor (GithubAuthProvider shape); fall back to
+        # plain .tokens/.sessions attributes for legacy providers (Credentials).
+        getter = getattr(provider, "get_pool", None)
+        if callable(getter):
+            try:
+                kind = "sessions" if service == SERVICE_TYPE_GITHUB_WEB else "tokens"
+                items = getter(kind)
+            except Exception:
+                items = None
         else:
-            items = getattr(provider, "tokens", None)
+            if service == SERVICE_TYPE_GITHUB_WEB:
+                items = getattr(provider, "sessions", None)
+            else:
+                items = getattr(provider, "tokens", None)
         return [item for item in (items or []) if item]
 
     def is_rate_limited_content(self, service: str, content: str) -> bool:
@@ -874,12 +884,40 @@ class GitHubClient:
 _github_client: Optional[GitHubClient] = GitHubClient()
 
 
-def init_github_client(limits: Dict[str, RateLimitConfig]) -> None:
-    """Initialize GitHub client with rate limiter"""
+def init_github_client(
+    limits: Dict[str, RateLimitConfig],
+    resource_provider: Optional[IAuthProvider] = None,
+) -> None:
+    """Initialize GitHub client with rate limiter and optional credential provider.
+
+    Args:
+        limits: Rate limit configuration per service bucket.
+        resource_provider: Optional credential provider; when supplied the
+            authenticated ``rest`` gather transport uses it instead of running
+            anonymous.  Pool sizes (counts only) are logged at INFO.
+    """
     global _github_client
     limiter = RateLimiter(limits)
-    _github_client = GitHubClient(limiter, limits=limits)
-    logger.info("GitHub client initialized with rate limiting")
+    _github_client = GitHubClient(limiter, resource_provider=resource_provider, limits=limits)
+    if resource_provider is not None:
+        # Log pool sizes only (never values).  Duck-type: the provider may
+        # expose get_pool(kind) or plain .tokens/.sessions attributes.
+        getter = getattr(resource_provider, "get_pool", None)
+        if callable(getter):
+            try:
+                n_tokens = len(getter("tokens"))
+                n_sessions = len(getter("sessions"))
+            except Exception:
+                n_tokens = n_sessions = "?"
+        else:
+            n_tokens = len(getattr(resource_provider, "tokens", None) or [])
+            n_sessions = len(getattr(resource_provider, "sessions", None) or [])
+        logger.info(
+            "GitHub client initialized with rate limiting and credential provider "
+            "(tokens=%s, sessions=%s)", n_tokens, n_sessions
+        )
+    else:
+        logger.info("GitHub client initialized with rate limiting (no credential provider)")
 
 
 def get_github_client() -> GitHubClient:
@@ -1765,8 +1803,13 @@ def _read_capped_payload(response: Any, transport: str, cap: int) -> Tuple[str, 
     return text, total
 
 
+# One-shot flag: emit the anonymous-fallback warning at most once per process.
+_gather_anon_warned = False
+
+
 def _gather_credential() -> Optional[str]:
     """Resolve a credential for the authenticated ``rest`` transport, if any."""
+    global _gather_anon_warned
     provider = getattr(_github_client, "resource_provider", None)
     if provider is not None:
         try:
@@ -1777,8 +1820,18 @@ def _gather_credential() -> Optional[str]:
             # Typed exhaustion must NOT be swallowed into a None (which would
             # downgrade the rest fetch to a guaranteed-failing anonymous call).
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            # Loud degradation: warn once that the rest transport fell back to
+            # anonymous.  Never interpolate the exception text or credential
+            # value unmasked — log only the exception class name.
+            if not _gather_anon_warned:
+                _gather_anon_warned = True
+                logger.warning(
+                    "[gather-transport] credential provider failed (%s); "
+                    "rest transport falling back to anonymous",
+                    type(exc).__name__,
+                )
+            return None
     return None
 
 

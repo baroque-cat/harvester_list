@@ -29,7 +29,7 @@ from storage.priority import top_candidates
 from storage.repo_meta import RepoMetaEnricher, RepoMetaStore, tokens_cooling_down
 from storage.file_dating import FileDater
 from storage.file_meta import FileMetaStore
-from tools.coordinator import get_session, get_token, get_user_agent
+from tools.coordinator import get_credentials_manager, get_session, get_token, get_user_agent
 from tools.logger import get_logger
 from tools.ratelimit import RateLimiter
 from tools.state import credential_liveness_metrics
@@ -57,7 +57,12 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         self.providers: Dict[str, IProvider] = providers
 
         # Configure authentication service
-        configure_auth(session_provider=get_session, token_provider=get_token, user_agent_provider=get_user_agent)
+        configure_auth(
+            session_provider=get_session,
+            token_provider=get_token,
+            user_agent_provider=get_user_agent,
+            pool_provider=get_credentials_manager,
+        )
 
         # Create shared components
         self.result_manager = MultiResultManager(
@@ -134,7 +139,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         client.set_proxy(config.global_config.proxy)
 
         # Initialize GitHub client rate limiter
-        client.init_github_client(config.ratelimits)
+        client.init_github_client(config.ratelimits, resource_provider=get_auth_provider())
 
         # Shared search-response aggregation (off by default; config-only rollback)
         self._configure_aggregation(config)
