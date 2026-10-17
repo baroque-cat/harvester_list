@@ -106,6 +106,12 @@ class StageMetrics(BaseMetrics):
     # Durable-backend write failures (parallels tasks_dropped_max_retries):
     # a task dropped because the storage write failed is always counted.
     tasks_dropped_backend_errors: int = 0
+    # Fresh duplicates refused by the in-RAM processed-id gate (P25): the id
+    # was already ACCEPTED by this process, so the copy is refused without
+    # consuming retry budget.  Distinct from the durable queue's insert-time
+    # probe (``suppressed_puts``, cross-restart pending rows) and from the
+    # gather share ledger (``share_suppressed``, cross-provider claims).
+    tasks_suppressed_duplicate: int = 0
 
     @property
     def total_processed(self) -> int:

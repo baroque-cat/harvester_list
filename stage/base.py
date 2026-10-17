@@ -41,6 +41,12 @@ from tools.retry import ExponentialBackoff, RetryPolicy
 
 logger = get_logger("stage")
 
+# P25: cadence of the duplicate-suppression report (R16 publisher pattern).
+# The first refusal and every Nth are logged with the running total; the exact
+# final total rides the stop-completion record (design D7) so gate arithmetic
+# converges from published numbers alone (lesson Н9.4).
+_DUP_SUPPRESS_LOG_EVERY = 1000
+
 
 @dataclass
 class StageResources:
@@ -227,6 +233,13 @@ class BasePipelineStage(ABC, WorkerManageable):
         # Tasks discarded because ``stop()`` had begun (design D7): reported
         # once per stage and counted for the stop-completion record.
         self.tasks_discarded_after_shutdown = 0
+        # Fresh duplicates refused by the processed-id gate in ``put_task``
+        # (P25): counted always, reported loud-once + every
+        # ``_DUP_SUPPRESS_LOG_EVERY``-th, totalled on the stop-completion
+        # record.  The gate itself predates this counter; only its silence is
+        # fixed here (lesson Н9: a silent refusal without a counter makes any
+        # divergence arithmetic useless).
+        self.tasks_suppressed_duplicate = 0
 
         # Work state tracking
         self.active_workers = 0
@@ -332,20 +345,25 @@ class BasePipelineStage(ABC, WorkerManageable):
                     alive_workers.append(worker_name)
 
         # Track zombie threads for monitoring.  The stop-completion record
-        # carries the teardown discard total on both paths so the number
-        # survives the run even though only the first discard is logged (D7).
-        discarded = self.tasks_discarded_after_shutdown
+        # carries the teardown discard total AND the duplicate-suppression
+        # total on both paths so both numbers survive the run even though only
+        # the first discard / first-and-Nth suppression are logged (D7, P25).
+        with self.stats_lock:
+            discarded = self.tasks_discarded_after_shutdown
+            duplicates = self.tasks_suppressed_duplicate
         if alive_workers:
             self.zombie_threads = alive_workers
             logger.warning(
                 f"[{self.name}] {len(alive_workers)} workers did not stop gracefully, "
-                f"tasks discarded after shutdown: {discarded}"
+                f"tasks discarded after shutdown: {discarded}, "
+                f"duplicate suppressions: {duplicates}"
             )
         else:
             self.zombie_threads = []
             logger.info(
                 f"[{self.name}] all workers stopped gracefully, "
-                f"tasks discarded after shutdown: {discarded}"
+                f"tasks discarded after shutdown: {discarded}, "
+                f"duplicate suppressions: {duplicates}"
             )
 
     def put_task(self, task: ProviderTask) -> bool:
@@ -377,6 +395,22 @@ class BasePipelineStage(ABC, WorkerManageable):
                     logger.warning(
                         f"[{self.name}] task=[{task_id}] discarded, max retries=[{self.max_retries}] reached"
                     )
+                else:
+                    # P25: a FRESH copy of work already accepted this run.  The
+                    # refusal itself is correct in-RAM dedup; what was wrong is
+                    # that it used to be silent — no counter, no log — while
+                    # 17–27 % of created gather tasks went through this branch
+                    # (live R17 gate arithmetic).  Counted always, reported at
+                    # the R16 cadence, totalled on the stop-completion record.
+                    with self.stats_lock:
+                        self.tasks_suppressed_duplicate += 1
+                        total = self.tasks_suppressed_duplicate
+                        announce = total == 1 or total % _DUP_SUPPRESS_LOG_EVERY == 0
+                    if announce:
+                        logger.warning(
+                            f"[{self.name}] suppressed duplicate of already-queued task=[{task_id}] "
+                            f"(suppressed_duplicate now {total})"
+                        )
                 return False
 
         # Try to add to queue
@@ -522,6 +556,7 @@ class BasePipelineStage(ABC, WorkerManageable):
             metrics.tasks_dropped_max_retries = self.tasks_dropped_max_retries
             metrics.tasks_dropped_backend_errors = self.tasks_dropped_backend_errors
             metrics.tasks_deferred = self.tasks_deferred
+            metrics.tasks_suppressed_duplicate = self.tasks_suppressed_duplicate
 
             return metrics
 
