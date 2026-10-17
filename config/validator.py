@@ -636,6 +636,13 @@ class ConfigValidator:
         if not isinstance(gather_config.conditional_refetch, bool):
             self.errors.append("gather.conditional_refetch must be a boolean")
 
+        # R7 D9: share_fetch — deliberate duplication of __post_init__ check
+        # (house doctrine: validator collects all errors, dataclass raises on
+        # first; both paths must produce byte-identical messages).
+        share_mode = str(gather_config.share_fetch).strip().lower()
+        if share_mode not in ("off", "shadow", "on"):
+            self.errors.append("gather.share_fetch must be one of: off, shadow, on")
+
         wait_cap = float(gather_config.max_refusal_wait_s)
         if wait_cap <= 0:
             self.errors.append("Gather max_refusal_wait_s must be positive")

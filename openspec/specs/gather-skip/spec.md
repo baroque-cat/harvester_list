@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Suppresses creation of acquisition tasks for GitHub files that the harvester has already successfully gathered under the current provider and pattern set and that have not changed since, turning repeated runs from full re-fetches into delta collection — without ever skipping on incomplete or erroneous evidence. Amended (September 2026) after live probes established that `repo_pushed_at` is NULL in the prevailing production state (date-extraction design D7): absence of push evidence degrades precision to TTL-bounded staleness instead of vetoing skips outright; evidence quality is made visible via `push_signal_coverage`.
+Suppresses creation of acquisition tasks for GitHub files that the harvester has already successfully gathered under the current provider and pattern set and that have not changed since, turning repeated runs from full re-fetches into delta collection — without ever skipping on incomplete or erroneous evidence. Amended (September 2026) after live probes established that `repo_pushed_at` is NULL in the prevailing production state (date-extraction design D7): absence of push evidence degrades precision to TTL-bounded staleness instead of vetoing skips outright; evidence quality is made visible via `push_signal_coverage`. Amended again (October 2026) because coverage is no longer strictly per-provider: when cross-provider fetch sharing is enforced, one fetch writes a coverage row for every provider that discovered the link, so condition (4) can be satisfied by another provider's fetch. The conjunctive rule itself is unchanged; only the source of the coverage row widened. See the `gather-share` capability.
 
 ## Requirements
 ### Requirement: Conjunctive skip rule
@@ -29,10 +29,15 @@ The system SHALL skip creating an acquisition task for a discovered link only wh
 - **WHEN** `repo_pushed_at` is non-NULL and later than the link's `gathered_ts` (beyond grace)
 - **THEN** the task IS created and `regathered_changed` increments
 
-#### Scenario: Provider or pattern switch forces re-gather
+#### Scenario: Pattern switch forces re-gather
 
-- **WHEN** the link was gathered under provider A or an older patterns hash, and the current run uses provider B or changed patterns
+- **WHEN** the link was gathered under an older patterns hash and the current run uses changed patterns
 - **THEN** the task IS created and `regathered_coverage_gap` increments
+
+#### Scenario: Provider switch is satisfied by a shared fetch
+
+- **WHEN** the link was gathered under provider A with an identical patterns hash and the current run uses provider B, whose coverage row was written by that shared fetch
+- **THEN** condition (4) holds for provider B, no acquisition task is created and `skipped_known` increments — a provider switch on its own is no longer a re-gather reason (amended October 2026; see the `gather-share` capability, which writes coverage for every beneficiary of one fetch)
 
 #### Scenario: NULL push date does not veto skip
 

@@ -452,6 +452,29 @@ gather:
   #   false: never send the precondition, byte-for-byte pre-change behavior
   #          (etag storage may continue).  Config-flip rollback.
   conditional_refetch: true
+  # Cross-provider fetch sharing (R7 cross-provider-fetch-sharing).
+  # Suppresses duplicate gather fetches when multiple providers discover the
+  # same URL under identical patterns. Share key: (url_hash, patterns_hash,
+  # gather_transport) — the provider is deliberately absent; identical patterns
+  # are a precondition. Attribution is preserved for every beneficiary
+  # (coverage row, link metadata, check tasks and material results); the links
+  # row and revalidation token are written once by the owner. Per-fetch side
+  # effects (dating, enrichment, basket token) fire once, not per beneficiary.
+  # Measured live gate (300 s, four providers, raw transport, sqlite queue):
+  #   off   -> 12 276 tasks enqueued, 4.04 tasks/URL, backlog 9 711,
+  #            coverage skew 31.16x, keys 220 (two providers only)
+  #   on    ->  4 154 tasks enqueued, 1.35 tasks/URL, backlog 1 581 (-83.7 %),
+  #            coverage skew 1.24x, keys 667 (all four providers)
+  #   raw req, Refine, Aggregation byte-identical across arms; zero refusals.
+  # Restart caveat: the ledger is RAM-scoped; after a crash the ledger is lost
+  # and cross-provider copies can reappear. Remedy: skip.skip_known: on
+  # suppresses 86.5 % of post-restart re-discoveries at creation (versus ~18 %
+  # before R7, because coverage fan-out now covers every provider).
+  #   off    - no sharing, byte-for-byte pre-change behaviour (default)
+  #   shadow - compute + count every would-suppress, still create every task
+  #   on     - enforce suppression; late claims after fetch completion fail-open
+  # Rollback: "off" restores pre-change behaviour byte-for-byte.
+  share_fetch: "off"
 
 # LLM-provider refusal classification (fix-provider-failure-classification)
 # A capacity refusal on the provider surface (check/inspect stages) is a typed

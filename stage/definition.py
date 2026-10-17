@@ -170,18 +170,43 @@ class SearchStage(BasePipelineStage):
                 )
                 skip_map = self._gather_skip_map(task, results, patterns)
                 enforce = bool(getattr(getattr(self.resources, "gather_skip", None), "enforce", False))
+                # R7 D4: cross-provider share ledger (resolved once per page).
+                share_ledger = getattr(self.resources, "share_ledger", None)
+                share_enabled = share_ledger is not None and share_ledger.enabled
+                if share_enabled:
+                    share_digest = patterns_hash(
+                        key_pattern=patterns.key_pattern,
+                        address_pattern=patterns.address_pattern,
+                        endpoint_pattern=patterns.endpoint_pattern,
+                        model_pattern=patterns.model_pattern,
+                    )
+                    share_transport = self.resources.config.gather.transport
+                share_suppressed = 0
                 suppressed = 0
                 for link in results:
                     decision = skip_map.get(link)
                     if enforce and decision is not None and decision.skip:
                         suppressed += 1
                         continue
+                    # R7 D4: consult the share ledger after gather-skip.
+                    if share_enabled:
+                        try:
+                            if share_ledger.claim(url_hash(link), share_digest, share_transport, task.provider):
+                                share_suppressed += 1
+                                continue
+                        except Exception:
+                            pass  # fail-open: create the task
                     acquisition_task = TaskFactory.create_acquisition_task(task.provider, link, patterns)
                     output.add_task(acquisition_task, PipelineStage.GATHER.value)
 
                 if suppressed:
                     logger.info(
                         f"[{self.name}] suppressed {suppressed} already-known links, provider: {task.provider}"
+                    )
+                # R7 D4: aggregated INFO line for share suppressions.
+                if share_suppressed:
+                    logger.info(
+                        f"[{self.name}] shared {share_suppressed} fetch(es) with another provider, provider: {task.provider}"
                     )
 
                 # Add links to be saved (audit log stays complete regardless of skips)
@@ -625,6 +650,8 @@ class AcquisitionStage(BasePipelineStage):
                     # The blob fetch never happened: record a failed gather (no
                     # coverage row) and propagate for bounded requeue (design D4).
                     self._record_gathered(task, success=False)
+                    # R7 D8: abandon ledger entry on failure.
+                    self._abandon_beneficiaries(task)
                     raise
                 # legacy/shadow preserve the pre-change outcome (empty success);
                 # shadow additionally counts and logs the failure-empty.
@@ -648,14 +675,19 @@ class AcquisitionStage(BasePipelineStage):
             output = StageOutput(task=task)
 
             if not_modified:
+                # R7 D5: fan-out downstream outputs to all beneficiaries.
+                beneficiaries = self._take_beneficiaries(task)
                 # 304: no extraction ran, no findings to propagate.
                 # Still record the gather as successful (recency advances).
-                output.add_links(task.provider, [task.url])
+                for p in beneficiaries:
+                    output.add_links(p, [task.url])
                 self._record_gathered(
                     task, success=True,
                     etag=returned_etag, etag_transport=returned_etag_transport,
                 )
+                self._record_shared_coverage(task, beneficiaries)
                 # Dating hook for scope="gathered" (304 still counts as gathered).
+                # R7 D7: dating OUTSIDE the beneficiary loop — one call per URL.
                 dater = getattr(self.resources, "file_dating", None)
                 if dater is not None and getattr(dater, "enabled", False):
                     scope = getattr(dater, "scope", "keyed")
@@ -664,34 +696,46 @@ class AcquisitionStage(BasePipelineStage):
                         # F1: merge API date into the URL-keyed metadata channel.
                         api_date = api_dates.get(task.url)
                         if api_date is not None:
-                            output.add_link_metadata(
-                                task.provider,
-                                {task.url: LinkMetadata(file_commit_date=api_date, transport=self._transport(task))},
-                            )
+                            for p in beneficiaries:
+                                output.add_link_metadata(
+                                    p,
+                                    {task.url: LinkMetadata(file_commit_date=api_date, transport=self._transport_for(p))},
+                                )
                 return output
+
+            # R7 D5: fan-out downstream outputs to all beneficiaries.
+            beneficiaries = self._take_beneficiaries(task)
 
             # Carry the gathered page's file-commit date to the registry writer
             # and feed the web fill-rate drift monitor.
             file_commit_date = metadata.get("file_commit_date")
-            output.add_link_metadata(
-                task.provider,
-                {task.url: LinkMetadata(file_commit_date=file_commit_date, transport=self._transport(task))},
-            )
+            # R7 D6: per-beneficiary transport in metadata.
+            for p in beneficiaries:
+                output.add_link_metadata(
+                    p,
+                    {task.url: LinkMetadata(file_commit_date=file_commit_date, transport=self._transport_for(p))},
+                )
             date_metrics = getattr(self.resources, "date_metrics", None)
             if date_metrics is not None:
                 date_metrics.record_web(file_commit_date is not None)
 
-            # Create check tasks for found services
+            # Create check tasks for found services — per beneficiary (R7 D5).
             if services:
                 source_hash = url_hash(task.url)
-                for service in services:
-                    check_task = TaskFactory.create_check_task(task.provider, service, source_url_hash=source_hash)
-                    output.add_task(check_task, PipelineStage.CHECK.value)
+                for p in beneficiaries:
+                    for service in services:
+                        check_task = TaskFactory.create_check_task(p, service, source_url_hash=source_hash)
+                        output.add_task(check_task, PipelineStage.CHECK.value)
+                    # Add material keys to be saved
+                    output.add_result(p, ResultType.MATERIAL.value, services)
 
-                # Add material keys to be saved
-                output.add_result(task.provider, ResultType.MATERIAL.value, services)
+            # Add the processed link to be saved — per beneficiary (R7 D5).
+            for p in beneficiaries:
+                output.add_links(p, [task.url])
 
-                # Dating hook for scope="keyed": only files that produced services.
+            # Dating hook for scope="keyed": only files that produced services.
+            # R7 D7: dating OUTSIDE the beneficiary loop — one call per URL.
+            if services:
                 dater = getattr(self.resources, "file_dating", None)
                 if dater is not None and getattr(dater, "enabled", False):
                     scope = getattr(dater, "scope", "keyed")
@@ -700,15 +744,14 @@ class AcquisitionStage(BasePipelineStage):
                         # F1: API date takes precedence over markup-derived date.
                         api_date = api_dates.get(task.url)
                         if api_date is not None:
-                            output.add_link_metadata(
-                                task.provider,
-                                {task.url: LinkMetadata(file_commit_date=api_date, transport=self._transport(task))},
-                            )
-
-            # Add the processed link to be saved
-            output.add_links(task.provider, [task.url])
+                            for p in beneficiaries:
+                                output.add_link_metadata(
+                                    p,
+                                    {task.url: LinkMetadata(file_commit_date=api_date, transport=self._transport_for(p))},
+                                )
 
             # Dating hook for scope="gathered": after any successful gather.
+            # R7 D7: dating OUTSIDE the beneficiary loop — one call per URL.
             dater = getattr(self.resources, "file_dating", None)
             if dater is not None and getattr(dater, "enabled", False):
                 scope = getattr(dater, "scope", "keyed")
@@ -717,16 +760,19 @@ class AcquisitionStage(BasePipelineStage):
                     # F1: API date takes precedence over markup-derived date.
                     api_date = api_dates.get(task.url)
                     if api_date is not None:
-                        output.add_link_metadata(
-                            task.provider,
-                            {task.url: LinkMetadata(file_commit_date=api_date, transport=self._transport(task))},
-                        )
+                        for p in beneficiaries:
+                            output.add_link_metadata(
+                                p,
+                                {task.url: LinkMetadata(file_commit_date=api_date, transport=self._transport_for(p))},
+                            )
 
-            # Write-only hook: record successful gather + coverage
+            # Write-only hook: record successful gather + coverage (owner only).
             self._record_gathered(
                 task, success=True,
                 etag=returned_etag, etag_transport=returned_etag_transport,
             )
+            # R7 D5: coverage rows for non-owner beneficiaries.
+            self._record_shared_coverage(task, beneficiaries)
 
             return output
 
@@ -742,13 +788,103 @@ class AcquisitionStage(BasePipelineStage):
         except Exception as e:
             # Write-only hook: record failed gather
             self._record_gathered(task, success=False)
+            # R7 D8: abandon ledger entry on failure.
+            self._abandon_beneficiaries(task)
             logger.error(f"[{self.name}] error for provider: {task.provider}, task: {task}, message: {e}")
             return None
 
     def _transport(self, task: ProviderTask) -> str:
-        """Resolve the configured transport ("api"/"web") for a provider task."""
-        config = self.resources.task_configs.get(task.provider)
+        """Resolve the configured transport ("api"/"web") for a provider task.
+
+        R7 D6: delegates to ``_transport_for`` so per-beneficiary resolution
+        uses the same code path.
+        """
+        return self._transport_for(task.provider)
+
+    def _transport_for(self, provider: str) -> str:
+        """Resolve the configured transport ("api"/"web") for a provider (R7 D6)."""
+        config = self.resources.task_configs.get(provider)
         return "api" if getattr(config, "use_api", False) else "web"
+
+    def _digest_for(self, task: AcquisitionTask) -> str:
+        """Return the cached patterns digest for a task (R7 D5).
+
+        Reuses ``self._patterns_hashes`` exactly like ``_record_gathered``.
+        """
+        key = (task.key_pattern, task.address_pattern, task.endpoint_pattern, task.model_pattern)
+        digest = self._patterns_hashes.get(key)
+        if digest is None:
+            digest = patterns_hash(
+                key_pattern=task.key_pattern,
+                address_pattern=task.address_pattern,
+                endpoint_pattern=task.endpoint_pattern,
+                model_pattern=task.model_pattern,
+            )
+            self._patterns_hashes[key] = digest
+        return digest
+
+    def _take_beneficiaries(self, task: AcquisitionTask) -> List[str]:
+        """Return the ordered beneficiary list for a task (R7 D5).
+
+        When the ledger is absent or not enforcing, returns ``[task.provider]``.
+        On any ledger error, fails open to ``[task.provider]`` (logger.debug).
+        The owner is always first; duplicates are removed.
+        """
+        ledger = getattr(self.resources, "share_ledger", None)
+        if ledger is None or not getattr(ledger, "enforce", False):
+            return [task.provider]
+        try:
+            taken = ledger.take(url_hash(task.url), self._digest_for(task), self.resources.config.gather.transport)
+        except Exception:
+            logger.debug(f"[{self.name}] share ledger take failed (fail-open)")
+            return [task.provider]
+        if not taken:
+            # Entry lost (e.g. after a restart) — byte-identical to pre-change.
+            return [task.provider]
+        # Ensure owner is first, de-duplicated.
+        seen = set()
+        result = [task.provider]
+        seen.add(task.provider)
+        for p in taken:
+            if p not in seen:
+                result.append(p)
+                seen.add(p)
+        return result
+
+    def _record_shared_coverage(self, task: AcquisitionTask, beneficiaries: List[str]) -> None:
+        """Write coverage rows for non-owner beneficiaries (R7 D5).
+
+        No-op when registry is None or only one beneficiary.  Each non-owner
+        write is wrapped in its own try/except (write-only hook discipline,
+        matching ``_record_gathered``).
+        """
+        if len(beneficiaries) <= 1:
+            return
+        registry = getattr(self.resources, "registry", None)
+        if registry is None:
+            return
+        digest = self._digest_for(task)
+        for p in beneficiaries:
+            if p == task.provider:
+                continue
+            try:
+                registry.record_coverage(task.url, provider=p, patterns_hash=digest)
+            except Exception:
+                logger.debug(f"[{self.name}] shared coverage write failed for {p} (fail-open)")
+
+    def _abandon_beneficiaries(self, task: AcquisitionTask) -> None:
+        """Abandon the ledger entry for a failed gather (R7 D8).
+
+        Called only after ``_record_gathered(task, success=False)``.  Fail-open,
+        logger.debug.  NEVER called on a RateLimitDeferral path.
+        """
+        ledger = getattr(self.resources, "share_ledger", None)
+        if ledger is None or not getattr(ledger, "enforce", False):
+            return
+        try:
+            ledger.abandon(url_hash(task.url), self._digest_for(task), self.resources.config.gather.transport)
+        except Exception:
+            logger.debug(f"[{self.name}] share ledger abandon failed (fail-open)")
 
     def _lookup_etag(self, url: str) -> Tuple[Optional[str], str]:
         """Read-only lookup of a link's stored etag and its transport (design D6).

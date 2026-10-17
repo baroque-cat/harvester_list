@@ -553,6 +553,8 @@ class ConfigLoader:
             defer_local_suppression=data.get("defer_local_suppression", True),
             # F5: conditional re-gather rollback flag; no coercion.
             conditional_refetch=data.get("conditional_refetch", True),
+            # R7 D9: cross-provider fetch-sharing rollout flag.
+            share_fetch=data.get("share_fetch", "off"),
         )
 
     def _parse_credential_liveness_config(self, data: Dict[str, Any]) -> CredentialLivenessConfig:

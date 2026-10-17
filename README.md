@@ -1921,6 +1921,127 @@ detector. Under `raw`/`rest` there is no rendered markup, so `file_commit_date`
 is NULL by construction with no parse attempt (current GitHub serves no
 `datetime=` attributes anyway).
 
+### Cross-provider fetch sharing (`gather.share_fetch`)
+
+Optional, default-off suppression of duplicate gather fetches when multiple
+providers discover the same URL under identical patterns. Before this change
+every provider created its own acquisition task for a byte-identical file —
+measured live (300 s, four providers, identical query): 14 800 discovered link
+instances produced 12 276 enqueued tasks for only 3 040 distinct URLs (4.04
+tasks per URL), and the gather queue ended with 9 711 backlog rows. The content
+is anonymous and transport-identical (`raw`), so fetching the same bytes four
+times is pure queue and slot waste — not a traffic problem (R12 already
+recovers 63 % of repeat fetches as 304s) but a **task-creation** problem.
+
+```yaml
+gather:
+  share_fetch: "off"   # off | shadow | on
+```
+
+**Share key.** `(url_hash, patterns_hash, gather_transport)` — the provider is
+deliberately absent. Identical patterns are a precondition: a URL discovered
+under different `key_pattern` / `address_pattern` / `endpoint_pattern` /
+`model_pattern` tuples is never shared, because the downstream extraction would
+differ. `url_hash` is the same `sha256(canonical_url)` the registry uses for
+`links` and `link_coverage` (one canon, imported from one place). The transport
+component prevents a future hybrid mode from mixing byte surfaces.
+
+**Attribution is preserved for every beneficiary.** When a fetch completes
+successfully, the ledger's `take()` returns the owner plus all beneficiaries
+accumulated while the fetch was in flight. For **each** of them the gather
+worker emits:
+
+- `output.add_links(provider, [url])` — a `link_coverage` row;
+- `output.add_link_metadata(provider, {url: LinkMetadata(transport=<that provider's transport>)})`
+  — the transport label is resolved per beneficiary (`api` vs `web`), never
+  borrowed from the owner;
+- check tasks and material results for every beneficiary, with
+  `source_url_hash` pointing at the correct provider.
+
+The `links` row (visit_status, gathered_ts, etag, etag_transport) and the
+revalidation token are written **once** by the owner. Coverage fan-out is the
+only per-beneficiary write.
+
+**Per-fetch side effects are paid once.** Dating (`_date_file_links`),
+enrichment and the basket token fire on the unconditional FETCH, not on each
+beneficiary. Measured invariant: `Dates: web=<N>` denominator equals
+`raw req − 304` exactly in every arm (arm C: 2 573 − 416 = 2 157; arm A:
+2 565 − 380 = 2 185; arm B: 2 521 − 496 = 2 025). The retry budget is shared
+(`max_retries_requeued: 3` for all beneficiaries, not 3×N) — anonymous raw
+bytes are byte-identical across providers, so independent retries would carry
+no additional information.
+
+**Modes**
+
+- `off` (default): the ledger is never constructed; no `claim()` or `take()`
+  calls; behaviour is byte-for-byte indistinguishable from pre-change.
+- `shadow`: every `claim()` is computed and counted but always returns False —
+  all tasks are still created. The `Share:` line reports `suppressed=0` so the
+  would-be price is visible before enforcement.
+- `on`: first claim registers the owner and returns False; subsequent claims
+  for the same key return True (task suppressed). On fetch failure `abandon()`
+  resets the entry so a later discovery can create a fresh task (fail-open).
+
+**Measured gate** (three 300 s arms, each on its own fresh workspace, four
+providers, identical query, `gather.transport: raw`, `queue.backend: sqlite`):
+
+| Figure | A (`off`) | C (`on`) |
+|---|---|---|
+| acquisition tasks enqueued | 12 276 | 4 154 |
+| tasks per distinct URL | 4.04 | **1.35** |
+| gather backlog at end of run | 9 711 | **1 581 (−83.7 %)** |
+| `link_coverage` rows | 2 565 | **9 024** |
+| coverage skew (max:min per provider) | 31.16× | **1.24×** |
+| registry `keys` rows | 220 (two providers: 166/54) | **667** (all four: 169/160/160/157) |
+| check stage processed | 220 | **649** |
+| `Gather: raw req` / bytes / 304 | 2 565 / 92.8 MB / 380 | 2 573 / 86.5 MB / 416 |
+| `Refine:` / `Aggregation:` | byte-identical | byte-identical |
+| remote refusals / secondary limits | 0 | 0 |
+
+`raw req` is unchanged because gather is basket-bound, not task-bound. Refine
+and Aggregation are untouched because search is upstream of the share ledger.
+The residual 1.35 tasks per URL are late claims that arrive after the owning
+fetch already completed and released the entry — fail-open by design, never a
+loss. `queue.durable_dedup` suppressed zero puts in all three arms because every
+`(provider, url)` pair reaching the queue was fresh within the run.
+
+**Reconciliation.** In arm C: 14 800 claims − 9 102 ledger suppressions = 5 698
+tasks created; of those, 1 544 were dropped by the pre-existing in-RAM
+processed-id gate (`stage/base.py:372-380`, silent when `attempts == 0`),
+leaving 4 154 enqueued. Arm A loses 2 524 to the same gate (14 800 → 12 276).
+The drop is not a regression — it is the same gate that already existed,
+receiving more input because sharing removed the earlier FIFO coalescing.
+
+**Restart limitation.** The share ledger is RAM-scoped. A `kill -9` mid-run
+followed by a relaunch in the same workspace loses the ledger; cross-provider
+copies can reappear (the drilled queue ended at 11 265 rows, 3.67 providers per
+URL). No work is lost, no `IntegrityError`, and `durable_dedup` still suppresses
+intra-provider duplicates (`suppressed_puts=11770` in the drill). The remedy is
+`skip.skip_known: on`: R7's coverage fan-out makes gather-skip effective across
+restarts for every provider simultaneously. Measured: gather-skip in shadow
+reported `skipped=11176 regathered[g=1740]` — with `skip_known: on`, **86.5 %**
+of post-restart re-discoveries would be suppressed at creation, versus roughly
+18 % before R7 (previously 815 of 997 known links were re-gathered solely
+because the coverage key was per-provider).
+
+**Observability.** `PipelineStatus.share_metrics` publishes the counters, and a
+`Share:` line is rendered in the status display only when `mode != off` (by
+analogy with `Skip:` and `Dating:`):
+
+```
+Share: mode=on claims=14800 suppressed=9102 shared=2067 extra=6080 abandoned=0 tracked=0 full=0
+```
+
+`shared` counts fetches with more than one beneficiary; `extra` is
+Σ(len(taken)−1), the number of additionally written coverage rows. The
+`ledger_full` counter increments when the tracked-key cap (50 000, seatbelt
+only — live set is ~10 K entries ≈ 4 MB) is reached; `claim` returns False on
+cap (fail-open: own task is created).
+
+**Rollback:** set `gather.share_fetch: "off"` — a config flip, no code removal.
+The ledger is never constructed and no `claim()` / `take()` calls are made; the
+run is byte-for-byte indistinguishable from pre-change.
+
 ### Provider refusal classification (`provider`)
 
 A capacity refusal encountered while talking to an LLM provider (the `check`

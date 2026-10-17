@@ -23,6 +23,7 @@ from stage.resolver import DependencyResolver
 from storage.persistence import MultiResultManager
 from storage.early_stop import EarlyStopEngine
 from storage.gather_skip import GatherSkipEngine
+from manager.gather_share import GatherShareLedger
 from storage.key_ledger import KeyLedger
 from storage.registry import Registry, config_digest as build_config_digest, init_registry
 from storage.priority import top_candidates
@@ -93,6 +94,9 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             ttl_hours=config.skip.gather_ttl_hours,
             registry_path=self.link_registry.path,
         )
+
+        # R7 D11: cross-provider fetch-sharing ledger (run-scoped RAM; inert when off).
+        self.share_ledger = GatherShareLedger(mode=config.gather.share_fetch)
 
         # Frontier-based API pagination early-stop detector (off by default;
         # API transport only).  "Known" reuses gather-skip semantics and the
@@ -342,6 +346,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             key_ledger=self.key_ledger,
             refine_governor=self.refine_governor,
             file_dating=self.file_dating,
+            share_ledger=self.share_ledger,
         )
 
         # Create stages in dependency order
@@ -430,6 +435,8 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         # Drain and close the registry before result managers flush
         self.link_registry.stop()
         self.gather_skip.close()
+        if hasattr(self, "share_ledger"):
+            self.share_ledger.close()
         self.enrichment.close()
         if hasattr(self, "file_dating"):
             self.file_dating.close()
@@ -523,6 +530,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             early_stop_metrics=self.early_stop.to_stats(),
             key_ledger_metrics=self.key_ledger.to_stats(),
             registry_metrics=self._registry_metrics(),
+            share_metrics=self.share_ledger.to_stats() if hasattr(self, "share_ledger") else {},
             recheck_metrics=self.recheck.to_stats(),
             prioritization_metrics=self._prioritization_metrics(),
             aggregation_metrics=get_aggregation_metrics(),

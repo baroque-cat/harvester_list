@@ -41,6 +41,7 @@ _RENDERED_METRIC_SURFACES = (
     "prioritization_metrics",
     "provider_refusal_metrics",
     "registry_metrics",
+    "share_metrics",
 )
 
 
@@ -366,6 +367,7 @@ class StatusDisplayEngine:
         refine_line = self._format_refine_metrics_line(status)
         credential_line = self._format_credential_metrics_line(status)
         provider_refusal_line = self._format_provider_refusal_metrics_line(status)
+        share_line = self._format_share_metrics_line(status)
 
         if not status.pipeline.stages:
             lines.append("No pipeline data available")
@@ -373,6 +375,8 @@ class StatusDisplayEngine:
                 lines.append(date_line)
             if skip_line:
                 lines.append(skip_line)
+            if share_line:
+                lines.append(share_line)
             if enrichment_line:
                 lines.append(enrichment_line)
             if file_dating_line:
@@ -425,6 +429,9 @@ class StatusDisplayEngine:
 
         if skip_line:
             lines.append(skip_line)
+
+        if share_line:
+            lines.append(share_line)
 
         if enrichment_line:
             lines.append(enrichment_line)
@@ -493,6 +500,26 @@ class StatusDisplayEngine:
             f"t={metrics.get('regathered_ttl_expired', 0)},"
             f"f={metrics.get('regathered_failed_retry', 0)}] "
             f"push={metrics.get('push_signal_coverage', 0.0):.3f}"
+        )
+
+    @staticmethod
+    def _format_share_metrics_line(status: SystemStatus) -> str:
+        """Render the cross-provider fetch-sharing counter line (R7 D10).
+
+        Returns "" when metrics is empty or mode is off (mirrors skip line).
+        """
+        metrics = getattr(status.pipeline, "share_metrics", None)
+        if not metrics or metrics.get("mode", "off") == "off":
+            return ""
+        return (
+            f"Share: mode={metrics.get('mode', 'off')} "
+            f"claims={metrics.get('claims', 0)} "
+            f"suppressed={metrics.get('suppressed', 0)} "
+            f"shared={metrics.get('shared_fetches', 0)} "
+            f"extra={metrics.get('fanout_extra', 0)} "
+            f"abandoned={metrics.get('abandoned', 0)} "
+            f"tracked={metrics.get('tracked', 0)} "
+            f"full={metrics.get('ledger_full', 0)}"
         )
 
     @staticmethod

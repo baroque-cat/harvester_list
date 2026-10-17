@@ -722,6 +722,10 @@ class GatherConfig:
     into the DEFER seam (default ``True``, the fixed behavior); ``False`` is the
     rollback position that restores the legacy ``TransientFetchError`` failure
     classification (design D5).
+
+    ``share_fetch`` is the three-position R7 rollout flag: ``off`` (default,
+    byte-identical pre-change), ``shadow`` (counts would-be suppressions
+    without acting), ``on`` (enforces cross-provider fetch sharing).
     """
 
     transport: str = "raw"
@@ -735,6 +739,8 @@ class GatherConfig:
     # non-bool raises loudly (house doctrine: behavioral changes ship behind
     # flags, rollback is a config flip).
     conditional_refetch: bool = True
+    # R7 D9: cross-provider fetch-sharing rollout flag.
+    share_fetch: str = "off"
 
     def __post_init__(self):
         # Mirrors ConfigValidator._validate_gather_config on purpose: this
@@ -764,6 +770,12 @@ class GatherConfig:
         # the operator's rollback (house doctrine).
         if not isinstance(self.conditional_refetch, bool):
             raise ValueError("gather.conditional_refetch must be a boolean")
+
+        # R7 D9: three-position rollout flag, normalised like skip.skip_known.
+        share_mode = str(self.share_fetch).strip().lower()
+        if share_mode not in ("off", "shadow", "on"):
+            raise ValueError("gather.share_fetch must be one of: off, shadow, on")
+        self.share_fetch = share_mode
 
 
 @dataclass

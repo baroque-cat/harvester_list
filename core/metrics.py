@@ -248,6 +248,11 @@ class PipelineStatus:
     # visible to the operator without opening sqlite.
     registry_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Cross-provider fetch-sharing counters (R7 D10): mode, claims, suppressed,
+    # shared_fetches, fanout_extra, abandoned, tracked, ledger_full.  Empty
+    # while the ledger is off — mirrors the skip_metrics pattern.
+    share_metrics: Dict[str, Any] = field(default_factory=dict)
+
     def queue_size(self) -> int:
         """Get total queue size across all stages"""
         return sum(stage.queue_size for stage in self.stages.values())
