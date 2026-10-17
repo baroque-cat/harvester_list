@@ -12,7 +12,7 @@ Durable SQLite-backed task queue (fix-queue-persistence-under-load).
     get_nowait() -> obj
     task_done()                       # acks (deletes) this thread's claim
     empty() / qsize() / full()
-    counts() / snapshot_pending() / sweep_expired_claims()
+    counts() / snapshot_pending() / sweep_expired_claims() / dedup_stats()
     bulk_insert(objs) / checkpoint() / close() / journal_mode
 
 Design D1-D6:
@@ -23,7 +23,12 @@ Design D1-D6:
   and starts a visibility timeout;
 - ``task_done`` deletes the calling thread's claimed row;
 - startup reclaims orphaned ``claimed`` rows (at-least-once after a crash) and
-  purges rows older than ``max_age_hours`` loudly.
+  purges rows older than ``max_age_hours`` loudly;
+- durable dedup: a fresh (``attempts == 0``) task whose ``dedup_id`` is non-empty
+  and already has a PENDING row is suppressed at insert time (returns False);
+  claimed rows never block re-insertion because deferrals and retries re-put
+  before ``task_done()`` deletes the claim.  A startup reconcile collapses any
+  remaining duplicates (keeping ``MIN(seq)``) after reclaim and age purge.
 
 The engine is storage-only: task (de)serialization is injected by the caller.
 """
@@ -42,7 +47,14 @@ from tools.logger import get_logger
 logger = get_logger("storage")
 
 # Bump only with an additive migration (mirrors storage/registry.py).
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Suppression is logged on the first occurrence and then every N-th (house
+# pattern: loud once, counted always).  One line per suppression would bury the
+# console -- a measured restart re-discovery suppressed ~9.6k puts in 300 s --
+# while a single line hides the running total, which is the one figure that
+# tells an operator how much redundant work the store absorbed.
+_DEDUP_LOG_EVERY = 1000
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -58,6 +70,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_state_seq ON tasks(state, seq);
 CREATE INDEX IF NOT EXISTS idx_tasks_claimed ON tasks(claimed_until) WHERE state = 'claimed';
+CREATE INDEX IF NOT EXISTS idx_tasks_dedup_pending ON tasks(dedup_id, seq) WHERE state = 'pending' AND dedup_id <> '';
 """
 
 
@@ -68,6 +81,14 @@ class SqliteTaskQueue:
     (one-writer discipline, design D3).  Wakeups for blocking ``get`` are
     signalled through a ``threading.Condition`` bound to that same lock, so
     consumers sleep instead of polling (design D2).
+
+    Parameters
+    ----------
+    durable_dedup : bool, default True
+        When True, ``put()`` suppresses a fresh (``attempts == 0``) INSERT
+        whose ``dedup_id`` is non-empty and already has a PENDING row, and
+        the startup reconcile collapses any remaining duplicates keeping
+        ``MIN(seq)``.  Set to False to restore the pre-P20 behaviour.
     """
 
     def __init__(
@@ -79,13 +100,17 @@ class SqliteTaskQueue:
         name: str = "",
         visibility_timeout_s: float = 300.0,
         max_age_hours: float = 24.0,
+        durable_dedup: bool = True,
     ) -> None:
+        if not isinstance(durable_dedup, bool):
+            raise ValueError("queue.durable_dedup must be a boolean")
         self.path = path
         self.serializer = serializer
         self.deserializer = deserializer
         self.name = name
         self.visibility_timeout_s = float(visibility_timeout_s)
         self.max_age_hours = float(max_age_hours)
+        self.durable_dedup = durable_dedup
 
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
@@ -97,6 +122,13 @@ class SqliteTaskQueue:
         # object only stays cached while someone else references it, so the
         # queue never retains the task graph (design D2).
         self._objects: "weakref.WeakValueDictionary[int, Any]" = weakref.WeakValueDictionary()
+
+        # Durable-dedup counters (design D7).  Both live in RAM only, so they
+        # are published through ``dedup_stats()`` and reported periodically by
+        # ``QueueManager.save_all_queues`` -- otherwise the figure dies with the
+        # process and a run's only evidence is "the queue did not grow".
+        self._suppressed_puts = 0
+        self._startup_collapsed = 0
 
         # Parent directory is created here so stage construction just works
         # (the queue_state directory may not exist on a first run).  Any
@@ -144,6 +176,26 @@ class SqliteTaskQueue:
                     f"[{self.name}] purged {purged} aged-out task(s) older than {self.max_age_hours}h at startup"
                 )
 
+            # Durable-dedup reconcile (D4): collapse duplicate pending rows,
+            # keeping MIN(seq).  Runs after reclaim + age purge so it also
+            # collapses duplicates the reclaim just produced.
+            if self.durable_dedup:
+                collapsed = self._conn.execute(
+                    "DELETE FROM tasks"
+                    " WHERE state='pending' AND dedup_id <> ''"
+                    "   AND seq NOT IN ("
+                    "     SELECT MIN(seq) FROM tasks"
+                    "     WHERE state='pending' AND dedup_id <> ''"
+                    "     GROUP BY dedup_id"
+                    "   )"
+                ).rowcount
+                self._conn.commit()
+                self._startup_collapsed = collapsed
+                if collapsed:
+                    logger.warning(
+                        f"[{self.name}] collapsed {collapsed} duplicate pending task(s) at startup, kept earliest seq per dedup_id"
+                    )
+
     def checkpoint(self) -> None:
         """Run a passive WAL checkpoint (bounded file growth)."""
         with self._cond:
@@ -179,11 +231,30 @@ class SqliteTaskQueue:
         """Durably commit one task.
 
         Never raises ``queue.Full`` (there is no capacity bound).  Returns True
-        once the INSERT is committed (design D6).
+        once the INSERT is committed (design D6).  Returns False when the
+        durable-dedup probe suppresses the INSERT (flag on, non-empty dedup_id,
+        ``attempts == 0``, and a PENDING row with the same dedup_id already
+        exists).
         """
         payload = self.serializer(obj)
         created = float(created_at) if created_at is not None else time.time()
         with self._cond:
+            # Insert-time dedup probe (D3).
+            if self.durable_dedup and dedup_id and int(attempts) == 0:
+                hit = self._conn.execute(
+                    "SELECT 1 FROM tasks WHERE state='pending' AND dedup_id=? LIMIT 1",
+                    (dedup_id,),
+                ).fetchone()
+                if hit is not None:
+                    self._suppressed_puts += 1
+                    total = self._suppressed_puts
+                    if total == 1 or total % _DEDUP_LOG_EVERY == 0:
+                        logger.warning(
+                            f"[{self.name}] suppressed duplicate pending put for dedup_id={dedup_id!r} "
+                            f"(suppressed_puts now {total})"
+                        )
+                    return False
+
             cur = self._conn.execute(
                 "INSERT INTO tasks (dedup_id, payload_json, attempts, state, claimed_until, created_at) "
                 "VALUES (?, ?, ?, 'pending', NULL, ?)",
@@ -355,6 +426,14 @@ class SqliteTaskQueue:
                 self._conn.execute("SELECT COUNT(*) FROM tasks WHERE state='claimed'").fetchone()[0]
             )
         return {"pending": pending, "claimed": claimed}
+
+    def dedup_stats(self) -> Dict[str, int]:
+        """Return ``{"suppressed_puts": n, "startup_collapsed": m}``."""
+        with self._cond:
+            return {
+                "suppressed_puts": self._suppressed_puts,
+                "startup_collapsed": self._startup_collapsed,
+            }
 
     def snapshot_pending(self) -> List[Any]:
         """Non-destructive FIFO list of pending payloads (design S14)."""

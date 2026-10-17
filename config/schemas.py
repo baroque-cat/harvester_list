@@ -670,12 +670,19 @@ class TaskQueueConfig:
     enables a durable per-stage store.  ``visibility_timeout_s`` bounds how long
     a claimed-but-unacknowledged task stays invisible before the periodic sweep
     returns it to pending; ``max_age_hours`` is the startup/import age gate
-    (parity with the legacy snapshot gate).
+    (parity with the legacy snapshot gate).  ``durable_dedup`` makes the stage's
+    process-scoped dedup gate durable across restarts: a fresh task whose
+    ``dedup_id`` is already PENDING is suppressed at insert time, and a startup
+    reconcile collapses legacy duplicates keeping the earliest ``seq``.
     """
 
     backend: str = "memory"
     visibility_timeout_s: float = 300.0
     max_age_hours: float = 24.0
+    # Durable dedup: makes the stage's process-scoped dedup gate durable across
+    # restarts.  Boolean, never coerced: ``bool("false")`` is ``True``, so
+    # coercion would silently invert an operator's rollback.
+    durable_dedup: bool = True
 
     def __post_init__(self):
         # Mirrors ConfigValidator._validate_task_queue_config on purpose: this
@@ -692,6 +699,12 @@ class TaskQueueConfig:
         self.max_age_hours = float(self.max_age_hours)
         if self.max_age_hours <= 0:
             raise ValueError("queue.max_age_hours must be positive")
+
+        # Boolean, never coerced: ``bool("false")`` is ``True``, so coercion would
+        # silently invert an operator's rollback (design D6).  Mirrored in
+        # ConfigValidator._validate_task_queue_config on purpose.
+        if not isinstance(self.durable_dedup, bool):
+            raise ValueError("queue.durable_dedup must be a boolean")
 
 
 @dataclass

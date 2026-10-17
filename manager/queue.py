@@ -158,6 +158,12 @@ class QueueManager(PeriodicTaskManager):
         # Stages to save (set by start_periodic_save/attach_stages)
         self.stages = None
 
+        # Last durable-dedup totals reported per stage (P20 observability): the
+        # counters live in the queue's RAM, so a line is emitted only when they
+        # change, which keeps a quiet run quiet and still lands the final total
+        # in the console because ``_on_stop`` saves once more before stopping.
+        self._dedup_reported: Dict[str, tuple] = {}
+
         logger.info(f"Initialized type-safe queue manager at: {self.config.persistence_dir}")
 
     def attach_stages(self, stages: Dict[str, BasePipelineStage]) -> None:
@@ -315,6 +321,33 @@ class QueueManager(PeriodicTaskManager):
             logger.error(f"Failed to load queue state for {stage_enum.value}: {e}")
             return []
 
+    def _report_dedup_stats(self, stage_name: str, durable: Any) -> None:
+        """Publish the durable-dedup totals when they changed (P20).
+
+        ``suppressed_puts`` and ``startup_collapsed`` live in the queue's RAM, so
+        without this line the number of redundant rows the store absorbed dies
+        with the process and a run's only evidence is "the queue did not grow".
+        Duck-typed and fail-open: a queue without the accessor (memory backend,
+        or a pre-P20 store object) reports nothing and never raises.  Zero totals
+        are not reported at all -- there is nothing to say, and the startup
+        reconcile already logs its own line when it collapses legacy duplicates.
+        """
+        getter = getattr(durable, "dedup_stats", None)
+        if not callable(getter):
+            return
+        try:
+            stats = getter() or {}
+            key = (int(stats.get("suppressed_puts", 0)), int(stats.get("startup_collapsed", 0)))
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Failed to read durable dedup stats for {stage_name}: {e}")
+            return
+        if key == (0, 0) or self._dedup_reported.get(stage_name) == key:
+            return
+        self._dedup_reported[stage_name] = key
+        logger.info(
+            f"Durable dedup for {stage_name}: suppressed_puts={key[0]} startup_collapsed={key[1]}"
+        )
+
     def save_all_queues(self, stages: Dict[str, BasePipelineStage]) -> None:
         """Save state for all queues with type-safe stage handling.
 
@@ -329,6 +362,7 @@ class QueueManager(PeriodicTaskManager):
                     swept = durable.sweep_expired_claims()
                     if swept:
                         logger.info(f"Swept {swept} expired claim(s) for {stage_name}")
+                    self._report_dedup_stats(stage_name, durable)
                     durable.checkpoint()
                 except Exception as e:
                     logger.error(f"Durable queue maintenance failed for {stage_name}: {e}")

@@ -163,6 +163,7 @@ class BasePipelineStage(ABC, WorkerManageable):
         queue_dir: Optional[str] = None,
         queue_visibility_timeout_s: float = 300.0,
         queue_max_age_hours: float = 24.0,
+        queue_durable_dedup: bool = True,
     ) -> None:
         self.name = name
         self.resources = resources
@@ -180,6 +181,7 @@ class BasePipelineStage(ABC, WorkerManageable):
             queue_size,
             queue_visibility_timeout_s,
             queue_max_age_hours,
+            queue_durable_dedup,
         )
 
         # Task deduplication (bounded)
@@ -244,6 +246,7 @@ class BasePipelineStage(ABC, WorkerManageable):
         queue_size: int,
         visibility_timeout_s: float,
         max_age_hours: float,
+        durable_dedup: bool = True,
     ) -> Any:
         """Build the stage queue for the selected backend (design D7/D11).
 
@@ -251,6 +254,10 @@ class BasePipelineStage(ABC, WorkerManageable):
         open/bootstrap failure logs an ERROR naming the stage, marks the stage
         degraded and falls back to a functional in-memory queue so a disk
         problem never zeroes the run.
+
+        A claimed row never blocks re-insertion, which is why deferral
+        (``defer_task``) and the bounded retry in ``_worker_loop`` are
+        unaffected — they re-put BEFORE ``task_done()`` deletes the claim.
         """
         if str(queue_backend).strip().lower() != "sqlite":
             return queue.Queue(maxsize=queue_size)
@@ -270,6 +277,7 @@ class BasePipelineStage(ABC, WorkerManageable):
                 name=self.name,
                 visibility_timeout_s=visibility_timeout_s,
                 max_age_hours=max_age_hours,
+                durable_dedup=durable_dedup,
             )
             self._durable_queue = True
             return durable

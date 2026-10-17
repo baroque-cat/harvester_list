@@ -1627,6 +1627,7 @@ queue:
   backend: "memory"          # memory | sqlite
   visibility_timeout_s: 300  # sqlite: reclaim a claim after this many seconds
   max_age_hours: 24          # startup/import age gate
+  durable_dedup: true        # sqlite: suppress fresh duplicates already PENDING
 ```
 
 **Flag semantics.** A two-position switch; flips require a restart.
@@ -1640,6 +1641,46 @@ queue:
   (`queue.Full` is unreachable), periodic saving becomes a non-destructive
   query plus a WAL checkpoint, and the drain race disappears. RAM holds only the
   transient task being handed to a worker.
+
+**Durable dedup (`queue.durable_dedup`).** The stage's process-scoped dedup gate
+(the in-RAM `processed` set capped by `dedup_max_size`) dies with the process, so
+a restart re-discovering the same URLs re-inserts them. Measured price (two
+sequential 300 s runs on ONE workspace, 2026-10-01): run 1 ended with 9 843 rows,
+run 2 grew to **19 675** rows (+12 224 rows, +6 537 216 bytes, 7 451 duplicated
+`dedup_id`s of which every one was a fresh task whose id was already PENDING).
+Arithmetic reconciled exactly: `9 843 − 2 392 processed + 12 224 inserted = 19 675`.
+When `durable_dedup: true` (the default), `put()` probes for a PENDING row with
+the same non-empty `dedup_id` and suppresses the INSERT (returns False) — but
+only when `attempts == 0`, so deferrals (`defer_task`) and the bounded retry in
+`_worker_loop` are unaffected: they re-put BEFORE `task_done()` deletes the
+claim, and a claimed row never blocks re-insertion. A startup reconcile collapses
+any remaining legacy duplicates keeping `MIN(seq)` (the earliest `created_at`
+survives so the age gate stays anchored to first creation).
+
+Three log lines carry the evidence, because the counters live in RAM and would
+otherwise die with the process that earned them:
+
+* `[gather] suppressed duplicate pending put for dedup_id=... (suppressed_puts now N)`
+  — WARNING on the 1st suppression and then every 1000th (`_DEDUP_LOG_EVERY`), so
+  a soak shows a running total without one line per event;
+* `[gather] collapsed N duplicate pending task(s) at startup, kept earliest seq per dedup_id`
+  — WARNING, only when the reconcile actually removed something;
+* `Durable dedup for gather: suppressed_puts=N startup_collapsed=M` — INFO from
+  the queue manager's maintenance pass (every `persistence.save_interval`, and
+  once more from `Pipeline._on_stop`). It is emitted **on change**, so the last
+  such line in a console always carries the final totals whether or not it falls
+  inside the graceful-stop window. Zero totals are never reported.
+
+Programmatic access: `SqliteTaskQueue.dedup_stats() -> {"suppressed_puts": int,
+"startup_collapsed": int}`. Measured live (two sequential 120 s runs on one
+workspace): run 1 ended with 11 259 rows, run 2 published
+`suppressed_puts=11240` and ended with **11 187** rows and zero duplicated
+`dedup_id`s — the same restart that added ~11 240 rows before the fix shrank the
+queue by 72 instead. Rollback is `queue.durable_dedup: false` — one flip restores
+the previous behaviour byte-for-byte; the probe and the reconcile are governed by
+the same flag. There is deliberately no UNIQUE constraint on `dedup_id`: an
+`IntegrityError` raised inside the constructor would be swallowed by the stage's
+fail-open branch and silently degrade the whole stage to the memory backend.
 
 **Durability doctrine.** The store is **at-least-once**: a claim is invisible to
 other consumers for `visibility_timeout_s`; an unacknowledged claim (crash,

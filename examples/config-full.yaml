@@ -390,6 +390,19 @@ queue:
   # Startup/legacy-import age gate in hours; older rows are purged loudly at
   # startup and aged snapshots are parked, never imported (> 0)
   max_age_hours: 24
+  # Durable dedup (P20): suppress fresh (attempts==0) tasks whose dedup_id is
+  # already PENDING, and collapse legacy duplicates at startup keeping MIN(seq).
+  # Measured price removed: +12 224 rows and +6 537 216 bytes per restart
+  # (7 451 duplicated dedup_ids, arithmetic 9 843 − 2 392 + 12 224 = 19 675).
+  # Deferrals and bounded retries are untouched (they re-put BEFORE task_done
+  # deletes the claim). Rollback is flipping this to false.
+  # Observed live (two sequential 120 s runs on one workspace): run 1 ended with
+  # 11 259 rows, run 2 published suppressed_puts=11240 and ended with 11 187 rows
+  # and zero duplicated dedup_ids. Evidence lines: the engine WARNING on the 1st
+  # suppression and every 1000th, the startup collapse WARNING, and the queue
+  # manager INFO "Durable dedup for <stage>: suppressed_puts=N startup_collapsed=M"
+  # emitted on change (so the last one always carries the final totals).
+  durable_dedup: true
   # NOTE: pipeline.queue_sizes is ignored when backend is sqlite (disk is the
   # bound; the refine governor bounds inflow) -- a startup WARNING says so.
 

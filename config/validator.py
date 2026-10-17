@@ -600,6 +600,12 @@ class ConfigValidator:
         if float(queue_config.max_age_hours) <= 0:
             self.errors.append("Queue max_age_hours must be positive")
 
+        # Mirrors TaskQueueConfig.__post_init__ (deliberate duplication): a
+        # non-boolean value would silently invert the rollback flag, so it fails
+        # loudly and names the key.  No coercion (design D6).
+        if not isinstance(queue_config.durable_dedup, bool):
+            self.errors.append("queue.durable_dedup must be a boolean")
+
     def _validate_gather_config(self, config: Config) -> None:
         """Validate the gather transport configuration section.
 

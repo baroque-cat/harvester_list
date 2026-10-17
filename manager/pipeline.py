@@ -376,6 +376,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
                     queue_dir=queue_dir,
                     queue_visibility_timeout_s=self.config.queue.visibility_timeout_s,
                     queue_max_age_hours=self.config.queue.max_age_hours,
+                    queue_durable_dedup=self.config.queue.durable_dedup,
                 )
 
                 self.stages[name] = stage

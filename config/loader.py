@@ -529,6 +529,7 @@ class ConfigLoader:
             backend=data.get("backend", "memory"),
             visibility_timeout_s=data.get("visibility_timeout_s", 300.0),
             max_age_hours=data.get("max_age_hours", 24.0),
+            durable_dedup=data.get("durable_dedup", True),
         )
 
     def _parse_gather_config(self, data: Dict[str, Any]) -> GatherConfig:
