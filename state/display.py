@@ -746,23 +746,41 @@ class StatusDisplayEngine:
 
     @staticmethod
     def _format_aggregation_metrics_line(status: SystemStatus) -> str:
-        """Render the shared search-response aggregation counters (RO-S1)."""
+        """Render the shared search-response aggregation counters (RO-S1).
+
+        P15: ``ratio=`` is the derived KPI ``(hits+misses+joins)/misses`` and is
+        rendered ON THE SAME LINE as its denominator ``misses=`` (the count of
+        real HTTP requests); the distinct-work companion ``uniq_wires=`` lives
+        on the adjacent ``Refine:`` line.  The pair is the contract — a ratio
+        read alone rewards waste (plan.md II.4, measured 49.9 vs 3.0).
+        """
         metrics = getattr(status.pipeline, "aggregation_metrics", None)
         if not metrics:
             return ""
         metric_int = StatusDisplayEngine._metric_int
+        metric_rate = StatusDisplayEngine._metric_rate
         return (
             f"Aggregation: hits={metric_int(metrics.get('hits'))} "
             f"misses={metric_int(metrics.get('misses'))} "
             f"joins={metric_int(metrics.get('joins'))} "
             f"entries={metric_int(metrics.get('entries'))} "
             f"bytes={metric_int(metrics.get('bytes'))} "
-            f"pairs={metric_int(metrics.get('aggregatable_pairs'))}"
+            f"pairs={metric_int(metrics.get('aggregatable_pairs'))} "
+            f"ratio={metric_rate(metrics.get('aggregation_ratio')):.2f}"
         )
 
     @staticmethod
     def _format_refine_metrics_line(status: SystemStatus) -> str:
-        """Render the refine governance counters and coverage estimate (RO-S1)."""
+        """Render the refine governance counters and coverage estimate (RO-S1).
+
+        P15 honest verdict: ``cov[...]`` keeps its pinned honest arithmetic but
+        carries an explicit ``(unfit-denominator)`` marker — per plan.md II.5.2
+        neither numerator nor denominator relates to the key population (the
+        denominator derives from ``total_count`` of a degenerate literal wire
+        query), so the value must never be read as coverage.  Retained rather
+        than removed because spec scenarios pin the arithmetic; a silent zero
+        would be a false comfort instrument.
+        """
         metrics = getattr(status.pipeline, "refine_metrics", None)
         if not metrics:
             return ""
@@ -779,7 +797,8 @@ class StatusDisplayEngine:
             f"trunc={metric_int(metrics.get('truncated_to_cap'))} "
             f"uniq_wires={metric_int(metrics.get('distinct_wire_admitted'))} "
             f"cov[min={metric_rate(metrics.get('coverage_estimate_min')):.4f}, "
-            f"avg={metric_rate(metrics.get('coverage_estimate_avg')):.4f}]"
+            f"avg={metric_rate(metrics.get('coverage_estimate_avg')):.4f}] "
+            f"(unfit-denominator)"
         )
 
     @staticmethod

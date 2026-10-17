@@ -89,6 +89,18 @@ class AggregationMetrics:
             "shadow_jaccard_min": self.shadow_jaccard_min,
             "shadow_jaccard_p95": self.shadow_jaccard_p95,
             "aggregatable_pairs": get_aggregatable_pairs(),
+            # P15 (plan.md II.4): derived KPI computed from counters that are
+            # already published — no new collection.  MUST be read paired with
+            # the distinct-work measures (`misses` on the same rendered line,
+            # `uniq_wires` on the adjacent Refine line): an unpaired ratio
+            # rewards waste (measured 49.9 for the wasteful arm vs 3.0 for the
+            # enforcing one; 307.6 vs 6.4 in the depth A/B).  ``misses == 0``
+            # is a legitimate zero (no real HTTP yet), not an error.
+            "aggregation_ratio": (
+                (self.hits + self.misses + self.joins) / self.misses
+                if self.misses
+                else 0.0
+            ),
         }
 
 

@@ -1471,7 +1471,15 @@ case equals pre-change behavior and no task is ever dropped.
 **Metrics.** Exposed in `PipelineStatus.aggregation_metrics`: `hits`, `misses`,
 `joins`, `join_timeouts`, `evictions`, `entries`, `bytes`, `poisoned_rejected`
 (should stay 0), `shadow_comparisons`, `shadow_jaccard_min` /
-`shadow_jaccard_p95`, and the planning-time `aggregatable_pairs`. The store is
+`shadow_jaccard_p95`, the planning-time `aggregatable_pairs`, and the derived
+KPI `aggregation_ratio = (hits + misses + joins) / misses` (0.0 while
+`misses == 0` — a legitimate zero, no real HTTP yet). **Read the ratio only
+paired with the distinct-work measures** — its denominator `misses` (real HTTP
+requests) on the same rendered line and `uniq_wires` (distinct admitted wire
+queries) on the adjacent `Refine:` line. An unpaired ratio rewards waste: a run
+re-executing few distinct queries many times scores higher than one doing more
+distinct work (measured 49.9 for the wasteful arm vs 3.0 for the enforcing one;
+307.6 vs 6.4 in the depth A/B — plan.md II.4/II.16.2). The store is
 in-memory only: a restart starts cold and no workspace artifact is created in
 `off`/`on` (the shadow decision log is the sole on-disk output, append-only
 audit data).
@@ -1585,7 +1593,14 @@ coverage estimate per refined parent is `min(1.0, admitted × limit / max(total,
 1))` — the fraction of the reported space reachable if every admitted child fills
 a page window. It ignores child-total skew and is an approximation; `shadow` mode
 calibrates expectations before relying on `on`. Raising the caps is a config
-edit; lowering is a one-flip rollback.
+edit; lowering is a one-flip rollback. **Honest verdict (P15):** the rendered
+`cov[min=…, avg=…]` carries an explicit `(unfit-denominator)` marker. `total`
+derives from the `total_count` of the degenerate literal wire query (`"sk-"`,
+tens of millions of matches) rather than the real key population (~200K), so
+neither numerator nor denominator measures coverage and the value must never be
+read as one; it is retained because spec scenarios pin its arithmetic, and a
+silent zero would be a false comfort instrument. Recomputing the denominator
+(former proposal R6) was removed from the roadmap by operator decision.
 
 **Metrics.** Exposed in `PipelineStatus.refine_metrics`: `mode`,
 `children_generated`, `children_admitted`, `refused_depth`, `refused_budget`,
@@ -1905,13 +1920,20 @@ surface is non-empty and read through an explicit key allowlist (so an upstream
 key cannot widen output or leak a value):
 
 ```
-Gather: raw req=12 bytes=3456 p50=250ms p99=750ms defer[rl=1, budget=3, sec=0, cred=0] drop[auth=0, 404=2] head=1 trunc=0 badlink=0
-Aggregation: hits=5 misses=2 joins=1 entries=6 bytes=1234 pairs=4
-Refine: mode=on gen=144 adm=128 refused[depth=0, budget=0] trunc=16 cov[min=0.0027, avg=0.0746]
+Gather: raw req=12 bytes=3456 p50=250ms p99=750ms defer[rl=1, budget=3, sec=0, cred=0] drop[auth=0, 404=2] head=1 trunc=0 badlink=0 304=1
+Aggregation: hits=5 misses=2 joins=1 entries=6 bytes=1234 pairs=4 ratio=4.00
+Refine: mode=on gen=144 adm=128 refused[depth=0, budget=0, wire=16] trunc=16 uniq_wires=128 cov[min=0.0027, avg=0.0746] (unfit-denominator)
 ```
 
 Read **A1** (mean bytes per file) as `bytes_raw / req` on the `Gather:` line and
-**A2** as `p50=`/`p99=` (upper band edges). The same status is rendered once at
+**A2** as `p50=`/`p99=` (upper band edges). Read `ratio=` as aggregator calls
+per real HTTP request — **always together with** `misses=` on the same line and
+`uniq_wires=` on the adjacent `Refine:` line (see the aggregation section: an
+unpaired ratio rewards waste). The `(unfit-denominator)` marker on `cov[...]`
+is an explicit honest verdict, not decoration: the coverage estimate keeps its
+pinned arithmetic, but its denominator derives from the `total_count` of a
+degenerate literal wire query, so the value must never be read as key-population
+coverage (plan.md II.5.2). The same status is rendered once at
 shutdown; the R5.2 `Credential liveness: …` INFO line is unchanged.
 
 **Unchanged:** authenticated search and `repo_meta` behavior, wire-query
