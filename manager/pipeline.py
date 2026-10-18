@@ -7,7 +7,7 @@ Implements producer-consumer pattern with configurable worker threads and dynami
 
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from config.schemas import Config
 from core.auth import configure_auth, get_auth_provider

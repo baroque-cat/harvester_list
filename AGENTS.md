@@ -88,3 +88,67 @@ A suite run no longer writes log files into the repository (`fix-run-output-hygi
   sink location at import time — before any fixture could run.
 - Consequence: an empty repository `logs/` after a suite run is an invariant. A
   file appearing there is a regression in the isolation, not harmless output.
+
+## 5. Two interpreters: dev runs Python 3.14, prod runs pyenv 3.11.15
+
+The dev host runs the suite and every live gate under `/usr/bin/python3` =
+**3.14.8**. The production host (`/home/scrapuser/harvester_list`) runs
+**pyenv 3.11.15**. Since 3.14, PEP 649 makes annotations *lazy* (never
+evaluated at import); on 3.11 they are evaluated *eagerly* during class-body
+execution. Anything that only breaks under eager evaluation is invisible to
+the whole dev loop — suite and gates included.
+
+Measured incident (2026-10-18): `manager/pipeline.py` shipped
+`def get_refine_metrics(self) -> Dict[str, Any]:` since `e6d81ea` (R1,
+2026-09-22) while its typing import listed only `Dict, List, Optional`. A
+month, 30 commits, a 727-test suite and every live gate passed under 3.14;
+the first prod launch died before executing a single statement:
+`NameError: name 'Any' is not defined` (main.py:29 → `manager/__init__.py`:16
+→ `pipeline.py`:45 → :294). A 3.11 sweep of all 104 product modules showed
+exactly one root cause (the other eight failures were cascades through
+`manager/__init__`).
+
+**Policy**
+
+1. `tests/test_annotation_hygiene.py` is the interpreter-independent guard:
+   an AST scan requires every annotation name to be bound (strictly at module
+   level for `manager/pipeline.py`), and every product source must parse with
+   `feature_version=(3, 11)`. Never weaken it to an import-based check — an
+   import cannot fail on this class under 3.14.
+2. Before deploying to the prod host, run the 3.11 import sweep from a
+   **sandbox copy** (never from the repository cwd — importing `tools`
+   attaches file handlers at import time and would write into the repo's
+   `logs/`, §4):
+
+   ```bash
+   SB=/tmp/opencode/py311_sweep; rm -rf "$SB"; mkdir -p "$SB"
+   tar cf - --exclude=./.git --exclude=./data --exclude=./logs \
+       --exclude=./openspec --exclude=./docs --exclude=./examples \
+       --exclude=./tests --exclude=__pycache__ --exclude=.secrets \
+       --exclude=./config.yaml . | (cd "$SB" && tar xf -)
+   cd "$SB" && ~/.pyenv/versions/3.11.15/bin/python3 - <<'EOF'
+   import importlib, os, sys
+   sys.path.insert(0, ".")
+   mods = []
+   for root, dirs, files in os.walk("."):
+       dirs[:] = [d for d in dirs if d != "__pycache__"]
+       for f in files:
+           if f.endswith(".py"):
+               p = os.path.join(root, f)[2:-3].replace("/", ".")
+               mods.append(p[:-9] if p.endswith(".__init__") else p)
+   fails = 0
+   for m in sorted(mods):
+       try:
+           importlib.import_module(m)
+       except Exception as e:
+           fails += 1; print("FAIL", m, type(e).__name__, e)
+   print(f"attempted {len(mods)}, failures {fails}")
+   EOF
+   ```
+
+   Expect 0 failures except the documented root `__init__.py` artifact (§4:
+   relative import with no known parent package — it is never imported
+   standalone in production; `main.py` is the entry point).
+3. Interpreter-sensitive smoke checks (`main.py --validate`) may run under
+   3.11 with the config referenced **by absolute path** from the sandbox cwd;
+   the config is never copied (§3, lesson И8).
