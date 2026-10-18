@@ -7,13 +7,14 @@ This module provides enhanced task recovery functionality using type-safe
 stage management and configuration-driven approach.
 """
 
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from core.enums import PipelineStage
 from core.models import AllRecoveredTasks, ProviderTask, RecoveredTasks, Service
 from core.types import IProvider
 from stage.base import StageUtils
 from stage.factory import TaskFactory
+from storage.registry import patterns_hash, url_hash
 from tools.logger import get_logger
 
 from .pipeline import Pipeline
@@ -150,6 +151,18 @@ class TaskRecoveryManager:
     def _recover_acquisition_tasks(self, name: str, acquisition_tasks: List[str]) -> None:
         """Recover acquisition tasks for provider
 
+        P26: apply the same creation-time policy stack the search stage uses
+        (gather-skip decision first, then cross-provider share claim) BEFORE
+        put_task, so a restart stops re-enqueueing the entire cumulative shard
+        history (measured 12 268 tasks on one restart, unbounded growth;
+        plan.md II.19 P26 / I.23).  Both layers ride their EXISTING flags
+        (``skip.skip_known``, ``gather.share_fetch``); with both off the replay
+        is byte-identical to the pre-P26 behaviour.  Every layer fails open in
+        the enqueue direction.  No repo-meta refresh and no dating hooks run
+        here (D4): startup consumes STORED registry state only — refreshing
+        thousands of URLs would hammer the github_api basket before workers
+        start, and push evidence is NULL anyway while enrichment is off.
+
         Args:
             name: Name of the provider
             acquisition_tasks: List of URLs to acquire
@@ -165,10 +178,63 @@ class TaskRecoveryManager:
             return
 
         patterns = provider.get_patterns()
-        recovered_count = 0
+        urls = [url for url in (acquisition_tasks or []) if url]
 
-        for url in acquisition_tasks:
+        # P26: resolve the policy stack once per provider (fail-open to inert).
+        engine = getattr(self.pipeline, "gather_skip", None)
+        engine_on = engine is not None and bool(getattr(engine, "enabled", False))
+        enforce = bool(getattr(engine, "enforce", False))
+        ledger = getattr(self.pipeline, "share_ledger", None)
+        share_enabled = ledger is not None and bool(getattr(ledger, "enabled", False))
+
+        digest = ""
+        if urls and (engine_on or share_enabled):
             try:
+                digest = patterns_hash(
+                    key_pattern=patterns.key_pattern,
+                    address_pattern=patterns.address_pattern,
+                    endpoint_pattern=patterns.endpoint_pattern,
+                    model_pattern=patterns.model_pattern,
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(f"[recovery] patterns digest failed for {name}: {e}")
+                digest = ""
+
+        skip_map: Dict[str, Any] = {}
+        if engine_on and digest and urls:
+            try:
+                decisions = engine.decide(urls, provider=name, patterns_hash=digest)
+                skip_map = {decision.url: decision for decision in decisions}
+            except Exception as e:
+                logger.warning(f"[recovery] gather-skip decision failed for {name}: {e}")
+                skip_map = {}
+
+        transport = "raw"
+        if share_enabled:
+            cfg = getattr(self.pipeline, "config", None)
+            transport = str(getattr(getattr(cfg, "gather", None), "transport", "raw") or "raw")
+
+        recovered_count = 0
+        skip_suppressed = 0
+        share_suppressed = 0
+
+        for url in urls:
+            try:
+                decision = skip_map.get(url)
+                if enforce and decision is not None and decision.skip:
+                    skip_suppressed += 1
+                    continue
+                # P26: consult the share ledger after gather-skip (search-side
+                # order, R7 D4).  A skip-suppressed provider registers no share
+                # interest: another provider with a genuine coverage gap owns
+                # the fetch, and the suppressed one already has coverage.
+                if share_enabled and digest:
+                    try:
+                        if ledger.claim(url_hash(url), digest, transport, name):
+                            share_suppressed += 1
+                            continue
+                    except Exception:
+                        pass  # fail-open: create the task
                 # Create acquisition task with patterns
                 acquisition_task = TaskFactory.create_acquisition_task(name, url, patterns)
                 stage_instance.put_task(acquisition_task)
@@ -177,8 +243,15 @@ class TaskRecoveryManager:
             except Exception as e:
                 logger.error(f"Failed to create acquisition task for {name}: {e}")
 
-        if recovered_count > 0:
-            logger.info(f"Recovered {recovered_count} acquisition tasks for {name}")
+        # P26/D5: printed even when everything was suppressed — a fully
+        # filtered recovery must be LOUDER, not silent (Н9).  The legacy base
+        # substring "Recovered N acquisition tasks for <name>" stays stable.
+        if urls:
+            logger.info(
+                f"Recovered {recovered_count} acquisition tasks for {name} "
+                f"(shard urls {len(urls)}, skip-suppressed {skip_suppressed}, "
+                f"share-suppressed {share_suppressed})"
+            )
 
     def _get_stage_enum(self, stage_name: str) -> Optional[PipelineStage]:
         """Get stage enum from stage name
