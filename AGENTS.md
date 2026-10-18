@@ -3,7 +3,98 @@
 Domain conventions (parsing, registry, flags, wire-format probing) live in
 `openspec/config.yaml` → `context:` and in `plan.md`. This file covers the
 **environment and operational** rules that are not domain logic but have already
-caused real incidents.
+caused real incidents. **Exception (operator directive, 2026-10-18): §0 below is
+domain canon** — the refine-mechanism contract and the program's normative goals
+— recorded here so it is loaded into every agent session and never re-argued.
+
+## 0. Domain canon: the refine mechanism and the normative goals
+
+This section is **normative**. Everything in §0.1 was established by direct
+offline functional probes of the shipped generator (2026-10-18, reproducible via
+`RefineEngine.generate_queries(query, partitions=P)`) and by git history.
+
+### 0.1 The refine (query-splitting) mechanism — what it is, API vs HTML
+
+The refine engine (`search/github/refine/`, untouched since 2026-06-18 except
+for wire-extraction in `engine.py`) recursively enumerates the character space
+of a `/regex/` pattern into disjoint subsets. It performs **no semantic
+enrichment**: the `language:`/`size:` qualifier branch (`engine.py:270`) is
+unreachable in the productive path (early return at `engine.py:179-181`), and
+`content:` is web-only (`constant/search.py::WEB_ONLY_QUALIFIERS`). Splitting is
+pure prefix/subset narrowing — on both transports.
+
+Per task the stage decides: `refine = total > limit`, where limit is
+`API_LIMIT = 1000` (10 pages × 100) or `WEB_LIMIT = 100` (5 × 20)
+(`constant/search.py`); `partitions = ceil(total / limit)`, clamped by
+`refine_governor.max_partitions_per_refine` BEFORE the generator
+(`stage/definition.py:418-421`).
+
+**Child shape is a function of the partition target** (measured; root
+`/sk-[a-zA-Z0-9]{32}/`, alphabet folds to 36 case-insensitive chars; groups of
+one char become bare literals via `_build_str`, wider groups stay classes):
+
+| partitions | candidates | child shape | distinct API wires |
+|---|---|---|---|
+| 128 | 144 | `/sk-0[0123456789][a-zA-Z0-9]{30}/` (1 literal + residual class) | 36 (`"sk-0"`…`"sk-z"`) |
+| 1 296 | 1 296 | `/sk-00[a-zA-Z0-9]{30}/` (2 contiguous literals) | 1 296 (`"sk-00"`…) |
+| 46 656 | 46 656 | `/sk-000[a-zA-Z0-9]{29}/` (3 contiguous literals) | 46 656 (`"sk-000"`…) |
+
+**Transport projection is what differs:**
+
+- **HTML/web** sends the raw pattern VERBATIM (`search/querykey.py:12`): every
+  subset is a distinct wire query at any depth and any clamp. Brute-force
+  widening works as designed; the R11 wire guard never fires there (by
+  construction, not defect).
+- **API** does not accept regex syntax: `clean_regex` extracts only CONTIGUOUS
+  fixed-literal runs of ≥3 chars and quotes them (`_extract_fixed_strings`
+  merges consecutive fixed segments; runs shorter than 3 chars are dropped). A
+  residual character class terminates the run. Therefore at clamp=128 every
+  level past the first collapses onto the parent's wire (measured:
+  distinct_api_wires=1 at L2/L3/L4), and the R11 guard
+  (`drop_wire_indistinguishable`) legitimately withholds those children. At
+  clamp ≥ 36^k children carry k contiguous literals and stay wire-distinct.
+
+**Normative consequences:**
+
+1. On API, splitting WIDTH is governed by `max_partitions_per_refine`, not by
+   `max_refine_depth`. Depth alone adds zero wire-distinct queries at clamp
+   128; depth regains meaning once the clamp lets children carry literal
+   prefixes — then over-limit buckets split further, data-driven
+   (`partitions = ceil(total/limit)` per bucket; P < 37 yields depth-1
+   group-only children whose wire equals the parent's).
+2. Buckets with total ∈ (1 000, ~37 000) cannot be usefully split on API
+   (GitHub's 1 000-results-per-query ceiling is absolute); their tails are
+   reachable only via web transport. Platform property, not a bug.
+3. The generator is parameter-driven and intact. "API splitting is degenerate"
+   is a statement about the clamp VALUE (an emergency brake installed after the
+   2026-09-21 OOM incident), never about broken code. Widening coverage means
+   turning config knobs, not editing `search/github/refine/`.
+
+### 0.2 Normative goals of the program (operator dictate, priority order)
+
+Wall-clock runtime is explicitly NOT a goal:
+
+1. **Maximum coverage** — embrace the largest possible set of the search space.
+   A horizon of ~10^6 distinct queries is EXPECTED to take tens to hundreds of
+   hours; that is acceptable by design.
+2. **Provider aggregation** — N providers discovering the same work must cost
+   ONE fetch (search responses via `aggregation`, gather files via
+   `gather.share_fetch`), never N.
+3. **Link accumulation** — discoveries persist and compound across runs
+   (registry, shards, coverage rows); restarts continue, not repeat.
+4. **Limit efficiency with braking** — operate at the maximum sustainable rate
+   relative to API limits without provoking refusals; when limits are hit, the
+   deferral/cooldown machinery (RateLimitDeferral, baskets, bounded credential
+   waits) absorbs the pressure WITHOUT losing tasks. Hitting a limit and
+   deferring is designed behavior, not failure.
+5. **RAM economy via the governor** — work materialization stays bounded
+   (sqlite queues, clamps, budgets); RAM plateaus regardless of horizon.
+
+Search wall-time is reducible ONLY by adding API tokens (operator's
+prerogative). Never argue against a coverage-oriented configuration on the
+grounds that it makes runs longer. Every control mechanism (governor, wire
+guard, budget, dedup layers, share ledger, age gate) MUST fully support — never
+contradict — raised depth/partition knobs aimed at large coverage.
 
 ## 1. Temporary storage: `/tmp` is a small tmpfs — never put run data there
 
