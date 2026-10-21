@@ -23,9 +23,9 @@ import math
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from search.querykey import fingerprint, wire_query
 from storage.atomic import AtomicFileWriter
@@ -42,6 +42,12 @@ DEFAULT_JOIN_TIMEOUT_S = 60.0
 
 _VALID_MODES = ("off", "shadow", "on")
 
+# NEW-7 (a): bounded window for shadow-jaccard samples.  Caps memory and makes
+# the sorted() in shadow_jaccard_p95 O(W log W) with W = 10 000 instead of
+# unbounded.  Quantiles become windowed over the last _SHADOW_JACCARD_WINDOW
+# comparisons; for N <= W the min/p95 semantics are exact.
+_SHADOW_JACCARD_WINDOW = 10_000
+
 
 @dataclass
 class AggregationMetrics:
@@ -57,7 +63,9 @@ class AggregationMetrics:
     poisoned_rejected: int = 0
     shadow_comparisons: int = 0
     shadow_warnings: int = 0
-    shadow_jaccard: List[float] = field(default_factory=list)
+    shadow_jaccard: Deque[float] = field(
+        default_factory=lambda: deque(maxlen=_SHADOW_JACCARD_WINDOW)
+    )
 
     @property
     def shadow_jaccard_min(self) -> float:

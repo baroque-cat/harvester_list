@@ -576,6 +576,7 @@ class Registry:
         self._degraded = False
         self._degraded_kinds: set = set()
         self.dropped = 0
+        self._dropped_lock = threading.Lock()
         self._metadata_noops = 0
         self._metadata_noop_logged = False
 
@@ -1444,7 +1445,8 @@ class Registry:
         try:
             self._queue.put_nowait((op, payload))
         except queue.Full:
-            self.dropped += 1
+            with self._dropped_lock:
+                self.dropped += 1
             self._degrade("queue_full", RuntimeError("registry queue is full"))
 
     def _execute(self, action, kind: str) -> None:

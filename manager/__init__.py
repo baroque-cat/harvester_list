@@ -16,7 +16,7 @@ For storage and persistence operations, use the 'storage' package.
 from .pipeline import Pipeline
 
 # Queue management
-from .queue import GracefulShutdown, QueueConfig, QueueManager, QueueStateInfo
+from .queue import QueueConfig, QueueManager, QueueStateInfo
 from .task import TaskManager, create_task_manager
 
 # Worker management
@@ -31,7 +31,6 @@ __all__ = [
     "QueueConfig",
     "QueueManager",
     "QueueStateInfo",
-    "GracefulShutdown",
     # Worker management
     "WorkerManager",
     "create_worker_manager",

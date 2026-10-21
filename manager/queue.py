@@ -7,8 +7,6 @@ Handles serialization/deserialization with enum-based stage management.
 
 import json
 import shutil
-import signal
-import sys
 import tempfile
 import threading
 import time
@@ -742,90 +740,6 @@ class QueueManager(PeriodicTaskManager):
                 pass
 
         return task_list
-
-
-class GracefulShutdown:
-    """Handles graceful shutdown with queue state preservation"""
-
-    def __init__(
-        self, queue_manager: QueueManager, result_manager: MultiResultManager, stages: Dict[str, BasePipelineStage]
-    ):
-        self.queue_manager = queue_manager
-        self.result_manager = result_manager
-        self.stages = stages
-        self.shutdown_timeout = 30
-
-        # Register signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-
-        logger.info("Registered graceful shutdown handlers")
-
-    def _signal_handler(self, signum, _):
-        """Handle shutdown signals"""
-        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-        self.shutdown()
-
-    def shutdown(self) -> None:
-        """Perform graceful shutdown"""
-        start_time = time.time()
-
-        try:
-            # 1. Stop accepting new tasks
-            logger.info("Stopping task acceptance...")
-            for stage in self.stages.values():
-                stage.stop_accepting()
-
-            # 2. Flush all result buffers
-            logger.info("Flushing result buffers...")
-            self.result_manager.flush_all()
-
-            # 3. Save all queue states
-            logger.info("Saving queue states...")
-            self.queue_manager.save_all_queues(self.stages)
-
-            # 4. Wait for current tasks to complete (with timeout)
-            remaining_time = self.shutdown_timeout - (time.time() - start_time)
-            if remaining_time > 0:
-                logger.info(f"Waiting up to {remaining_time:.1f}s for tasks to complete...")
-                self._wait_for_completion(remaining_time)
-
-            # 5. Force save final state
-            logger.info("Final state save...")
-            self.queue_manager.save_all_queues(self.stages)
-
-            # 6. Stop managers
-            self.queue_manager.stop()
-            self.result_manager.stop_all()
-
-            logger.info("Graceful shutdown completed")
-
-        except Exception as e:
-            logger.error(f"Error during graceful shutdown: {e}")
-
-        finally:
-            sys.exit(0)
-
-    def _wait_for_completion(self, timeout: float) -> None:
-        """Wait for tasks to complete"""
-        start_time = time.time()
-
-        while time.time() - start_time < timeout:
-            all_idle = True
-
-            for stage in self.stages.values():
-                if stage.is_busy():
-                    all_idle = False
-                    break
-                elif not stage.queue.empty():
-                    all_idle = False
-                    break
-
-            if all_idle:
-                logger.info("All stages idle, shutdown can proceed")
-                break
-
-            time.sleep(1)
 
 
 if __name__ == "__main__":

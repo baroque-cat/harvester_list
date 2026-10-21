@@ -799,20 +799,6 @@ class MultiResultManager:
                     logger.error(f"Failed to stop periodic snapshot for {manager.name}: {e}")
         logger.info("Stopped periodic snapshots for all providers")
 
-    def build_all_snapshots_all(self) -> Dict[str, Dict[str, int]]:
-        """Build snapshots for all result types across all providers."""
-        results: Dict[str, Dict[str, int]] = {}
-        with self.lock:
-            for provider_name, manager in self.managers.items():
-                try:
-                    results[provider_name] = manager.build_all_snapshots()
-                except Exception as e:
-                    logger.error(f"Failed to build snapshots for {provider_name}: {e}")
-                    results[provider_name] = {}
-        total_snapshots = sum(len(provider_results) for provider_results in results.values())
-        logger.info(f"Built {total_snapshots} snapshots across {len(results)} providers")
-        return results
-
     def stop_all(self):
         """Stop all result managers"""
         with self.lock:

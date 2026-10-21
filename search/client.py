@@ -2851,25 +2851,6 @@ def _search_with_count_impl(
         return search_web_with_count(keywords, session, page, callback)
 
 
-@handle_exceptions(default_result=0, log_level="error")
-def get_total_num(query: str, token: str) -> int:
-    """Get total number of results from GitHub API."""
-    if isblank(token) or isblank(query):
-        return 0
-
-    url = f"https://api.github.com/search/code?q={query}&sort=indexed&order=desc&per_page=20&page=1"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    client = get_github_client()
-    content = client.get(url=url, headers=headers, interval=1, credential=token)
-    data = json.loads(content)
-    return data.get("total_count", 0)
-
-
 def estimate_web_total(query: str, session: str, content: Optional[str] = None) -> int:
     """
     Get total count for web search using GitHub's blackbird_count API.

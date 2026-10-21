@@ -359,6 +359,13 @@ class SqliteTaskQueue:
 
         ``dedup_id`` is left empty; ``created_at`` is taken from each task when
         available so the age gate stays meaningful.
+
+        Invariant: legacy rows carry ``dedup_id=''`` by design — invisible to
+        both dedup layers (durable reconcile skips ``''`` via
+        ``dedup_id <> ''`` predicates in ``_recover_on_open`` and the partial
+        index; RAM gate keys off non-empty ids).  Protected by the zero-rows
+        guard.  Wave-4 restore tooling MUST NOT rely on dedup semantics for
+        imported rows.
         """
         count = 0
         with self._cond:
