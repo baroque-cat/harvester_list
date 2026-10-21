@@ -120,6 +120,9 @@ class ConfigValidator:
         # Validate failure-handling mode coupling (NEW-1: shadow + registry-write hazard)
         self._validate_failure_handling_coupling(config)
 
+        # Validate handle-coherence advisories (W1–W5: cross-section budget/ledger/age/envelope/pattern checks)
+        self._validate_handle_coherence(config)
+
         # Surface non-fatal configuration warnings.
         if self.warnings:
             for warning in self.warnings:
@@ -866,3 +869,87 @@ class ConfigValidator:
                 "Consider failure_handling=strict (records 'failed' on transient errors) or "
                 "skip.skip_known=off (no registry-write consumer) to avoid the hazard."
             )
+
+    def _validate_handle_coherence(self, config: Config) -> None:
+        """Validate handle-coherence advisories (W1–W5, slice 2.7).
+
+        Cross-section checks that alert the operator to configuration mismatches
+        that degrade program goals (coverage, provider aggregation, link accumulation)
+        without blocking config load (all WARNING-class, house advisory style).
+
+        W1: budget < N_enabled_tasks × clamp — budget starves some roots in the same run.
+        W2: share_ledger_max_tracked < proxy — ledger cap smaller than expected distinct
+            gather keys in backlog ⇒ share suppression degrades to counted-fail-open.
+            Proxy: refine_governor.max_search_tasks_per_run (search budget bounds distinct
+            keys discovered; default 10000 ≤ default ledger 50000 ⇒ neutral).
+        W3: max_age_hours < HORIZON_HOURS (456 = 19 days × 24, Д3) — age gate narrower
+            than program horizon ⇒ tasks age out before full coverage.
+        W4: max_partitions_per_refine > 46656 (36^3 envelope, AGENTS §0.1) — fat-finger
+            guard; WARNING only (F8: no hard upper bound).
+        W5: ≥2 distinct key_pattern sets among enabled tasks — share suppression between
+            providers with different patterns is structurally impossible (goal 2 narrows).
+
+        Traceability: 02_critical_fixes.md:48 (W1–W5 line), 02_critical_fixes.md:98 (F8),
+        08_decisions.md Д3 (19 days / 10^6 wires), AGENTS.md §0.1 (46656 = 36^3).
+        """
+        enabled_tasks = [t for t in config.tasks if t.enabled]
+        n_enabled = len(enabled_tasks)
+
+        # W1: budget < N_enabled × clamp (budget starvation)
+        if n_enabled >= 2:
+            budget = int(config.refine_governor.max_search_tasks_per_run)
+            clamp = int(config.refine_governor.max_partitions_per_refine)
+            demand = n_enabled * clamp
+            if budget < demand:
+                self.warnings.append(
+                    f"W1: refine_governor.max_search_tasks_per_run ({budget}) is less than "
+                    f"N_enabled_tasks × max_partitions_per_refine ({n_enabled} × {clamp} = {demand}); "
+                    f"the budget starves some roots in the same run. "
+                    f"Raise max_search_tasks_per_run to ≥ {demand} or reduce max_partitions_per_refine."
+                )
+
+        # W2: share_ledger_max_tracked < proxy (ledger undersized)
+        ledger_cap = int(config.gather.share_ledger_max_tracked)
+        proxy = int(config.refine_governor.max_search_tasks_per_run)
+        if ledger_cap < proxy:
+            self.warnings.append(
+                f"W2: gather.share_ledger_max_tracked ({ledger_cap}) is less than "
+                f"refine_governor.max_search_tasks_per_run ({proxy}); "
+                f"the ledger cap is smaller than the expected distinct gather keys in backlog, "
+                f"so share suppression degrades to counted-fail-open. "
+                f"Raise share_ledger_max_tracked to ≥ {proxy}."
+            )
+
+        # W3: max_age_hours < HORIZON_HOURS (age gate narrower than program horizon)
+        HORIZON_HOURS = 456  # 19 days × 24 (08_decisions.md Д3: program horizon 19 days / 10^6 wires)
+        age_gate = float(config.queue.max_age_hours)
+        if age_gate < HORIZON_HOURS:
+            self.warnings.append(
+                f"W3: queue.max_age_hours ({age_gate}) is less than the program horizon "
+                f"({HORIZON_HOURS} hours = 19 days, Д3); "
+                f"tasks age out before full coverage. "
+                f"Raise max_age_hours to ≥ {HORIZON_HOURS}."
+            )
+
+        # W4: max_partitions_per_refine > 46656 (fat-finger guard, 36^3 envelope)
+        GENERATOR_ENVELOPE = 46_656  # 36^3 = three contiguous literals (AGENTS.md §0.1 table)
+        clamp = int(config.refine_governor.max_partitions_per_refine)
+        if clamp > GENERATOR_ENVELOPE:
+            self.warnings.append(
+                f"W4: refine_governor.max_partitions_per_refine ({clamp}) exceeds the generator "
+                f"envelope ({GENERATOR_ENVELOPE} = 36^3, AGENTS §0.1); "
+                f"this is a fat-finger guard, not a hard limit (F8). "
+                f"Verify this is intentional."
+            )
+
+        # W5: ≥2 distinct key_pattern sets among enabled tasks (share suppression impossible)
+        if n_enabled >= 2:
+            pattern_sets = {t.patterns.key_pattern for t in enabled_tasks}
+            if len(pattern_sets) >= 2:
+                task_names = [t.name for t in enabled_tasks]
+                self.warnings.append(
+                    f"W5: enabled tasks {task_names} have {len(pattern_sets)} distinct key_pattern sets; "
+                    f"share suppression between providers with different patterns is structurally "
+                    f"impossible (goal 2 narrows). "
+                    f"Align key_pattern across enabled tasks or accept reduced sharing."
+                )

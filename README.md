@@ -1797,12 +1797,14 @@ pipeline:
 counters tick only when `strict` actually propagates a failure. Search failures
 also now increment `total_errors` (they previously did not).
 
-**Config lint.** The validator emits an advisory warning (never an error) when a
-`use_api: true` provider carries a web-only qualifier such as `content:` in a
-condition query, because the code-search REST API silently returns zero matches
-for it (live probe 2026-09-20). The qualifier list is data-driven
-(`constant/search.py`, `WEB_ONLY_QUALIFIERS`), so extending it needs no validator
-change.
+**Config lint.** The validator emits advisory warnings (never errors) for:
+web-only qualifiers (`content:` etc.) under `use_api: true` providers (the API
+silently returns zero matches; live probe 2026-09-20; qualifier list is
+data-driven via `constant/search.py::WEB_ONLY_QUALIFIERS`); and handle-coherence
+mismatches (W1–W5, slice 2.7): budget starvation (W1), undersized share ledger
+(W2), narrow age gate vs program horizon (W3), partitions beyond the 36³
+generator envelope (W4), and divergent key patterns across enabled tasks (W5).
+All warnings name the mismatch and suggest remediation; the config still loads.
 
 **Promotion & rollback (project paradigm).** Ship `shadow`, run one
 representative cycle (including a rate-limit storm), review
