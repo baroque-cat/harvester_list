@@ -652,6 +652,11 @@ instead of being mangled into a zero-result wire query.
           gather: 4   # Acquisition threads
           check: 2     # Validation threads
           inspect: 1    # API capability inspection threads
+        dedup_sizes:
+          search: 100000   # In-RAM dedup cap per stage (FIFO eviction)
+          gather: 500000   # Raise to 1M for large horizons (~170 MB/stage)
+          check: 100000
+          inspect: 100000
 
       # System monitoring settings
       monitoring:

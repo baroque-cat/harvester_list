@@ -359,6 +359,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         # Create stages in dependency order
         thread_config = self.config.pipeline.threads
         queue_config = self.config.pipeline.queue_sizes
+        dedup_config = self.config.pipeline.dedup_sizes
 
         # Durable task-queue backend (fix-queue-persistence-under-load).  Under
         # sqlite, per-stage store files live beside the legacy JSON snapshots.
@@ -383,6 +384,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
                     handler=self._handle_stage_output,
                     thread_count=max(thread_config.get(name, 1), 1),
                     queue_size=max(queue_config.get(name, 1000), 1),
+                    dedup_max_size=max(dedup_config.get(name, 100_000), 1),
                     max_retries=self.config.global_config.max_retries_requeued,
                     queue_backend=queue_backend,
                     queue_dir=queue_dir,

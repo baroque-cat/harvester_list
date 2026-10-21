@@ -127,12 +127,27 @@ def _get_default_queue_sizes() -> Dict[str, int]:
     }
 
 
+def _get_default_dedup_sizes() -> Dict[str, int]:
+    """Get default dedup max sizes using StandardPipelineStage enum.
+
+    Default 100_000 per stage matches the historical ctor default in
+    ``stage/base.py`` — absent key ⇒ byte-identical pre-fix behavior.
+    """
+    return {
+        PipelineStage.SEARCH.value: 100_000,
+        PipelineStage.GATHER.value: 100_000,
+        PipelineStage.CHECK.value: 100_000,
+        PipelineStage.INSPECT.value: 100_000,
+    }
+
+
 @dataclass
 class PipelineConfig:
     """Pipeline stage configuration"""
 
     threads: Dict[str, int] = field(default_factory=_get_default_threads)
     queue_sizes: Dict[str, int] = field(default_factory=_get_default_queue_sizes)
+    dedup_sizes: Dict[str, int] = field(default_factory=_get_default_dedup_sizes)
     # Failure-handling contract: "legacy" | "shadow" | "strict" (project
     # paradigm: ship risky behavior behind a flag, default shadow at release).
     failure_handling: str = "shadow"
@@ -142,6 +157,8 @@ class PipelineConfig:
             self.threads = _get_default_threads()
         if not self.queue_sizes:
             self.queue_sizes = _get_default_queue_sizes()
+        if not self.dedup_sizes:
+            self.dedup_sizes = _get_default_dedup_sizes()
 
 
 @dataclass

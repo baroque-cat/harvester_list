@@ -184,6 +184,12 @@ class ConfigValidator:
             elif pipeline.queue_sizes[stage] <= 0:
                 self.errors.append(f"Queue size for {stage} must be positive")
 
+            # Validate dedup sizes
+            if stage not in pipeline.dedup_sizes:
+                self.errors.append(f"Missing dedup size for stage: {stage}")
+            elif pipeline.dedup_sizes[stage] <= 0:
+                self.errors.append(f"Dedup size for {stage} must be positive")
+
     def _validate_query_transport_compat(self, config: Config) -> None:
         """Warn about web-only qualifiers under API transport (advisory lint).
 

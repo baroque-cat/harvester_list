@@ -266,6 +266,7 @@ class ConfigLoader:
         return PipelineConfig(
             threads=data.get("threads", {}),
             queue_sizes=data.get("queue_sizes", {}),
+            dedup_sizes=data.get("dedup_sizes", {}),
             failure_handling=data.get("failure_handling", "shadow"),
         )
 

@@ -40,6 +40,16 @@ pipeline:
     gather: 200000 # Acquisition tasks queue
     check: 500000 # Validation tasks queue
     inspect: 1000000 # API capability inspection tasks queue
+  # In-RAM dedup cap per stage (FIFO eviction of oldest seen task-id).
+  # Default 100000 matches the historical ctor default — absent key ⇒ byte-identical
+  # pre-fix behavior.  For large horizons (≥10⁶ tasks), raise to 500000–1000000
+  # for gather (~85–170 MB/stage at ~170 B/entry — within the RAM plateau).
+  # Rollback: delete this key or set back to 100000.
+  dedup_sizes:
+    search: 100000 # Search stage dedup cap
+    gather: 500000 # Acquisition stage dedup cap (raise to 1000000 for large horizons)
+    check: 100000 # Validation stage dedup cap
+    inspect: 100000 # API capability inspection dedup cap
   # Failure-handling contract for transient fetch failures (empty-result taxonomy).
   #   legacy: byte-for-byte pre-change behavior (typed failures swallowed; counters inert)
   #   shadow: detect + count + log failure-empties, but keep legacy outcomes   (default)
