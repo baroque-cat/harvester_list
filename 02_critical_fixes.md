@@ -50,6 +50,23 @@
 
 **E1 — ЗАКРЫТО ДОСРОЧНО срезом 1.4 (`7c7e684`):** `_validate_persistence_config` + parse 4 ключей + WARNING неизвестных ключей реализованы.
 
+**Статус срезов волны 2 (ИСПОЛНЕНО 2026-10-22, коммиты локальные, не пушены; origin/main=c5468eb, local впереди на 21):**
+
+| Срез | Коммит | Суть |
+|---|---|---|
+| 2.1 C2/C2b | `5cef359` | Ключ `gather.share_ledger_max_tracked` (дефолт 50k нейтрален) + cap на shadow-множество `_shadow_seen`; аларм `full=` в строке `Share:` подтверждён пином |
+| 2.2 C6/F5 | `4612b0c` | Per-stage `pipeline.dedup_sizes` (дефолт 100k = байт-прежнее поведение); wiring-пин через Pipeline (постфактум-RED `assert 100000 == 250000`) |
+| 2.3 NEW-4 | `d1fafbc` | (а) ключ `file_dating.coalesce_window_s` (≤0 = откат P21-коалесцинга конфигом); (б) `gather.max_payload_bytes` доведён до fetch-цепи (аксессор-зеркало `_configured_gather_transport`, fallback 8 МиБ); (в) `graphql_batch_max` задокументирован как validation-ceiling |
+| 2.4 F-04 | `933efe4` | Queue schema v3: колонки `defer_count`/`last_defer_ts` (аддитивная миграция v2→v3), exempt-предикат purge `NOT (pending AND attempts=0 AND defer_count=0)`, `put_defer()`; дельта спеки durable-task-queue: S13 переписан + новый S23 (потолок циркуляции) |
+| 2.5 C8/F-20 | `c513c19` | Хелпер `tools/jsonl_rotate.py` (поколения .1….{keep_n}, fail-open) + ключи `registry.decision_log_max_bytes=64МиБ`/`decision_log_keep_rotated=2`; ротация ОБА файлов: registry_decisions.jsonl (gather_skip+early_stop) и aggregation_decisions.jsonl; строки при ротации не теряются |
+| 2.6 F4 | `2419463` | Одна агрегат-WARNING на родителя `budget_refusal: provider=… query=… refused=N first=… last=… reason=budget`; per-child строки запрещены; спека refine-fanout-governor правлена в том же коммите |
+| 2.7 W1–W5 | `2f63189` | `_validate_handle_coherence`: W1 бюджетное голодание (budget < n×clamp), W2 ledger cap < proxy (max_search_tasks_per_run), W3 age-gate < горизонта 456ч, W4 clamp > конверта 46656, W5 patterns-дивергенция включённых задач; пин нейтральности боевой формы |
+| 2.8 NEW-7+C10 | `09d65e3` | `shadow_jaccard` → deque(maxlen=10k); `_dropped_lock` вокруг dropped+=1; инвариант bulk_insert dedup_id='' задокументирован; мёртвые поверхности удалены (см. поправку C10 ниже) |
+
+**Suite:** 768 → 776 → 783 → 790 → 796 → 809 → 815 → 829 → **837 passed**. Правки существующих пинов — только предрегистрированные для F-04 (фактическая нота в `07_verification.md` §7.9): нормативное изменение поведения, легитимировано дельтой спеки S13/S23, не ослабление. `search/github/refine/` не тронут. **Гейт 2.G PASS** — детали в `07_verification.md` §7.2.
+
+**Диспозиция OBS-1/OBS-2:** в срезы волны 2 не вошли; OBS-1 (согласование shutdown_timeout с api.timeout+retries) остаётся кандидатом волны 5 (shutdown-тюнинг); OBS-2 (прореживание `.build_meta.json["generations"]`) — косметика, оставлен.
+
 **NOTE (новое 2026-10-21, живая фаза волны 1):**
 
 | ID | Sev | Где | Суть | Фикс-кандидат |
@@ -59,7 +76,7 @@
 | **NEW-4** | MEDIUM | `file_dating.py:46-48,:79`; `pipeline.py:180-190`; `loader.py:549`; `client.py:3096-3104,:1841` | Plumbing-дефекты класса `resource_provider`: (а) `FileDater.coalesce_window_s` — самоописанный «de-facto rollback knob» P21 — НЕ имеет конфигурационного ключа и не передаётся ⇒ откат требует правки кода (нарушение инварианта 4); (б) `gather.max_payload_bytes` парсится+валидируется, но НЕ доходит до fetch-цепи — мёртвый рантайм-ключ (всегда hardcoded 8 МиБ); (в) `graphql_batch_max` — только config-time потолок | (а) новый ключ `file_dating.coalesce_window_s` (0 = откат); (б) plumb ИЛИ удаление ключа из схемы (мёртвый рантайм-ключ недопустим — инвариант 5); (в) оставить как validation-ceiling с комментарием |
 | **F-04** | **BLOCKER (до волны 5)** | `task_queue.py:171-177`; `base.py:455-462`; spec durable-task-queue S13/S20 | Широкий режим: чистый приток ≈+185k строк/ч (search 216k/h против gather-drain 31k/h, early-stop off) ⇒ high-water 30–45M строк ≈ 25–35 ГБ; DELETE не возвращает страницы ФС (нет VACUUM для queue_state); дренаж ~2700 ч ≫ max_age_hours 720 ⇒ каждый рестарт age-purge удаляет миллионы НЕПРОБОВАННЫХ pending-строк. При этом C1-fix(720)+naive-exemption снимают «единственный потолок циркуляции defer» без замены — S13/S20 становятся нормативно ложными; write-amplification циркуляции (INSERT+DELETE+WAL на цикл) не размечен в доке 06 | Defer-aware exemption: колонка `defer_count`/`last_defer_ts` (аддитивная миграция queue v2→v3) + предикат exempt «pending AND attempts=0 AND defer_count=0» + дельта спеки durable-task-queue (S13/S20) + пины; замер write-amplification в гейте волны 5 |
 | **NEW-7** | LOW | `aggregation.py:60,:74-75`; `registry.py:1446-1447`; `task_queue.py:272-293` | Микро-набор: (а) `shadow_jaccard` list неограничен + полная сортировка каждый рендер (~30 с); (б) `dropped += 1` без лока — недосчёт ровно когда C7-монитор важен; (в) legacy `bulk_insert` пишет `dedup_id=''` — невидим обоим слоям дедупа (защищён zero-rows guard; важен для restore-тулинга волны 4) | (а) `deque(maxlen)` или streaming-квантиль; (б) лок/`itertools.count`; (в) документировать в 05 (restore) или считать dedup_id в импортёре |
-| **C10** | NOTE | `manager/queue.py:747-760,:769-807` | Мёртвый класс `GracefulShutdown` со своими signal-хендлерами, никогда не инстанцируется (+ `build_all_snapshots_all` ноль вызовов — выглядит как точка финальной сборки, но ею НЕ является; `get_total_num` мёртв — N-07) | Удалить (или документировать) — косметика; ВАЖНО не принять мёртвую поверхность за живую при реализации волны 1 |
+| **C10** | NOTE | `manager/queue.py:747-760` (GracefulShutdown); `storage/persistence.py:802-814` (build_all_snapshots_all — **локация исправлена по аудиту среза 2.8**, ранее док ошибочно указывал queue.py:769-807); `search/client.py` (get_total_num) | Мёртвый класс `GracefulShutdown` со своими signal-хендлерами, никогда не инстанцируется (+ `build_all_snapshots_all` ноль вызовов — выглядит как точка финальной сборки, но ею НЕ является; `get_total_num` мёртв — N-07) | **УДАЛЕНО 2026-10-22 (`09d65e3`, срез 2.8)** вместе с мёртвыми экспортами; живой `build_all_snapshots` не тронут (пин P7 стережёт различие) |
 
 ## 2.3 Волна 3 — структурные (переносятся в `03_sql_integration.md`)
 
