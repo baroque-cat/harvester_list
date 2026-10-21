@@ -195,6 +195,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             max_requests_per_run=config.file_dating.max_requests_per_run,
             graphql_batch_size=config.file_dating.graphql_batch_size,
             cooling_probe=tokens_cooling_down,
+            coalesce_window_s=config.file_dating.coalesce_window_s,
         )
 
         self.queue_manager = QueueManager(

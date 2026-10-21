@@ -1166,6 +1166,8 @@ and no data rollback is needed. Conditional re-gathering (the `If-None-Match`
 precondition on already-gathered links) can be disabled independently with
 `gather.conditional_refetch: false` — a config flip that restores the
 pre-change byte-for-byte behavior without touching the dating subsystem.
+The opportunistic coalescing window (P21) can be disabled with
+`file_dating.coalesce_window_s: 0` — a config flip, no code change.
 
 See `docs/specs/registry_flags_metrics.md` for the flag/metrics dictionary and
 the enrichment semantics.

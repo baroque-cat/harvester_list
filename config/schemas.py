@@ -408,6 +408,12 @@ class FileDatingConfig:
     bounds how long a cached commit-date is trusted before a re-fetch.
     ``graphql_batch_size`` / ``graphql_batch_max`` bound the GraphQL batching
     (design D3: the ceiling bounds the unmeasured cost of larger batches).
+    ``graphql_batch_max`` is a config-time ceiling only; runtime batches use
+    ``graphql_batch_size``.
+
+    ``coalesce_window_s`` mirrors ``DEFAULT_COALESCE_WINDOW_SECONDS`` in
+    ``storage/file_dating.py``.  Values ≤ 0 disable coalescing entirely — this
+    is the de-facto rollback knob for P21.
     """
 
     enabled: bool = False
@@ -417,6 +423,9 @@ class FileDatingConfig:
     max_requests_per_run: int = 200
     graphql_batch_size: int = 4
     graphql_batch_max: int = 50
+    # Coalesce window for P21 batching; mirrors DEFAULT_COALESCE_WINDOW_SECONDS.
+    # ≤ 0 disables coalescing entirely (rollback knob — no positivity check).
+    coalesce_window_s: float = 0.25
 
     def __post_init__(self):
         # Mirrors ConfigValidator._validate_file_dating_config on purpose: this
@@ -454,6 +463,9 @@ class FileDatingConfig:
             raise ValueError(
                 "file_dating.graphql_batch_size must not exceed file_dating.graphql_batch_max"
             )
+
+        # Coalesce window: float-coerce, no positivity check (≤ 0 disables = rollback).
+        self.coalesce_window_s = float(self.coalesce_window_s)
 
 
 @dataclass

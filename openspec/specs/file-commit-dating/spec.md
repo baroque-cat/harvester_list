@@ -42,6 +42,10 @@ The system SHALL support a one-file-per-request REST form and a batched GraphQL 
 - **WHEN** the configured batch size is not a positive integer within the supported bound
 - **THEN** configuration loading fails loudly with a message naming the field, and no run starts
 
+#### Scenario: Coalescing window can be disabled by configuration
+- **WHEN** `file_dating.coalesce_window_s` is set to 0 or a negative value
+- **THEN** opportunistic coalescing is disabled entirely without a code change (rollback knob, invariant 4)
+
 #### Scenario: Transport switch preserves recorded semantics
 - **WHEN** the same file is dated under each transport in turn
 - **THEN** both produce the same recorded value for the same underlying commit

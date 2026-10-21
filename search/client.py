@@ -1435,6 +1435,32 @@ def _configured_defer_local_suppression() -> bool:
     return bool(configured)
 
 
+# Built-in max-payload cap used when the operator configuration is unreachable.
+# Kept identical to ``GatherConfig.max_payload_bytes``'s default so a config-less
+# caller and a fully configured one agree (design D8).
+_DEFAULT_MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
+
+
+def _configured_max_payload_bytes() -> int:
+    """Resolve the operator-configured gather payload cap (``gather.max_payload_bytes``).
+
+    Mirrors :func:`_configured_gather_transport` / :func:`_configured_defer_local_suppression`
+    exactly: the ``config`` import is deferred and fully guarded so this module
+    keeps no hard top-level dependency on ``config`` (no import cycle), and a
+    caller that never loaded ``config.yaml`` degrades to the built-in default
+    rather than raising ``RuntimeError``.  ``collect()`` passes the resolved
+    value through so an explicit caller and a config-less caller agree and the
+    operator's runtime key cannot be silently bypassed (design D8).
+    """
+    try:
+        from config import get_config
+
+        configured = getattr(get_config().gather, "max_payload_bytes", _DEFAULT_MAX_PAYLOAD_BYTES)
+    except Exception:
+        return _DEFAULT_MAX_PAYLOAD_BYTES
+    return int(configured)
+
+
 # Built-in provider-refusal policy used when the operator configuration is
 # unreachable.  Kept identical to ``ProviderConfig``'s defaults so a config-less
 # caller and a fully configured one agree (design D7).
@@ -3096,6 +3122,7 @@ def collect(
             content = fetch_gather_content(
                 url=url,
                 transport=fetch_transport,
+                max_payload_bytes=_configured_max_payload_bytes(),
                 retries=retries,
                 defer_local_suppression=_configured_defer_local_suppression(),
                 etag=etag,

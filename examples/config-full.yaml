@@ -280,8 +280,15 @@ file_dating:
   max_requests_per_run: 200
   # Aliases per GraphQL POST (transport: graphql only)
   graphql_batch_size: 4
-  # Enforced ceiling for graphql_batch_size; rejected loudly at load time
+  # Enforced ceiling for graphql_batch_size; rejected loudly at load time.
+  # Config-time ceiling only; runtime batches use graphql_batch_size.
   graphql_batch_max: 50
+  # Opportunistic coalescing window in seconds (P21).  Small gather calls wait
+  # up to this long for siblings to share a single GraphQL POST.  Set to 0 (or
+  # negative) to disable coalescing entirely — the de-facto rollback knob,
+  # no code change needed (invariant 4).  Default 0.25 mirrors the storage
+  # constant DEFAULT_COALESCE_WINDOW_SECONDS.
+  coalesce_window_s: 0.25
 
 # Frontier-based API pagination early-stop configuration
 # (add-search-early-stop; API transport only, gated by registry trust)
@@ -453,7 +460,8 @@ gather:
   #        every credential in the service pool)
   transport: "raw"
   # Streaming byte cap for plain-content payloads (> 0). An oversized payload is
-  # truncated, counted, and its retained prefix is still searched.
+  # truncated, counted, and its retained prefix is still searched.  This key is
+  # live: the configured value reaches the fetch chain (fetch_gather_content).
   max_payload_bytes: 8388608
   # Bounded refusal sleep in seconds (> 0). MUST be strictly below
   # queue.visibility_timeout_s when backend is sqlite: the durable queue has no
