@@ -100,7 +100,11 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         )
 
         # R7 D11: cross-provider fetch-sharing ledger (run-scoped RAM; inert when off).
-        self.share_ledger = GatherShareLedger(mode=config.gather.share_fetch)
+        # Slice 2.1 (C2): cap is configurable via gather.share_ledger_max_tracked.
+        self.share_ledger = GatherShareLedger(
+            mode=config.gather.share_fetch,
+            max_tracked=config.gather.share_ledger_max_tracked,
+        )
 
         # Frontier-based API pagination early-stop detector (off by default;
         # API transport only).  "Known" reuses gather-skip semantics and the

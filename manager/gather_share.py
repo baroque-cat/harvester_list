@@ -130,7 +130,18 @@ class GatherShareLedger:
                 if key in self._shadow_seen:
                     self._would_suppress += 1
                 else:
-                    self._shadow_seen.add(key)
+                    # Slice 2.1 (C2b): shadow seen-set bounded by same cap.
+                    if len(self._shadow_seen) >= self._max_tracked:
+                        self._ledger_full += 1
+                        if not self._warned_full:
+                            self._warned_full = True
+                            logger.warning(
+                                "GatherShareLedger: shadow seen-set cap reached (%d); "
+                                "new keys fail open (counted but not tracked)",
+                                self._max_tracked,
+                            )
+                    else:
+                        self._shadow_seen.add(key)
                 return False
 
             # -- on mode --

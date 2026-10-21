@@ -96,6 +96,16 @@ Sharing SHALL never cause work to be lost. A deferral SHALL neither consume nor 
 - **WHEN** the ledger already tracks its maximum number of keys and a new key is claimed
 - **THEN** the claim does not suppress, the caller creates its own task, and the refusal is counted
 
+#### Scenario: Cap is configurable via gather.share_ledger_max_tracked
+
+- **WHEN** the operator sets `gather.share_ledger_max_tracked` to a value different from the default 50 000
+- **THEN** the ledger enforces that value as its tracked-key cap (and in shadow mode, its seen-set cap), and the `ledger_full` counter increments on refusal
+
+#### Scenario: Shadow seen-set is bounded by the same cap
+
+- **WHEN** the ledger runs in shadow mode and the seen-set reaches `share_ledger_max_tracked`
+- **THEN** further unique keys increment `ledger_full` without growing the seen-set, and re-claims of already-seen keys still increment `would_suppress`
+
 ### Requirement: Sharing is observable
 
 Per-run counters SHALL be published as a dedicated metrics surface and rendered only when the mode is not `off`, reporting at least the mode, the number of claims, the number of suppressed tasks, the number of fetches that served more than one provider, the number of extra coverage attributions delivered, the number of abandoned attributions, the number of currently tracked keys and the number of cap refusals.

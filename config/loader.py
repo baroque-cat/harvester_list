@@ -572,6 +572,8 @@ class ConfigLoader:
             conditional_refetch=data.get("conditional_refetch", True),
             # R7 D9: cross-provider fetch-sharing rollout flag.
             share_fetch=data.get("share_fetch", "off"),
+            # Slice 2.1 (C2): configurable cap on tracked keys in the share ledger.
+            share_ledger_max_tracked=data.get("share_ledger_max_tracked", 50_000),
         )
 
     def _parse_credential_liveness_config(self, data: Dict[str, Any]) -> CredentialLivenessConfig:

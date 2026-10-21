@@ -649,6 +649,10 @@ class ConfigValidator:
         if share_mode not in ("off", "shadow", "on"):
             self.errors.append("gather.share_fetch must be one of: off, shadow, on")
 
+        # Slice 2.1 (C2): positive-int cap on tracked keys.
+        if int(gather_config.share_ledger_max_tracked) <= 0:
+            self.errors.append("gather.share_ledger_max_tracked must be positive")
+
         wait_cap = float(gather_config.max_refusal_wait_s)
         if wait_cap <= 0:
             self.errors.append("Gather max_refusal_wait_s must be positive")

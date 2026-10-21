@@ -761,6 +761,11 @@ class GatherConfig:
     conditional_refetch: bool = True
     # R7 D9: cross-provider fetch-sharing rollout flag.
     share_fetch: str = "off"
+    # Slice 2.1 (C2): configurable cap on tracked keys in the share ledger.
+    # Default 50 000 mirrors the pre-change hardcoded constant; raising to
+    # 10⁶ ≈ 0.5 GB at ~500–550 B/entry fits within MemoryMax 6G. Rollback:
+    # return to 50000.
+    share_ledger_max_tracked: int = 50_000
 
     def __post_init__(self):
         # Mirrors ConfigValidator._validate_gather_config on purpose: this
@@ -796,6 +801,11 @@ class GatherConfig:
         if share_mode not in ("off", "shadow", "on"):
             raise ValueError("gather.share_fetch must be one of: off, shadow, on")
         self.share_fetch = share_mode
+
+        # Slice 2.1 (C2): positive-int cap on tracked keys.
+        self.share_ledger_max_tracked = int(self.share_ledger_max_tracked)
+        if self.share_ledger_max_tracked <= 0:
+            raise ValueError("gather.share_ledger_max_tracked must be positive")
 
 
 @dataclass

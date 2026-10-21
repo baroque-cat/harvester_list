@@ -494,6 +494,11 @@ gather:
   #   on     - enforce suppression; late claims after fetch completion fail-open
   # Rollback: "off" restores pre-change behaviour byte-for-byte.
   share_fetch: "off"
+  # Maximum number of distinct fetch keys tracked in the share ledger (and in
+  # shadow mode, the seen-set). Default 50 000 mirrors the pre-change hardcoded
+  # constant. At ~500–550 B/entry, 10⁶ ≈ 0.5 GB fits within MemoryMax 6G.
+  # Rollback: return to 50000.
+  share_ledger_max_tracked: 50000
 
 # LLM-provider refusal classification (fix-provider-failure-classification)
 # A capacity refusal on the provider surface (check/inspect stages) is a typed

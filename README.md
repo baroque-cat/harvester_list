@@ -2063,9 +2063,11 @@ Share: mode=on claims=14800 suppressed=9102 shared=2067 extra=6080 abandoned=0 t
 
 `shared` counts fetches with more than one beneficiary; `extra` is
 Σ(len(taken)−1), the number of additionally written coverage rows. The
-`ledger_full` counter increments when the tracked-key cap (50 000, seatbelt
-only — live set is ~10 K entries ≈ 4 MB) is reached; `claim` returns False on
-cap (fail-open: own task is created).
+`ledger_full` counter increments when the tracked-key cap (configurable via
+`gather.share_ledger_max_tracked`, default 50 000, seatbelt only — live set is
+~10 K entries ≈ 4 MB; at ~500–550 B/entry, 10⁶ ≈ 0.5 GB fits within MemoryMax
+6G) is reached; `claim` returns False on cap (fail-open: own task is created).
+In shadow mode the seen-set is bounded by the same cap.
 
 **Rollback:** set `gather.share_fetch: "off"` — a config flip, no code removal.
 The ledger is never constructed and no `claim()` / `take()` calls are made; the
