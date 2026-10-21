@@ -64,6 +64,11 @@ STATUS_FAILED = "failed"
 
 _SECONDS_PER_HOUR = 3600.0
 
+# Maximum bind parameters per IN-clause SELECT.  Mirrors storage/priority.py
+# (900) and stays well below SQLite's upstream limit (32 766) to accommodate
+# builds with lower limits (prod pyenv 3.11 is unmeasured).
+_BIND_CHUNK_SIZE = 900
+
 
 @dataclass
 class SkipDecision:
@@ -128,6 +133,7 @@ class GatherSkipEngine:
         self.gathered_ts_missing = 0
         self._regathered: Dict[str, int] = {reason: 0 for reason in REGATHER_REASONS}
         self._logged_error_kinds: set = set()
+        self.chunk_warnings = 0
 
     # ------------------------------------------------------------------
     # Capabilities
@@ -284,27 +290,54 @@ class GatherSkipEngine:
         return conn
 
     def _lookup(self, urls: Sequence[str], provider: str, patterns_hash: str):
-        """Batched page lookup: link rows + coverage rows for the current run."""
+        """Batched page lookup: link rows + coverage rows for the current run.
+
+        Chunks the IN-clause to stay below the SQLite bind-variable limit
+        (C3).  The coverage query carries 2 extra bind params (provider,
+        patterns_hash), so the IN-chunk is capped at ``_BIND_CHUNK_SIZE - 2``
+        to keep the total ≤ _BIND_CHUNK_SIZE.  Results from all chunks are
+        merged identically to a single unchunked query.
+        """
         # De-duplicate hashes so a repeated URL does not bloat the IN clause.
         hashes = list(dict.fromkeys(url_hash(url) for url in urls))
         conn = self._connect()
         with self._stat_lock:
             self.registry_reads += 1
 
-        placeholders = ",".join("?" for _ in hashes)
-        link_rows = conn.execute(
-            "SELECT url_hash, visit_status, gathered_ts, repo_pushed_at "
-            f"FROM links WHERE url_hash IN ({placeholders})",
-            hashes,
-        ).fetchall()
-        coverage_rows = conn.execute(
-            "SELECT url_hash FROM link_coverage "
-            f"WHERE provider = ? AND patterns_hash = ? AND url_hash IN ({placeholders})",
-            [provider, patterns_hash, *hashes],
-        ).fetchall()
+        links: Dict[str, tuple] = {}
+        covered: set = set()
 
-        links = {row[0]: (row[1], row[2], row[3]) for row in link_rows}
-        covered = {row[0] for row in coverage_rows}
+        # The coverage query has 2 extra params, so cap the IN-chunk accordingly.
+        in_chunk = _BIND_CHUNK_SIZE - 2
+        num_chunks = (len(hashes) + in_chunk - 1) // in_chunk if hashes else 0
+        if num_chunks > 1:
+            with self._stat_lock:
+                self.chunk_warnings += 1
+                first = self.chunk_warnings == 1
+            if first:
+                logger.warning(
+                    f"[gather-skip] lookup chunked into {num_chunks} queries "
+                    f"({len(hashes)} hashes > {in_chunk}); "
+                    "further occurrences are counted in 'chunk_warnings'."
+                )
+
+        for start in range(0, len(hashes), in_chunk):
+            chunk = hashes[start : start + in_chunk]
+            placeholders = ",".join("?" for _ in chunk)
+            link_rows = conn.execute(
+                "SELECT url_hash, visit_status, gathered_ts, repo_pushed_at "
+                f"FROM links WHERE url_hash IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            coverage_rows = conn.execute(
+                "SELECT url_hash FROM link_coverage "
+                f"WHERE provider = ? AND patterns_hash = ? AND url_hash IN ({placeholders})",
+                [provider, patterns_hash, *chunk],
+            ).fetchall()
+            for row in link_rows:
+                links[row[0]] = (row[1], row[2], row[3])
+            covered.update(row[0] for row in coverage_rows)
+
         return links, covered
 
     def _reset_conn(self) -> None:

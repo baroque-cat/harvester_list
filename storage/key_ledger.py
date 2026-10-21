@@ -59,6 +59,11 @@ REASON_EXPIRED = "expired"
 
 _SECONDS_PER_HOUR = 3600.0
 
+# Maximum bind parameters per IN-clause SELECT.  Mirrors storage/priority.py
+# (900) and stays well below SQLite's upstream limit (32 766) to accommodate
+# builds with lower limits (prod pyenv 3.11 is unmeasured).
+_BIND_CHUNK_SIZE = 900
+
 
 def key_hash(provider: str, key: str, address: str = "", endpoint: str = "") -> str:
     """Deterministic identity hash ``sha256("provider|key|address|endpoint")``.
@@ -159,6 +164,7 @@ class KeyLedger:
         self.read_errors = 0
         self.read_error_warnings = 0
         self._logged_error_kinds: set = set()
+        self.chunk_warnings = 0
 
     # ------------------------------------------------------------------
     # Capabilities
@@ -249,20 +255,43 @@ class KeyLedger:
         return conn
 
     def _lookup(self, digests: Sequence[str]) -> Dict[str, tuple]:
-        """Batched lookup: ``key_hash -> (status, last_recheck_ts)``."""
+        """Batched lookup: ``key_hash -> (status, last_recheck_ts)``.
+
+        Chunks the IN-clause to stay below the SQLite bind-variable limit
+        (C3).  Results from all chunks are merged identically to a single
+        unchunked query.
+        """
         digest_list = list(dict.fromkeys(digests))
         if not digest_list:
             return {}
         conn = self._connect()
         with self._stat_lock:
             self.registry_reads += 1
-        placeholders = ",".join("?" for _ in digest_list)
-        rows = conn.execute(
-            "SELECT key_hash, status, last_recheck_ts FROM keys "
-            f"WHERE key_hash IN ({placeholders})",
-            digest_list,
-        ).fetchall()
-        return {row[0]: (row[1], row[2]) for row in rows}
+
+        num_chunks = (len(digest_list) + _BIND_CHUNK_SIZE - 1) // _BIND_CHUNK_SIZE
+        if num_chunks > 1:
+            with self._stat_lock:
+                self.chunk_warnings += 1
+                first = self.chunk_warnings == 1
+            if first:
+                logger.warning(
+                    f"[key-ledger] lookup chunked into {num_chunks} queries "
+                    f"({len(digest_list)} digests > {_BIND_CHUNK_SIZE}); "
+                    "further occurrences are counted in 'chunk_warnings'."
+                )
+
+        result: Dict[str, tuple] = {}
+        for start in range(0, len(digest_list), _BIND_CHUNK_SIZE):
+            chunk = digest_list[start : start + _BIND_CHUNK_SIZE]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                "SELECT key_hash, status, last_recheck_ts FROM keys "
+                f"WHERE key_hash IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                result[row[0]] = (row[1], row[2])
+        return result
 
     def _reset_conn(self) -> None:
         conn = getattr(self._local, "conn", None)
