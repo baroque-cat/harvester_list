@@ -108,6 +108,7 @@ class RefineGovernor:
         self._truncated_to_cap = 0
         self._parents_refined = 0
         self._parents_at_depth_cap_paginated = 0
+        self._pagination_fallbacks = 0
         self._budget_used = 0
         self._distinct_wire_admitted = 0
         self._coverage: List[float] = []
@@ -151,6 +152,11 @@ class RefineGovernor:
         """Count a task that paginated because it was at the refinement depth cap."""
         with self._lock:
             self._parents_at_depth_cap_paginated += 1
+
+    def record_pagination_fallback(self) -> None:
+        """Count a task that fell back to pagination because refine admission was empty."""
+        with self._lock:
+            self._pagination_fallbacks += 1
 
     # ------------------------------------------------------------------
     # Admission
@@ -368,6 +374,7 @@ class RefineGovernor:
                 "truncated_to_cap": self._truncated_to_cap,
                 "parents_refined": self._parents_refined,
                 "parents_at_depth_cap_paginated": self._parents_at_depth_cap_paginated,
+                "pagination_fallbacks": self._pagination_fallbacks,
                 "budget_remaining": max(0, self.max_search_tasks_per_run - self._budget_used),
                 "distinct_wire_admitted": self._distinct_wire_admitted,
                 "coverage_estimate_min": min(coverage) if coverage else 1.0,

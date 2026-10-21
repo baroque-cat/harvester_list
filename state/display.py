@@ -799,6 +799,7 @@ class StatusDisplayEngine:
             f"swallowed={metric_int(metrics.get('search_swallowed_exceptions'))} "
             f"cov[min={metric_rate(metrics.get('coverage_estimate_min')):.4f}, "
             f"avg={metric_rate(metrics.get('coverage_estimate_avg')):.4f}] "
+            f"fallbacks={metric_int(metrics.get('pagination_fallbacks'))} "
             f"(unfit-denominator)"
         )
 

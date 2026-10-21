@@ -475,32 +475,50 @@ class SearchStage(BasePipelineStage):
                 f"for provider: {task.provider}, query: {task.query}"
             )
 
+            # F1: when refine admitted nothing but there are more pages,
+            # fall back to pagination so the parent's pages 2..N are not lost.
+            if enqueued == 0 and total > per_page:
+                if governor is not None:
+                    governor.record_pagination_fallback()
+                self._paginate_first_page(task, results, total, per_page, output)
+
         # If needs pagination and not refining
         elif total > per_page:
-            max_pages = min(
-                math.ceil(total / per_page),
-                API_MAX_PAGES if task.use_api else WEB_MAX_PAGES,
-            )
+            self._paginate_first_page(task, results, total, per_page, output)
 
-            engine = self._early_stop_engine(task)
-            if engine is not None:
-                # API-only chained pagination: record page 1, then emit only the
-                # next page so every later boundary can be evaluated.
-                stopped = self._observe_page(task, results, page=1, max_pages=max_pages, engine=engine)
-                if not stopped and max_pages >= 2:
-                    output.add_task(self._generate_page_task(task, 2), PipelineStage.SEARCH.value)
-                    logger.info(
-                        f"[{self.name}] early-stop chaining page tasks for provider: {task.provider}, "
-                        f"query: {task.query}, max_pages: {max_pages}"
-                    )
-                return
+    def _paginate_first_page(
+        self, task: SearchTask, results: List[str], total: int, per_page: int,
+        output: "StageOutput",
+    ) -> None:
+        """Generate page tasks for pages 2..N of a first-page result set.
 
-            page_tasks = self._generate_page_tasks(task, total, per_page)
-            for page_task in page_tasks:
-                output.add_task(page_task, PipelineStage.SEARCH.value)
-            logger.info(
-                f"[{self.name}] generated {len(page_tasks)} page tasks for provider: {task.provider}, query: {task.query}"
-            )
+        Shared between the ordinary pagination branch and the F1 fallback
+        (refine admission empty but more pages available).
+        """
+        max_pages = min(
+            math.ceil(total / per_page),
+            API_MAX_PAGES if task.use_api else WEB_MAX_PAGES,
+        )
+
+        engine = self._early_stop_engine(task)
+        if engine is not None:
+            # API-only chained pagination: record page 1, then emit only the
+            # next page so every later boundary can be evaluated.
+            stopped = self._observe_page(task, results, page=1, max_pages=max_pages, engine=engine)
+            if not stopped and max_pages >= 2:
+                output.add_task(self._generate_page_task(task, 2), PipelineStage.SEARCH.value)
+                logger.info(
+                    f"[{self.name}] early-stop chaining page tasks for provider: {task.provider}, "
+                    f"query: {task.query}, max_pages: {max_pages}"
+                )
+            return
+
+        page_tasks = self._generate_page_tasks(task, total, per_page)
+        for page_task in page_tasks:
+            output.add_task(page_task, PipelineStage.SEARCH.value)
+        logger.info(
+            f"[{self.name}] generated {len(page_tasks)} page tasks for provider: {task.provider}, query: {task.query}"
+        )
 
     def _handle_page_results(self, task: SearchTask, results: List[str], output: StageOutput) -> None:
         """Handle a subsequent page when API early-stop chaining is active."""
