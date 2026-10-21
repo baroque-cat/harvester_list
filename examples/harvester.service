@@ -1,0 +1,92 @@
+# harvester.service — ПРОЕКТ для оператора, НЕ устанавливается автоматически.
+#
+# Зачем: инцидент 2026-09-21 завершился OOM-kill на пике 6.9 GB RSS + 7.4 GB swap.
+# R1 (refine_governor) ограничил генерацию работы, R2 (queue.backend: sqlite)
+# перенёс состояние очереди на диск. Этот юнит добавляет третий, бесплатный
+# уровень защиты — cgroup-seatbelt, который превращает «хостовый OOM-killer
+# убивает случайный процесс» в предсказуемое поведение собственного cgroup.
+#
+# Установка (на прод-хосте, от root):
+#   cp examples/harvester.service /etc/systemd/system/harvester.service
+#   # поправить User / WorkingDirectory / ExecStart под реальный хост
+#   systemctl daemon-reload && systemctl enable --now harvester.service
+#
+# ОБЯЗАТЕЛЬНО заменить под свой хост: User, WorkingDirectory, ExecStart,
+# ReadWritePaths. Значения ниже — шаблон, а не факт о вашем деплое.
+
+[Unit]
+Description=Multi-provider API key discovery harvester
+Documentation=file:README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- site-specific -----------------------------------------------------------
+User=harvester
+WorkingDirectory=/opt/harvester
+ExecStart=/usr/bin/python3 /opt/harvester/main.py -c /opt/harvester/config.yaml --log-level INFO
+# ----------------------------------------------------------------------------
+
+# Память: MemoryHigh включает троттлинг и reclaim ДО жёсткого предела, давая
+# адаптивным лимитам и губернатору время отреагировать; MemoryMax — потолок,
+# за которым cgroup убивает только свой процесс, а не весь хост.
+# Порог ≥ 2× рабочего окна: живой замер R2 при 5 083 задачах в очереди —
+# 145–154 MB RSS, т.е. 4G оставляет огромный запас на легитимные пики.
+MemoryHigh=4G
+MemoryMax=6G
+
+# Инцидент ушёл в 7.4 GB swap, что превратило OOM в минутную деградацию всего
+# хоста. Ограничиваем swap, чтобы решение принималось быстро и локально.
+# (0 = запретить swap вовсе; раскомментируйте после проверки на своём хосте.)
+#MemorySwapMax=0
+
+# ВАЖНО, значение из живых замеров волны 1 (2026-10-21, L4/L5): штатный
+# graceful shutdown занимает 30–96 с, НО finish_run включает priority-sweep
+# реестра, линейный по DISTINCT owner/repo (~0.87 мс/repo; замер L5 на раздутых
+# копиях боевой БД: 18k→15 с, 180k→150 с, 898k→782 с). На горизонте программы
+# 10⁶ ссылок (~0.9M repos) sweep ≈ 871 с + overhead ⇒ 1800 с даёт ~2× запас.
+# Для горизонтов >2M repos пересчитать: T ≈ 0.87 мс × repos + 120 с. Прежние
+# 300 с (замеры R2, малый реестр) обрезали бы остановку SIGKILL посреди sweep.
+KillSignal=SIGTERM
+TimeoutStopSec=1800
+
+# Синергия с queue.backend: sqlite — после OOM/SIGKILL перезапуск НЕ начинает
+# с нуля: сиротские claims возвращаются в pending, и работа продолжается с
+# сохранённых позиций (живой гейт: 13 сирот = 13 reclaimed, ноль потерь).
+# Под memory автоперезапуск терял бы всю очередь, поэтому там он был опасен.
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+# Умеренное укрепление. ProtectSystem=strict делает ФС read-only, поэтому
+# workspace и логи явно разрешены на запись. Ослабьте, если вашему деплою
+# нужно больше (например, каталог виртуального окружения или кэш провайдера).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/harvester/data /opt/harvester/logs
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+# Секреты: ключи лежат в config.yaml (git-ignored) и попадают в payload задач.
+# Не логируйте окружение и не включайте сюда .secrets.
+#
+# ПОПРАВКА (аудит 2026-10-21, C9 ОПРОВЕРГНУТ — см. 02_critical_fixes.md §2.6):
+# прежнее предупреждение «консольный обработчик не маскирует ключи» нормативно
+# ложно на текущем коде. Все пять Formatter-подклассов tools/logger.py
+# (включая ColoredFormatter, :106→:138) fail-closed вызывают _redact_line
+# внутри format(); файл provider/client.py не существует. Живое подтверждение
+# (гейт волны 1, рукав L1): строки ERROR с бизнес-ответами провайдеров в
+# консольном захвате содержат только маскированные ключи вида ****QBF0.
+# StandardOutput=journal безопасен: в journald попадает маскированный вывод.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=harvester
+
+[Install]
+WantedBy=multi-user.target
