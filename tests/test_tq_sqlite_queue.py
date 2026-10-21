@@ -218,13 +218,20 @@ def test_s12_all_four_task_types_round_trip_through_the_durable_store(tmp_path):
 # durable-task-queue-S13
 # ---------------------------------------------------------------------------
 def test_s13_aged_out_rows_are_purged_loudly_at_startup(tmp_path, caplog):
+    """S13 aged-out rows are purged loudly at startup.
+
+    F-04 adaptation: the stale row is inserted with ``attempts=1`` so it is
+    a *circulating* row (not untouched backlog).  Untouched pending rows
+    (``attempts=0, defer_count=0``) are now exempt from the age gate; the
+    natural ceiling of S13/S20 is preserved for circulating tasks.
+    """
     import logging
 
     path = str(tmp_path / "aged_queue.sqlite")
     q1 = SqliteTaskQueue(path, serializer=json.dumps,
                          deserializer=json.loads, name="aged")
     stale = time.time() - 25 * 3600
-    q1.put({"age": "stale"}, created_at=stale)
+    q1.put({"age": "stale"}, created_at=stale, attempts=1)
     q1.put({"age": "fresh"})
     q1.close()
 

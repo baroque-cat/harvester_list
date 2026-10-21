@@ -469,9 +469,12 @@ class BasePipelineStage(ABC, WorkerManageable):
         task_id = self._generate_id(task)
         try:
             if self._durable_queue:
-                self.queue.put(
+                # F-04: use put_defer so defer_count is incremented in the
+                # durable row, letting the age-purge predicate distinguish
+                # untouched backlog (exempt) from defer-circulating tasks
+                # (still subject to the natural ceiling — S13/S20).
+                self.queue.put_defer(
                     task,
-                    timeout=1.0,
                     dedup_id=task_id,
                     created_at=getattr(task, "created_at", None),
                     attempts=getattr(task, "attempts", 0),

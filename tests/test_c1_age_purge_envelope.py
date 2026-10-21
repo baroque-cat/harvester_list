@@ -67,22 +67,29 @@ def test_c1_pin1_row_within_720h_survives_reopen(tmp_path):
 
 def test_c1_pin2_row_beyond_720h_is_purged(tmp_path):
     """C1 pin 2: a pending row aged ~721h is purged when the queue reopens
-    with max_age_hours=720 (outside the 30-day gate)."""
+    with max_age_hours=720 (outside the 30-day gate).
+
+    F-04 adaptation: the row is inserted with attempts=1 so it is a
+    *circulating* row (not an untouched backlog entry).  Untouched pending
+    rows (attempts=0, defer_count=0) are now exempt from the age gate — the
+    natural ceiling of S13/S20 is preserved for retry/defer-circulating
+    tasks.  This pin verifies that discrimination.
+    """
     path = tmp_path / "c1_purge.sqlite"
 
-    # Phase 1: insert rows — one beyond the gate, one within
+    # Phase 1: insert rows — one beyond the gate (circulating), one within
     q1 = _q(path, max_age_hours=720.0)
     beyond_boundary = time.time() - 721 * HOUR
-    q1.put({"label": "beyond_boundary"}, created_at=beyond_boundary)
+    q1.put({"label": "beyond_boundary"}, created_at=beyond_boundary, attempts=1)
     q1.put({"label": "fresh"})
     assert q1.qsize() == 2
     q1.close()
 
-    # Phase 2: reopen — the 721h row must be purged
+    # Phase 2: reopen — the 721h circulating row must be purged
     q2 = _q(path, max_age_hours=720.0)
     try:
         assert q2.qsize() == 1, (
-            "row at 721h must be purged with max_age_hours=720"
+            "circulating row (attempts=1) at 721h must be purged with max_age_hours=720"
         )
         remaining = q2.get(timeout=1.0)
         assert remaining == {"label": "fresh"}

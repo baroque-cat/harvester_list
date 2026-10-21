@@ -47,7 +47,7 @@ from tools.logger import get_logger
 logger = get_logger("storage")
 
 # Bump only with an additive migration (mirrors storage/registry.py).
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Suppression is logged on the first occurrence and then every N-th (house
 # pattern: loud once, counted always).  One line per suppression would bury the
@@ -65,7 +65,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     state         TEXT NOT NULL DEFAULT 'pending'
                   CHECK (state IN ('pending', 'claimed')),
     claimed_until REAL,
-    created_at    REAL NOT NULL
+    created_at    REAL NOT NULL,
+    defer_count   INTEGER NOT NULL DEFAULT 0,
+    last_defer_ts REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_state_seq ON tasks(state, seq);
@@ -149,8 +151,39 @@ class SqliteTaskQueue:
     # Construction / maintenance
     # ------------------------------------------------------------------
     def _bootstrap(self) -> None:
-        """Create tables/indexes if missing and record the schema version."""
+        """Create tables/indexes if missing and record the schema version.
+
+        Additive migration v2→v3 (F-04): adds ``defer_count`` and
+        ``last_defer_ts`` columns so the age-purge predicate can exempt
+        untouched pending rows while preserving the natural ceiling for
+        defer-circulating tasks (S13/S20).  Rollback = revert code; the
+        columns are inert for any reader that uses explicit column names
+        (no ``SELECT *`` positional reads exist in the codebase).
+        """
+        # Read the existing version BEFORE executescript (which issues an
+        # implicit COMMIT) so we know whether to run the migration.
+        existing_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+
         self._conn.executescript(_DDL)
+
+        # Additive migration v2→v3 (F-04, variant A).
+        if existing_version < 3:
+            # ALTER TABLE ADD COLUMN is a no-op error if the column already
+            # exists (e.g. a v3 DB opened by code that was downgraded and
+            # re-upgraded).  Catch and continue.
+            try:
+                self._conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN defer_count INTEGER NOT NULL DEFAULT 0"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already present
+            try:
+                self._conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN last_defer_ts REAL"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already present
+
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
 
@@ -169,7 +202,16 @@ class SqliteTaskQueue:
                 logger.info(f"[{self.name}] reclaimed {reclaimed} orphaned claimed task(s) at startup")
 
             cutoff = time.time() - self.max_age_hours * 3600.0
-            purged = self._conn.execute("DELETE FROM tasks WHERE created_at < ?", (cutoff,)).rowcount
+            # F-04 defer-aware exemption: untouched pending rows (never
+            # attempted, never deferred) survive the age gate — they are
+            # pure backlog from a coverage wave that outpaced drain.
+            # Circulating rows (attempts>0 or defer_count>0) still hit the
+            # natural ceiling (S13/S20 preserved).
+            purged = self._conn.execute(
+                "DELETE FROM tasks WHERE created_at < ?"
+                "  AND NOT (state='pending' AND attempts=0 AND defer_count=0)",
+                (cutoff,),
+            ).rowcount
             self._conn.commit()
             if purged:
                 logger.warning(
@@ -268,6 +310,49 @@ class SqliteTaskQueue:
     def put_nowait(self, obj: Any, **kwargs: Any) -> bool:
         """Non-blocking ``put`` (identical semantics: commit before success)."""
         return self.put(obj, timeout=0, **kwargs)
+
+    def put_defer(
+        self,
+        obj: Any,
+        *,
+        dedup_id: str = "",
+        created_at: Optional[float] = None,
+        attempts: int = 0,
+    ) -> bool:
+        """Re-insert a deferred task with ``defer_count`` incremented.
+
+        F-04 variant A: a deferral preserves ``attempts`` and ``created_at``
+        (the age-gate anchor) but increments ``defer_count`` so the age-purge
+        predicate can distinguish *untouched* pending rows (``defer_count=0``,
+        exempt from purge) from *defer-circulating* rows (``defer_count>0``,
+        still subject to the natural ceiling — S13/S20).
+
+        The previous row's ``defer_count`` is looked up by ``dedup_id`` while
+        the caller still holds the claim (state='claimed'), so the lookup is
+        race-free against the dedup-reconcile (which only collapses pending
+        rows).  Returns True on committed INSERT.
+        """
+        payload = self.serializer(obj)
+        created = float(created_at) if created_at is not None else time.time()
+        with self._cond:
+            prev = self._conn.execute(
+                "SELECT defer_count FROM tasks WHERE dedup_id=? ORDER BY seq DESC LIMIT 1",
+                (dedup_id,),
+            ).fetchone()
+            new_defer_count = (prev[0] + 1) if prev else 1
+
+            cur = self._conn.execute(
+                "INSERT INTO tasks "
+                "(dedup_id, payload_json, attempts, state, claimed_until, created_at, "
+                " defer_count, last_defer_ts) "
+                "VALUES (?, ?, ?, 'pending', NULL, ?, ?, ?)",
+                (dedup_id, payload, int(attempts), created,
+                 new_defer_count, time.time()),
+            )
+            self._conn.commit()
+            self._remember(cur.lastrowid, obj)
+            self._cond.notify_all()
+        return True
 
     def bulk_insert(self, objs: Any) -> int:
         """Insert many tasks in a single transaction (legacy-importer feed).

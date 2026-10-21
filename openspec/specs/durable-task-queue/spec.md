@@ -72,7 +72,7 @@ On store open, rows left in the claimed state (crash orphans) SHALL return to pe
 
 #### Scenario: S13 aged-out rows are purged loudly at startup
 - **WHEN** the store contains a row whose creation time is older than `max_age_hours` and startup maintenance runs
-- **THEN** the row is deleted, a log message states the number of aged-out tasks, and newer rows are untouched
+- **THEN** circulating rows (attempts > 0 or defer_count > 0) are deleted, untouched pending rows (attempts = 0 and defer_count = 0) survive the age gate, a log message states the number of aged-out tasks, and newer rows are untouched
 
 ### Requirement: Non-destructive pending snapshot
 
@@ -125,3 +125,7 @@ If the durable store cannot be opened or bootstrapped at stage construction, the
 #### Scenario: S22 worker retry flow is identical on both backends
 - **WHEN** a task that always fails transiently is processed by a started stage in strict failure-handling mode on each backend
 - **THEN** the task is requeued with incremented attempts up to the bound, the requeue counter tracks each successful requeue, and at the cap the task is discarded with the pinned drop counter and warning wording on both backends
+
+#### Scenario: S23 defer-circulating tasks hit the natural ceiling
+- **WHEN** a task is deferred repeatedly (defer_count increments) and its creation time exceeds `max_age_hours`
+- **THEN** the task is purged at startup (defer-circulating tasks are not exempt from the age gate), preserving the natural ceiling that prevents infinite circulation of rate-limited tasks

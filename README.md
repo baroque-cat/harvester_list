@@ -1729,7 +1729,13 @@ dropped by a runtime storage write error is always logged and counted in
 **Operations.** `max_age_hours` purges rows older than the gate at startup with a
 loud WARNING stating the count; the gate was raised from 24 to 720 hours (30 days,
 C1) so that restarts no longer wipe the deferred backlog accumulated during a
-wave.  `visibility_timeout_s` bounds how long a stuck
+wave.  **Defer-aware exemption (F-04, schema v3):** the purge predicate exempts
+untouched pending rows (`attempts=0` and `defer_count=0`) — pure backlog from a
+coverage wave that outpaced drain — while preserving the natural ceiling for
+circulating tasks (retry or defer-circulating: `attempts>0` or `defer_count>0`).
+Schema migration v2→v3 adds `defer_count` and `last_defer_ts` columns (additive,
+rollback = revert code; no positional `SELECT *` reads in the codebase).
+`visibility_timeout_s` bounds how long a stuck
 worker's claim stays invisible. On a first `sqlite` start any legacy
 `{stage}_queue.json` snapshot is imported **once** (both envelope formats, within
 the age gate) into the store and renamed `*.imported-<ts>`; an aged snapshot is

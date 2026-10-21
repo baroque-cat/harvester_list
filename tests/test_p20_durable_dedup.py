@@ -306,6 +306,13 @@ def test_e9_reconcile_after_reclaim(tmp_path):
 # E10 — aged-out duplicate: purge removes old, survivor remains
 # ---------------------------------------------------------------------------
 def test_e10_aged_out_duplicate(tmp_path):
+    """E10 aged-out duplicate: purge removes old, survivor remains.
+
+    F-04 adaptation: the old row is inserted with ``attempts=1`` so it is a
+    *circulating* row (not untouched backlog).  Untouched pending rows
+    (``attempts=0, defer_count=0``) are now exempt from the age gate; the
+    natural ceiling of S13/S20 is preserved for circulating tasks.
+    """
     path = str(tmp_path / "aged_queue.sqlite")
     old_time = time.time() - (25 * 3600)  # 25 hours ago
 
@@ -322,7 +329,7 @@ def test_e10_aged_out_duplicate(tmp_path):
     with q1._cond:
         q1._conn.execute(
             "INSERT INTO tasks (dedup_id, payload_json, attempts, state, claimed_until, created_at) "
-            "VALUES (?, ?, 0, 'pending', NULL, ?)",
+            "VALUES (?, ?, 1, 'pending', NULL, ?)",
             ("gather:x:a", json.dumps({"url": "old"}), old_time),
         )
         q1._conn.execute(
@@ -351,16 +358,16 @@ def test_e10_aged_out_duplicate(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E11 — SCHEMA_VERSION == 2, partial index exists, counts() shape preserved
+# E11 — SCHEMA_VERSION == 3, partial index exists, counts() shape preserved
 # ---------------------------------------------------------------------------
 def test_e11_schema_version_and_index(tmp_path):
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
 
     q = _q(tmp_path)
     try:
-        # user_version must be 2
+        # user_version must be 3
         uv = q._conn.execute("PRAGMA user_version").fetchone()[0]
-        assert uv == 2
+        assert uv == 3
 
         # Partial index must exist
         indexes = {
