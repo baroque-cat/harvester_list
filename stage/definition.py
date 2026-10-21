@@ -99,6 +99,11 @@ class SearchStage(BasePipelineStage):
 
     def __init__(self, resources: StageResources, handler: OutputHandler, **kwargs):
         super().__init__(PipelineStage.SEARCH.value, resources, handler, **kwargs)
+        # NEW-2: exceptions the inner catch-all rewraps into TransientFetchError
+        # (refine-engine failures, unexpected worker errors).  Counted always,
+        # regardless of failure_handling mode, so the operator can see silent
+        # losses even in legacy/shadow where the task completes as None.
+        self.search_swallowed_exceptions = 0
 
     def _generate_id(self, task: ProviderTask) -> str:
         """Generate unique task identifier for deduplication"""
@@ -255,8 +260,17 @@ class SearchStage(BasePipelineStage):
             raise
 
         except Exception as e:
+            # NEW-2: count every unexpected exception and rewrap as a typed
+            # transient so the failure_handling policy applies (strict requeue,
+            # shadow detect-path, legacy pre-change).  Returning None here made
+            # the worker framework count the task as completed, silently losing
+            # refine subtrees and search results with no observability.
+            with self.stats_lock:
+                self.search_swallowed_exceptions += 1
             logger.error(f"[{self.name}] error, provider: {task.provider}, task: {task}, message: {e}")
-            return None
+            raise TransientFetchError(
+                f"search worker unexpected error: {e}"
+            ) from e
 
     def _record_discovered(self, task: SearchTask, links: List[str]) -> None:
         """Write-only hook: record discovered links in the registry."""

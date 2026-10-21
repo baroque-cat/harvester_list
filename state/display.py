@@ -796,6 +796,7 @@ class StatusDisplayEngine:
             f"wire={metric_int(metrics.get('refused_wire_collapse'))}] "
             f"trunc={metric_int(metrics.get('truncated_to_cap'))} "
             f"uniq_wires={metric_int(metrics.get('distinct_wire_admitted'))} "
+            f"swallowed={metric_int(metrics.get('search_swallowed_exceptions'))} "
             f"cov[min={metric_rate(metrics.get('coverage_estimate_min')):.4f}, "
             f"avg={metric_rate(metrics.get('coverage_estimate_avg')):.4f}] "
             f"(unfit-denominator)"

@@ -296,7 +296,15 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         governor = getattr(self, "refine_governor", None)
         if governor is None:
             return {}
-        return governor.metrics
+        metrics = dict(governor.metrics)
+        # NEW-2: merge the search-stage swallowed-exception counter into the
+        # refine surface so the operator sees it on the Refine render line.
+        search_stage = self.stages.get("search") if hasattr(self, "stages") else None
+        if search_stage is not None:
+            metrics["search_swallowed_exceptions"] = getattr(
+                search_stage, "search_swallowed_exceptions", 0
+            )
+        return metrics
 
     def _aggregate_stages(self) -> List[str]:
         """Aggregate stage requirements from all enabled tasks"""
