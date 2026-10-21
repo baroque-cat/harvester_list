@@ -65,7 +65,7 @@
 |---|---|---|---|---|
 | 0 | чек-лист 0.1–0.12 (добавлены: аудит отравленных строк, snapshot-starter soak, WAL mtime-gap, finish_run sweep, дифф конфига) | ИСПОЛНЕНА ЛОКАЛЬНО 2026-10-21 (L1–L10; остаток операторский: 0.4/0.5/0.6 + OPEN-1/2/3) | L1–L10 PASS локально (evidence: `/var/tmp/opencode-wave1live_20261021_210223/evidence/`) | OPEN-4 (кто выполняет на проде) → РЕШЁН исполнением локально |
 | 1 | срезы 1.1–1.6: NEW-2, F1, C3, snapshots(flag+starter-fix), NEW-1, C1-config+юнит | ГОТОВА 2026-10-21 (коммиты `6406fdd`…`87da8db`, suite 730→**768**, `search/github/refine/` не тронут) | 1.G PASS локально (L1–L10; S4 CORRECTED — `created=` не рендерится локально, замена DB-сверкой) | нет |
-| 2 | срезы 2.1–2.8: C2/C2b, C6, NEW-4, **F-04 exemption**, C8×2, F4, W1–W5+E1, NEW-7 микро | не начата | — | OPEN-11 (блокер для среза 2.4 F-04) |
+| 2 | срезы 2.1–2.8: C2/C2b, C6, NEW-4, **F-04 exemption**, C8×2, F4, W1–W5+E1, NEW-7 микро | В РАБОТЕ: 2.1 ГОТОВА 2026-10-21 (`5cef359`, suite 768→776) | — | нет (OPEN-11 РЕШЁН вариантом A 2026-10-21 — срез 2.4 разблокирован) |
 | 3a | срезы 3a.1–3a.4: wire_coverage(watermark), probe-kwarg губернатора, SQL-recovery(tri-mode), check-recovery carve-out | не начата | — | OPEN-5 (fallback-семантика); текстовые правки F-01/F-02/F-05/F-14 внесены в доки 2026-10-21 |
 | 3b | срезы 3b.1–3b.2: ledger(first-claimant, beneficiaries=все с общим patterns_hash, abandon-in-finally) + ротация порядка корней | не начата | — | OPEN-6 (порядок срезов), OPEN-13 (множество бенефициаров) |
 | 3c | фоновый батчинг дат + промоушен file_dating | не начата | — | нет |
