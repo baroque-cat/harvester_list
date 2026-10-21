@@ -41,11 +41,11 @@ The partition count passed to the query generator SHALL be clamped to `max_parti
 - **THEN** the truncation counter equals the number of post-guard candidates beyond the cap, the collapse counter equals the number withheld by the guard, and no candidate is counted in both
 
 ### Requirement: Per-run search-task budget with loud deterministic admission
-A per-process-run budget SHALL limit the number of admitted refined children (`max_search_tasks_per_run`). Root tasks from configured conditions and pagination tasks SHALL be exempt. Within each refine batch, children SHALL be admitted in deterministic sorted order until the budget is exhausted; every refused child SHALL produce a warning identifying provider, parent query and refusal reason, and SHALL increment the budget-refusal counter. No refusal SHALL be silent. The budget SHALL reset with each new process run.
+A per-process-run budget SHALL limit the number of admitted refined children (`max_search_tasks_per_run`). Root tasks from configured conditions and pagination tasks SHALL be exempt. Within each refine batch, children SHALL be admitted in deterministic sorted order until the budget is exhausted; every refused child SHALL increment the budget-refusal counter, and all refusals for a single parent SHALL be represented in exactly ONE aggregated warning line per parent (stable token `budget_refusal:`, fields: provider, parent query, refused count, first/last refused child in sorted order, reason). Per-child warning lines are FORBIDDEN (volume scales with clamp: 46 656 children = 46 k lines per starving root; measured incident 56 048 lines). No refusal SHALL be silent in the sense that every refusal is counted and represented in the aggregated line. The budget SHALL reset with each new process run.
 
 #### Scenario: Budget exhaustion refuses loudly and deterministically
 - **WHEN** admitting a batch of children would exceed the remaining budget
-- **THEN** the highest-sorted children beyond the remaining budget are refused, each refusal logs a warning (provider, parent query, reason) and increments the refusal counter, and the admitted set is identical for identical inputs
+- **THEN** the highest-sorted children beyond the remaining budget are refused, each refusal increments the refusal counter, exactly one aggregated warning line is emitted per parent batch (naming provider, parent query, refused count, first and last refused child in sorted order, and reason), and the admitted set is identical for identical inputs
 
 #### Scenario: Roots and page tasks never consume the budget
 - **WHEN** initial condition tasks and pagination tasks are created

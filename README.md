@@ -1574,7 +1574,10 @@ refine_governor:
   fingerprint order drops a scattered few that differ per parent.
 - *Volume:* refined children are admitted in that same fingerprint order until
   `max_search_tasks_per_run` is exhausted; the remainder is refused with a
-  per-child WARNING naming provider, parent query and reason (`budget`). Root
+  single aggregated WARNING per parent (stable token `budget_refusal:`, naming
+  provider, parent query, refused count, first/last refused child and reason
+  `budget`). Per-child WARNING lines are forbidden (at clamp 46 656 one
+  starving root would produce 46 k lines; measured incident 56 048). Root
   tasks (configured conditions) and page tasks are **exempt** — the configured
   conditions always run. The budget resets each process run.
 - *Wire collapse:* children the transport cannot distinguish from work already

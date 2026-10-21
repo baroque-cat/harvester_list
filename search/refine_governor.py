@@ -349,12 +349,23 @@ class RefineGovernor:
         )
 
     def _log_budget_refusals(self, provider: str, parent_query: str, refused: List[str]) -> None:
-        for query in refused:
-            logger.warning(
-                f"[refine_governor] budget refusal: provider={provider} "
-                f"query={parent_query} child={query} reason=budget "
-                f"(max_search_tasks_per_run {self.max_search_tasks_per_run})"
-            )
+        """One aggregated WARNING per parent that had budget refusals (fix F4).
+
+        Never one line per refused child: the per-child pattern produced
+        56 048 of 70 059 WARNING lines in the measured arm.  At clamp 46 656
+        a single starving root yields 46 k lines.  The stable token
+        ``budget_refusal:`` identifies the line.  ``refused`` arrives in
+        deterministic sorted (fingerprint) order from the caller, so the
+        first/last children are admitted-deterministic.
+        """
+        if not refused:
+            return
+        logger.warning(
+            f"[refine_governor] budget_refusal: provider={provider} "
+            f"query={parent_query} refused={len(refused)} "
+            f"first={refused[0]} last={refused[-1]} reason=budget "
+            f"(max_search_tasks_per_run {self.max_search_tasks_per_run})"
+        )
 
     # ------------------------------------------------------------------
     # Metrics
