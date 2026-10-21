@@ -19,6 +19,23 @@
 
 **Гейт волны 1:** suite RED→GREEN; живой гейт = 300 с fresh + restart-drill 2×120 с (протокол liveval); идентичность v3 БЕЗ изменений (новые счётчики аддитивны); компараторы канонические (`Refine gen=21312 adm=144 refused[wire=21168] uniq_wires=144`). Подробно — `07_verification.md`.
 
+**Статус срезов волны 1 (ИСПОЛНЕНО 2026-10-21, коммиты локальные, не пушены; origin/main=c5468eb, local впереди на 11):**
+
+| Срез | Коммит | Суть |
+|---|---|---|
+| 1.1 NEW-2 | `6406fdd` | Счётчик `search_swallowed_exceptions` + реврап typed transient |
+| 1.2 F1 | `652a06e` | `_paginate_first_page` + `pagination_fallbacks` + токен `fallbacks=` |
+| 1.3 C3 | `a6aafb0` | Чанкинг IN ≤900/898 в `gather_skip`+`key_ledger`, loud-once WARNING |
+| 1.4 C5 | `7c7e684` | Snapshot lifecycle: 4 ключа persistence, `snapshots_enabled=False` дефолт, starter-ordering фикс, пины C1–C10 |
+| 1.5 NEW-1 | `bfafb9c` | Shadow_swallowed гейт + validator WARNING coupling + дельта спеки failure-handling |
+| 1.6a C1 | `c8193e0` | `max_age_hours` 24→720 config-only |
+| L3-F1 | `f55e7d5` | Wiring `snapshot_keep_last_n` в прод-пути сборок, пины C11/C12 |
+| 1.6b TimeoutStopSec | `87da8db` | `examples/harvester.service` — `TimeoutStopSec=1800` по замеру L5 |
+
+**Suite:** 730 → 734 → 739 → 744 → 758 → 764 → 766 → **768 passed**. Существующие пины не правились (§7.9 выдержан). `search/github/refine/` не тронут.
+
+**TimeoutStopSec (RISK) — ЗАКРЫТА 2026-10-21:** замер L5 показал линейный закон ~0.87 ms/DISTINCT-repo (18k→15.5s, 180k→150s, 898k→782s); экстраполяция 1M repos→871s ⇒ `TimeoutStopSec=1800` подтверждён (~2× запас); закоммичен `87da8db` (examples/harvester.service).
+
 ## 2.2 Волна 2 — plumbing и наблюдаемость (подготовка к масштабу 10⁶)
 
 | ID | Sev | Где | Суть | Фикс |
@@ -30,6 +47,15 @@
 | **F4** | RISK | `search/refine_governor.py:345-351` | Спека ТРЕБУЕТ per-child WARNING на budget-отказ ⇒ при клампе 46656 один голодающий корень = 46k строк (реинцидент 56 048 строк) | Агрегированная строка на родителя (образец wire-collapse D7) + правка спеки (§1.4 доков) |
 | **W1–W5** | NOTE | `config/validator.py` | Нет предупреждений о рассогласовании ручек | W1 `budget < providers × clamp`; W2 ledger cap < proxy бэклога; W3 age-gate < горизонта; W4 clamp > 46656 (конверт генератора); **W5 (новое 2026-10-21): расхождение `patterns_hash` между включёнными провайдерами — молча обнуляет share-подавление (share×patterns-divergence, структурное сужение цели 2)** — все WARNING-класс (advisory, дом-стиль) |
 | **E1** | NOTE | `config/loader.py:316-332`, validator | Секция `persistence` НЕ валидируется вовсе; `snapshot_interval` мёртв | `_validate_persistence_config` (позитивы) + parse новых ключей цели 3 (`04_snapshot_lifecycle.md`) |
+
+**E1 — ЗАКРЫТО ДОСРОЧНО срезом 1.4 (`7c7e684`):** `_validate_persistence_config` + parse 4 ключей + WARNING неизвестных ключей реализованы.
+
+**NOTE (новое 2026-10-21, живая фаза волны 1):**
+
+| ID | Sev | Где | Суть | Фикс-кандидат |
+|---|---|---|---|---|
+| **OBS-1** | NOTE | `stage/base.py` graceful-stop; config `persistence.shutdown_timeout=30` vs `api.timeout=30` | При стопе «[check] 2 workers did not stop gracefully, duplicate suppressions: 134» — in-flight deepseek HTTP (api.timeout=30) переживает shutdown_timeout=30; discarded=0 (потерь нет). Кандидат: согласовать shutdown_timeout с api.timeout+retries или bounded wait | Волна 2+: согласование таймаутов или bounded wait для in-flight HTTP |
+| **OBS-2** | NOTE | `storage/strategies.py` `_apply_rotation`; `.build_meta.json` | `.build_meta.json["generations"]` список не прорежается ротацией (~150B/запись, байтово незначимо при keep_last_n=3) | Косметика волны 2 (или оставить) |
 | **NEW-4** | MEDIUM | `file_dating.py:46-48,:79`; `pipeline.py:180-190`; `loader.py:549`; `client.py:3096-3104,:1841` | Plumbing-дефекты класса `resource_provider`: (а) `FileDater.coalesce_window_s` — самоописанный «de-facto rollback knob» P21 — НЕ имеет конфигурационного ключа и не передаётся ⇒ откат требует правки кода (нарушение инварианта 4); (б) `gather.max_payload_bytes` парсится+валидируется, но НЕ доходит до fetch-цепи — мёртвый рантайм-ключ (всегда hardcoded 8 МиБ); (в) `graphql_batch_max` — только config-time потолок | (а) новый ключ `file_dating.coalesce_window_s` (0 = откат); (б) plumb ИЛИ удаление ключа из схемы (мёртвый рантайм-ключ недопустим — инвариант 5); (в) оставить как validation-ceiling с комментарием |
 | **F-04** | **BLOCKER (до волны 5)** | `task_queue.py:171-177`; `base.py:455-462`; spec durable-task-queue S13/S20 | Широкий режим: чистый приток ≈+185k строк/ч (search 216k/h против gather-drain 31k/h, early-stop off) ⇒ high-water 30–45M строк ≈ 25–35 ГБ; DELETE не возвращает страницы ФС (нет VACUUM для queue_state); дренаж ~2700 ч ≫ max_age_hours 720 ⇒ каждый рестарт age-purge удаляет миллионы НЕПРОБОВАННЫХ pending-строк. При этом C1-fix(720)+naive-exemption снимают «единственный потолок циркуляции defer» без замены — S13/S20 становятся нормативно ложными; write-amplification циркуляции (INSERT+DELETE+WAL на цикл) не размечен в доке 06 | Defer-aware exemption: колонка `defer_count`/`last_defer_ts` (аддитивная миграция queue v2→v3) + предикат exempt «pending AND attempts=0 AND defer_count=0» + дельта спеки durable-task-queue (S13/S20) + пины; замер write-amplification в гейте волны 5 |
 | **NEW-7** | LOW | `aggregation.py:60,:74-75`; `registry.py:1446-1447`; `task_queue.py:272-293` | Микро-набор: (а) `shadow_jaccard` list неограничен + полная сортировка каждый рендер (~30 с); (б) `dropped += 1` без лока — недосчёт ровно когда C7-монитор важен; (в) legacy `bulk_insert` пишет `dedup_id=''` — невидим обоим слоям дедупа (защищён zero-rows guard; важен для restore-тулинга волны 4) | (а) `deque(maxlen)` или streaming-квантиль; (б) лок/`itertools.count`; (в) документировать в 05 (restore) или считать dedup_id в импортёре |
