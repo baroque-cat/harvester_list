@@ -97,6 +97,8 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             mode=config.skip.skip_known,
             ttl_hours=config.skip.gather_ttl_hours,
             registry_path=self.link_registry.path,
+            decision_log_max_bytes=config.registry.decision_log_max_bytes,
+            decision_log_keep_rotated=config.registry.decision_log_keep_rotated,
         )
 
         # R7 D11: cross-provider fetch-sharing ledger (run-scoped RAM; inert when off).
@@ -122,6 +124,8 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             # Share the gather-skip engine so its registry read errors (the
             # spec kill-switch) also mute early-stop for the run.
             skip_engine=self.gather_skip,
+            decision_log_max_bytes=config.registry.decision_log_max_bytes,
+            decision_log_keep_rotated=config.registry.decision_log_keep_rotated,
         )
 
         # Date-extraction fill-rate observability (per run, fail-open).
@@ -249,6 +253,8 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
                     max_bytes=agg_cfg.max_bytes,
                     join_timeout_s=agg_cfg.join_timeout_s,
                     workspace=config.global_config.workspace,
+                    decision_log_max_bytes=config.registry.decision_log_max_bytes,
+                    decision_log_keep_rotated=config.registry.decision_log_keep_rotated,
                 )
             )
             logger.info(

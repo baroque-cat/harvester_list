@@ -334,6 +334,8 @@ class RegistryConfig:
     batch_size: int = 50
     flush_interval: int = 5
     queue_size: int = 100000
+    decision_log_max_bytes: int = 67_108_864  # 64 MiB (C8/F-20, slice 2.5)
+    decision_log_keep_rotated: int = 2  # keep .1 and .2 (C8/F-20, slice 2.5)
 
     def __post_init__(self):
         # Mirrors ConfigValidator._validate_registry_config on purpose: this
@@ -349,6 +351,10 @@ class RegistryConfig:
             raise ValueError("registry.flush_interval must be positive")
         if self.queue_size <= 0:
             raise ValueError("registry.queue_size must be positive")
+        if self.decision_log_max_bytes <= 0:
+            raise ValueError("registry.decision_log_max_bytes must be positive")
+        if self.decision_log_keep_rotated <= 0:
+            raise ValueError("registry.decision_log_keep_rotated must be positive")
 
 
 @dataclass

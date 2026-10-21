@@ -110,6 +110,8 @@ class EarlyStopEngine:
         log_path: Optional[str] = None,
         degraded_probe: Optional[Callable[[], bool]] = None,
         skip_engine: Optional[GatherSkipEngine] = None,
+        decision_log_max_bytes: int = 67_108_864,
+        decision_log_keep_rotated: int = 2,
     ):
         self.workspace = str(workspace)
         candidate = str(mode).strip().lower()
@@ -124,6 +126,8 @@ class EarlyStopEngine:
         self.run_id = run_id
         self._clock = clock or time.time
         self._degraded_probe = degraded_probe
+        self.decision_log_max_bytes = int(decision_log_max_bytes)
+        self.decision_log_keep_rotated = int(decision_log_keep_rotated)
 
         # Reuse the amended gather-skip conjunction verbatim for "known".  The
         # pipeline injects its shared gather-skip engine so a registry read
@@ -144,6 +148,7 @@ class EarlyStopEngine:
         self._conns: set = set()
         self._log_lock = threading.Lock()
         self._log_handle = None
+        self._log_bytes = 0  # in-memory byte counter for rotation threshold
         self._closed = False
 
         self._trackers: Dict[Tuple[str, str], _PartitionTracker] = {}
@@ -155,6 +160,7 @@ class EarlyStopEngine:
         self.early_stop_would_fire = 0
         self.early_stop_fired = 0
         self.novel_after_stop = 0
+        self.decision_log_rotations = 0
 
     # ------------------------------------------------------------------
     # Capabilities
@@ -440,6 +446,38 @@ class EarlyStopEngine:
                 if self._log_handle is None:
                     # Line-buffered: each record is durable on its own line.
                     self._log_handle = open(self.log_path, "a", encoding="utf-8", buffering=1)
-                self._log_handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+                    # Seed the in-memory byte counter from the file's current size.
+                    try:
+                        self._log_bytes = os.path.getsize(self.log_path)
+                    except OSError:
+                        self._log_bytes = 0
+                line = json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n"
+                line_bytes = len(line.encode("utf-8"))
+                # Check rotation threshold before writing.
+                if self._log_bytes + line_bytes >= self.decision_log_max_bytes:
+                    # Close the handle before rotation.
+                    try:
+                        self._log_handle.close()
+                    except Exception:
+                        pass
+                    self._log_handle = None
+                    # Perform rotation (fail-open).
+                    from tools.jsonl_rotate import maybe_rotate_jsonl
+                    rotated = maybe_rotate_jsonl(
+                        self.log_path,
+                        max_bytes=self.decision_log_max_bytes,
+                        keep_n=self.decision_log_keep_rotated,
+                    )
+                    if rotated:
+                        with self._lock:
+                            self.decision_log_rotations += 1
+                        logger.info(
+                            f"[early-stop] rotated decision log after {self._log_bytes} bytes"
+                        )
+                    self._log_bytes = 0
+                    # Reopen handle.
+                    self._log_handle = open(self.log_path, "a", encoding="utf-8", buffering=1)
+                self._log_handle.write(line)
+                self._log_bytes += line_bytes
         except Exception as exc:  # decision log is observability, never fatal
             logger.debug(f"[early-stop] decision log write failed: {exc}")

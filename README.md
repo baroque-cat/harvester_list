@@ -1043,8 +1043,10 @@ and `push_signal_coverage` are exposed in `PipelineStatus.skip_metrics` and the
 status display.
 
 **Decision-log growth:** `registry_decisions.jsonl` is append-only (one line
-per would-skip). It is pure observability data — rotate, truncate or archive it
-freely between cycles; the run counters do not depend on the file.
+per would-skip).  Size-based rotation (config `registry.decision_log_max_bytes`,
+default 64 MiB; `registry.decision_log_keep_rotated`, default 2) caps disk usage
+at ≤192 MiB per file name.  It is pure observability data — rotate, truncate or
+archive it freely between cycles; the run counters do not depend on the file.
 
 **Rollback:** set `skip.skip_known: off` — a config flip, no code removal. A run
 whose registry was degraded is not a trustworthy source of "known" counts.
@@ -1494,7 +1496,8 @@ distinct work (measured 49.9 for the wasteful arm vs 3.0 for the enforcing one;
 307.6 vs 6.4 in the depth A/B — plan.md II.4/II.16.2). The store is
 in-memory only: a restart starts cold and no workspace artifact is created in
 `off`/`on` (the shadow decision log is the sole on-disk output, append-only
-audit data).
+audit data with size-based rotation sharing the same config keys as
+`registry_decisions.jsonl`).
 
 **Promotion & rollback.** Run `shadow` for a representative production cycle
 (including a rate-limit storm), review `aggregation_decisions.jsonl` (p95

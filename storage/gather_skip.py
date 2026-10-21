@@ -106,6 +106,8 @@ class GatherSkipEngine:
         grace_seconds: float = DEFAULT_PUSH_GRACE_SECONDS,
         clock=None,
         log_path: Optional[str] = None,
+        decision_log_max_bytes: int = 67_108_864,
+        decision_log_keep_rotated: int = 2,
     ):
         self.workspace = str(workspace)
         self.mode = mode if mode in VALID_MODES else MODE_OFF
@@ -115,6 +117,8 @@ class GatherSkipEngine:
         self.log_path = log_path or os.path.join(self.workspace, DECISION_LOG_FILENAME)
         self.run_id = run_id
         self._clock = clock or time.time
+        self.decision_log_max_bytes = int(decision_log_max_bytes)
+        self.decision_log_keep_rotated = int(decision_log_keep_rotated)
 
         self._local = threading.local()
         self._stat_lock = threading.Lock()
@@ -122,6 +126,7 @@ class GatherSkipEngine:
         self._conn_lock = threading.Lock()
         self._conns: set = set()
         self._log_handle = None
+        self._log_bytes = 0  # in-memory byte counter for rotation threshold
         self._closed = False
 
         self.skipped_known = 0
@@ -134,6 +139,7 @@ class GatherSkipEngine:
         self._regathered: Dict[str, int] = {reason: 0 for reason in REGATHER_REASONS}
         self._logged_error_kinds: set = set()
         self.chunk_warnings = 0
+        self.decision_log_rotations = 0
 
     # ------------------------------------------------------------------
     # Capabilities
@@ -480,7 +486,39 @@ class GatherSkipEngine:
                 if self._log_handle is None:
                     # Line-buffered: each decision is durable on its own line.
                     self._log_handle = open(self.log_path, "a", encoding="utf-8", buffering=1)
-                self._log_handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+                    # Seed the in-memory byte counter from the file's current size.
+                    try:
+                        self._log_bytes = os.path.getsize(self.log_path)
+                    except OSError:
+                        self._log_bytes = 0
+                line = json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n"
+                line_bytes = len(line.encode("utf-8"))
+                # Check rotation threshold before writing.
+                if self._log_bytes + line_bytes >= self.decision_log_max_bytes:
+                    # Close the handle before rotation.
+                    try:
+                        self._log_handle.close()
+                    except Exception:
+                        pass
+                    self._log_handle = None
+                    # Perform rotation (fail-open).
+                    from tools.jsonl_rotate import maybe_rotate_jsonl
+                    rotated = maybe_rotate_jsonl(
+                        self.log_path,
+                        max_bytes=self.decision_log_max_bytes,
+                        keep_n=self.decision_log_keep_rotated,
+                    )
+                    if rotated:
+                        with self._stat_lock:
+                            self.decision_log_rotations += 1
+                        logger.info(
+                            f"[gather-skip] rotated decision log after {self._log_bytes} bytes"
+                        )
+                    self._log_bytes = 0
+                    # Reopen handle (lazy; will be opened on next write or now).
+                    self._log_handle = open(self.log_path, "a", encoding="utf-8", buffering=1)
+                self._log_handle.write(line)
+                self._log_bytes += line_bytes
         except Exception as exc:  # decision log is observability, never fatal
             logger.debug(f"[gather-skip] decision log write failed: {exc}")
 

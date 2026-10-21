@@ -384,6 +384,8 @@ class ConfigLoader:
             batch_size=data.get("batch_size", 50),
             flush_interval=data.get("flush_interval", 5),
             queue_size=data.get("queue_size", 100000),
+            decision_log_max_bytes=data.get("decision_log_max_bytes", 67_108_864),
+            decision_log_keep_rotated=data.get("decision_log_keep_rotated", 2),
         )
 
     def _parse_skip_config(self, data: Dict[str, Any]) -> SkipConfig:

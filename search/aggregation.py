@@ -140,6 +140,8 @@ class SearchAggregator:
         join_timeout_s: float = DEFAULT_JOIN_TIMEOUT_S,
         clock: Optional[Callable[[], float]] = None,
         workspace: Optional[str] = None,
+        decision_log_max_bytes: int = 67_108_864,
+        decision_log_keep_rotated: int = 2,
     ) -> None:
         resolved = str(mode).strip().lower()
         if resolved not in _VALID_MODES:
@@ -151,12 +153,15 @@ class SearchAggregator:
         self.join_timeout_s = float(join_timeout_s)
         self.clock: Callable[[], float] = clock or time.monotonic
         self.workspace = workspace
+        self.decision_log_max_bytes = int(decision_log_max_bytes)
+        self.decision_log_keep_rotated = int(decision_log_keep_rotated)
 
         self.metrics = AggregationMetrics()
         self._lock = threading.Lock()
         self._cache: "OrderedDict[Tuple[Any, ...], _Entry]" = OrderedDict()
         self._flights: Dict[Tuple[Any, ...], _Flight] = {}
         self._bytes = 0
+        self.decision_log_rotations = 0
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -334,7 +339,27 @@ class SearchAggregator:
         if not self.workspace:
             return
         path = os.path.join(self.workspace, DECISION_LOG_FILENAME)
-        AtomicFileWriter.append_atomic(path, [json.dumps(record, ensure_ascii=True, sort_keys=True)])
+        line = json.dumps(record, ensure_ascii=True, sort_keys=True)
+        line_bytes = len(line.encode("utf-8")) + 1  # +1 for newline
+        # Check rotation threshold (stat each time; aggregation writes are rare).
+        try:
+            current_size = os.path.getsize(path)
+        except OSError:
+            current_size = 0
+        if current_size + line_bytes >= self.decision_log_max_bytes:
+            from tools.jsonl_rotate import maybe_rotate_jsonl
+            rotated = maybe_rotate_jsonl(
+                path,
+                max_bytes=self.decision_log_max_bytes,
+                keep_n=self.decision_log_keep_rotated,
+            )
+            if rotated:
+                with self._lock:
+                    self.decision_log_rotations += 1
+                logger.info(
+                    f"[aggregation] rotated decision log after {current_size} bytes"
+                )
+        AtomicFileWriter.append_atomic(path, [line])
 
     # ------------------------------------------------------------------
     # Store internals (caller holds ``self._lock`` unless noted)

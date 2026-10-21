@@ -351,6 +351,12 @@ class ConfigValidator:
         if not isinstance(registry.path, str):
             self.errors.append("Registry path must be a string")
 
+        if registry.decision_log_max_bytes <= 0:
+            self.errors.append("Registry decision_log_max_bytes must be positive")
+
+        if registry.decision_log_keep_rotated <= 0:
+            self.errors.append("Registry decision_log_keep_rotated must be positive")
+
     def _validate_skip_config(self, config: Config) -> None:
         """Validate gather-skip configuration section
 

@@ -89,3 +89,12 @@ Per-run counters SHALL report `skipped_known`, the four `regathered_*` reasons (
 
 - **WHEN** a run evaluates 100 already-known links, 30 of which carry non-NULL `repo_pushed_at`
 - **THEN** run stats report `push_signal_coverage = 0.30` alongside the skip/regather counters
+
+### Requirement: Decision-log size rotation
+
+The decision log (`registry_decisions.jsonl`) SHALL be rotated by size when it exceeds `registry.decision_log_max_bytes` (default 64 MiB), keeping the last `registry.decision_log_keep_rotated` (default 2) generations. Rotation is fail-open: OS errors during rotation are logged at debug level and do not halt the pipeline. The same rotation mechanism applies to `aggregation_decisions.jsonl` (shared config keys).
+
+#### Scenario: Rotation at threshold preserves all decisions
+
+- **WHEN** the decision log reaches `decision_log_max_bytes`
+- **THEN** the live file is shifted to `.1`, older generations shift up (`.i` → `.i+1`), the oldest beyond `keep_rotated` is deleted, and a new empty live file is opened; all decisions across all generations remain valid JSONL without loss

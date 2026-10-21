@@ -230,6 +230,13 @@ registry:
   flush_interval: 5
   # Maximum queued operations before writes are dropped (and the run degraded)
   queue_size: 100000
+  # Decision-log rotation: size threshold in bytes (default 64 MiB).
+  # Measured 470 B/line (2026-10-21); restart bursts ∝ backlog×providers can
+  # grow decision logs to GB.  Rollback: remove key or raise threshold.
+  decision_log_max_bytes: 67108864
+  # Decision-log rotation: keep last N rotated generations (.1, .2, ...).
+  # Total disk cap per file name ≤ (keep+1)×max = 192 MiB (default 2+1).
+  decision_log_keep_rotated: 2
 
 # Registry-driven gather-skip configuration (add-gather-skip)
 skip:
