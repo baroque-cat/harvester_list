@@ -163,14 +163,24 @@ persistence:
   save_interval: 30
   # Queue state save interval in seconds
   queue_interval: 60
-  # Periodic snapshot interval in seconds
-  snapshot_interval: 300
   # Auto restore state on startup
   auto_restore: true
   # Shutdown timeout in seconds
   shutdown_timeout: 30
   # Output format, support txt or ndjson
   format: txt
+  # Snapshot lifecycle configuration (wave 1, slice 1.4)
+  # Master switch for periodic and final snapshots (off by default;
+  # snapshot artifacts have zero consumers in the repository)
+  snapshots_enabled: false
+  # Periodic snapshot build interval in seconds (only used when enabled)
+  snapshot_interval_s: 3600
+  # Rotation: keep last N generations (0 = keep all)
+  snapshot_keep_last_n: 3
+  # Size guard for final build: skip if total shard size exceeds this (bytes)
+  snapshot_final_max_bytes: 2000000000
+  # Rollback: setting snapshots_enabled: true restores pre-wave-1 behavior
+  # (periodic + final snapshots), but with interval 3600 instead of 300
 
 # Dynamic worker manager configuration
 worker:

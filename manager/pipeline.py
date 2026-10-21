@@ -73,6 +73,10 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             save_interval=config.persistence.save_interval,
             simple=config.persistence.simple,
             shutdown_timeout=float(config.persistence.shutdown_timeout),
+            snapshots_enabled=config.persistence.snapshots_enabled,
+            snapshot_interval_s=config.persistence.snapshot_interval_s,
+            snapshot_keep_last_n=config.persistence.snapshot_keep_last_n,
+            snapshot_final_max_bytes=config.persistence.snapshot_final_max_bytes,
         )
 
         self.rate_limiter = RateLimiter(config.ratelimits)
@@ -197,15 +201,6 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             visibility_timeout_s=config.queue.visibility_timeout_s,
             max_age_hours=config.queue.max_age_hours,
         )
-
-        # Start periodic snapshots for results
-        if not config.persistence.simple:
-            try:
-                self.result_manager.start_periodic_snapshots(config.persistence.snapshot_interval)
-            except Exception as e:
-                logger.error(f"Failed to start periodic snapshots: {e}")
-        else:
-            logger.debug("Skipping periodic snapshots in simple mode")
 
         # Store task configs for stage checking (must be before _create_stages)
         self.task_configs = {task.name: task for task in config.tasks if task.enabled}

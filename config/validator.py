@@ -114,6 +114,9 @@ class ConfigValidator:
         # Validate display configuration
         self._validate_display_config(config)
 
+        # Validate persistence/snapshot configuration
+        self._validate_persistence_config(config)
+
         # Surface non-fatal configuration warnings.
         if self.warnings:
             for warning in self.warnings:
@@ -786,3 +789,33 @@ class ConfigValidator:
                 # Validate title
                 if not mode_config.title.strip():
                     self.errors.append(f"{prefix}: title cannot be empty")
+
+    def _validate_persistence_config(self, config: Config) -> None:
+        """Validate persistence/snapshot configuration section.
+
+        Mirrors PersistenceConfig.__post_init__ (deliberate duplication): the
+        validator collects all errors instead of raising on first, so an
+        operator sees every misconfiguration in one load.
+        """
+        persistence = config.persistence
+
+        if int(persistence.batch_size) <= 0:
+            self.errors.append("persistence.batch_size must be positive")
+
+        if int(persistence.save_interval) <= 0:
+            self.errors.append("persistence.save_interval must be positive")
+
+        if int(persistence.queue_interval) <= 0:
+            self.errors.append("persistence.queue_interval must be positive")
+
+        if int(persistence.shutdown_timeout) <= 0:
+            self.errors.append("persistence.shutdown_timeout must be positive")
+
+        if int(persistence.snapshot_interval_s) <= 0:
+            self.errors.append("persistence.snapshot_interval_s must be positive")
+
+        if int(persistence.snapshot_keep_last_n) < 0:
+            self.errors.append("persistence.snapshot_keep_last_n must be non-negative")
+
+        if int(persistence.snapshot_final_max_bytes) <= 0:
+            self.errors.append("persistence.snapshot_final_max_bytes must be positive")

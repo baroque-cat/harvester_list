@@ -322,6 +322,19 @@ class ConfigLoader:
         Returns:
             PersistenceConfig: Parsed persistence configuration
         """
+        # Warn about unknown keys in persistence section
+        known_keys = {
+            "batch_size", "save_interval", "queue_interval", "auto_restore",
+            "shutdown_timeout", "format", "snapshots_enabled", "snapshot_interval_s",
+            "snapshot_keep_last_n", "snapshot_final_max_bytes"
+        }
+        for key in data.keys():
+            if key not in known_keys:
+                logger.warning(
+                    f"persistence.{key} is ignored (unknown key; known keys: "
+                    f"{', '.join(sorted(known_keys))})"
+                )
+        
         return PersistenceConfig(
             batch_size=data.get("batch_size", 50),
             save_interval=data.get("save_interval", 30),
@@ -329,6 +342,10 @@ class ConfigLoader:
             auto_restore=data.get("auto_restore", True),
             shutdown_timeout=data.get("shutdown_timeout", 30),
             simple=data.get("format", "txt").strip().lower() == "txt",
+            snapshots_enabled=data.get("snapshots_enabled", False),
+            snapshot_interval_s=data.get("snapshot_interval_s", 3600),
+            snapshot_keep_last_n=data.get("snapshot_keep_last_n", 3),
+            snapshot_final_max_bytes=data.get("snapshot_final_max_bytes", 2_000_000_000),
         )
 
     def _parse_worker_manager_config(self, data: Dict[str, Any]) -> WorkerManagerConfig:

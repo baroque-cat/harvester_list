@@ -662,6 +662,11 @@ instead of being mangled into a zero-result wire query.
       persistence:
         auto_restore: true      # Auto restore state on startup
         shutdown_timeout: 30    # Shutdown timeout in seconds
+        # Snapshot lifecycle (off by default; zero consumers in repo)
+        snapshots_enabled: false
+        snapshot_interval_s: 3600
+        snapshot_keep_last_n: 3
+        snapshot_final_max_bytes: 2000000000
 
       # Global rate limiting configuration
       ratelimits:

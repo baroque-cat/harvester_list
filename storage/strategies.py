@@ -19,7 +19,7 @@ from tools.logger import get_logger
 
 from .atomic import AtomicFileWriter
 from .shard import NDJSONShardWriter
-from .snapshot import SnapshotManager as BaseSnapshotManager
+from .snapshot import BaseSnapshotManager
 
 logger = get_logger("storage")
 
@@ -201,7 +201,12 @@ class SnapshotManager:
     """Dedicated snapshot management with periodic building support.
 
     Manages the lifecycle of snapshot generation including periodic
-    background building and proper cleanup.
+    background building, incremental builds, rotation, and proper cleanup.
+    
+    Generation tracking:
+    - Each build creates versioned files: {type}.json.{generation}
+    - .build_meta.json tracks: current_generation, processed_shards per type, generations list
+    - Rotation removes old generations keeping only last N
     """
 
     def __init__(self, directory: str, result_types: List[str], provider_name: str):
@@ -223,12 +228,55 @@ class SnapshotManager:
 
         # Statistics
         self.stats = {"last_snapshot": 0.0, "snapshot_count": 0, "total_snapshot_time": 0.0, "snapshot_operations": 0}
+        
+        # Snapshots directory
+        self.snapshots_dir = os.path.join(self.directory, "snapshots")
+        os.makedirs(self.snapshots_dir, exist_ok=True)
+        
+        # Build metadata path
+        self.build_meta_path = os.path.join(self.snapshots_dir, ".build_meta.json")
 
-    def build_snapshot(self, result_type: str) -> int:
-        """Build snapshot for specific result type.
+    def _load_build_meta(self) -> dict:
+        """Load build metadata from .build_meta.json."""
+        if not os.path.exists(self.build_meta_path):
+            return {
+                "current_generation": 1,
+                "ts": None,  # No previous build timestamp
+                "shards": [],  # List of shard files included in last build
+                "generations": []
+            }
+        try:
+            with open(self.build_meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+                # Ensure required fields exist (backward compatibility)
+                if "ts" not in meta:
+                    meta["ts"] = None
+                if "shards" not in meta:
+                    meta["shards"] = []
+                return meta
+        except Exception as e:
+            logger.warning(f"Failed to load build metadata, starting fresh: {e}")
+            return {
+                "current_generation": 1,
+                "ts": None,
+                "shards": [],
+                "generations": []
+            }
+
+    def _save_build_meta(self, meta: dict) -> None:
+        """Save build metadata to .build_meta.json."""
+        try:
+            with open(self.build_meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Failed to save build metadata: {e}")
+
+    def build_snapshot(self, result_type: str, keep_last_n: int = 0) -> int:
+        """Build snapshot for specific result type with incremental support.
 
         Args:
             result_type: Type of result to build snapshot for
+            keep_last_n: Rotation parameter - keep last N generations (0 = keep all)
 
         Returns:
             Number of records in the snapshot
@@ -238,15 +286,43 @@ class SnapshotManager:
             logger.debug(f"No shard directory for {result_type} in {self.provider_name}")
             return 0
 
-        snapshots_dir = os.path.join(self.directory, "snapshots")
-        os.makedirs(snapshots_dir, exist_ok=True)
-        snapshot_path = os.path.join(snapshots_dir, f"{result_type}.json")
+        # Load build metadata
+        meta = self._load_build_meta()
+        current_gen = meta["current_generation"]
+        last_build_ts = meta.get("ts")  # None if missing (full rebuild)
+        
+        # Log full rebuild scenarios
+        if last_build_ts is None:
+            if not os.path.exists(self.build_meta_path):
+                logger.info(f"Full rebuild for {result_type} in {self.provider_name}: no build metadata found")
+            else:
+                logger.info(f"Full rebuild for {result_type} in {self.provider_name}: build metadata missing ts field")
+        
+        # Versioned snapshot path
+        snapshot_path = os.path.join(self.snapshots_dir, f"{result_type}.json.{current_gen}")
 
         try:
-            manager = BaseSnapshotManager(shard_root, snapshot_path)
+            manager = BaseSnapshotManager(shard_root, snapshot_path, last_build_ts)
             start_time = time.time()
-            count = manager.build_snapshot()
+            count, new_shards = manager.build_snapshot()
             duration = time.time() - start_time
+
+            # Update build metadata with current timestamp and shard list
+            meta["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            meta["shards"] = new_shards
+            
+            # Also create/update current symlink or copy
+            current_snapshot = os.path.join(self.snapshots_dir, f"{result_type}.json")
+            if os.path.exists(snapshot_path):
+                try:
+                    # Copy to current (simple approach, no symlink for portability)
+                    with open(snapshot_path, "r", encoding="utf-8") as src:
+                        with open(current_snapshot, "w", encoding="utf-8") as dst:
+                            dst.write(src.read())
+                except Exception as e:
+                    logger.warning(f"Failed to update current snapshot: {e}")
+            
+            self._save_build_meta(meta)
 
             # Update statistics
             with self._lock:
@@ -256,25 +332,100 @@ class SnapshotManager:
                 self.stats["snapshot_operations"] += 1
 
             logger.info(f"Built snapshot for {result_type} with {count} records in {duration:.3f}s")
+            
+            # Apply rotation if keep_last_n > 0
+            if keep_last_n > 0:
+                self._apply_rotation(result_type, keep_last_n, meta)
+            
             return count
 
         except Exception as e:
             logger.error(f"Failed to build snapshot for {result_type}: {e}")
             return 0
 
-    def build_all_snapshots(self) -> Dict[str, int]:
-        """Build snapshots for all result types.
+    def _apply_rotation(self, result_type: str, keep_last_n: int, meta: dict) -> None:
+        """Apply rotation to keep only the last N generations of snapshots.
+        
+        A generation is defined as a complete set of {type}.json files from one build.
+        Removes old generation files and updates metadata.
+        
+        Args:
+            result_type: Type of result
+            keep_last_n: Number of generations to keep
+            meta: Build metadata dict
+        """
+        if keep_last_n <= 0:
+            return
+        
+        # Find all generation files for this type
+        generation_files = []
+        for fn in os.listdir(self.snapshots_dir):
+            if fn.startswith(f"{result_type}.json."):
+                try:
+                    gen_num = int(fn.split(".")[-1])
+                    generation_files.append((gen_num, fn))
+                except ValueError:
+                    continue
+        
+        # Sort by generation number
+        generation_files.sort()
+        
+        # Keep only last N generations
+        if len(generation_files) > keep_last_n:
+            to_delete = generation_files[:-keep_last_n]
+            total_bytes_deleted = 0
+            
+            for gen_num, fn in to_delete:
+                fp = os.path.join(self.snapshots_dir, fn)
+                try:
+                    file_size = os.path.getsize(fp)
+                    os.remove(fp)
+                    total_bytes_deleted += file_size
+                    logger.info(f"Rotated out generation {gen_num} for {result_type} ({file_size} bytes)")
+                except Exception as e:
+                    logger.error(f"Failed to delete old generation file {fp}: {e}")
+            
+            if total_bytes_deleted > 0:
+                logger.info(f"Rotation complete for {result_type}: deleted {total_bytes_deleted} bytes")
+
+    def build_all_snapshots(self, keep_last_n: int = 0) -> Dict[str, int]:
+        """Build snapshots for all result types and increment generation.
+
+        Args:
+            keep_last_n: Rotation parameter - keep last N generations (0 = keep all)
 
         Returns:
             Dictionary mapping result types to record counts
         """
         results = {}
+        
+        # Build snapshots for all types
         for result_type in self.result_types:
             try:
-                results[result_type] = self.build_snapshot(result_type)
+                results[result_type] = self.build_snapshot(result_type, keep_last_n=0)
             except Exception as e:
                 logger.error(f"Failed to build snapshot for {result_type}: {e}")
                 results[result_type] = 0
+        
+        # After all types are built, increment generation and record it
+        meta = self._load_build_meta()
+        current_gen = meta["current_generation"]
+        
+        # Record this generation
+        generation_record = {
+            "gen": current_gen,
+            "ts": time.time(),
+            "files": {rt: f"{rt}.json.{current_gen}" for rt in self.result_types}
+        }
+        meta["generations"].append(generation_record)
+        meta["current_generation"] = current_gen + 1
+        self._save_build_meta(meta)
+        
+        # Apply rotation for all types
+        if keep_last_n > 0:
+            for result_type in self.result_types:
+                self._apply_rotation(result_type, keep_last_n, meta)
+        
         return results
 
     def start_periodic(self, interval_sec: int = 300) -> None:

@@ -278,10 +278,30 @@ class PersistenceConfig:
     batch_size: int = 50
     save_interval: int = 30
     queue_interval: int = 60
-    snapshot_interval: int = 300  # seconds, periodic snapshot build interval
     auto_restore: bool = True
     shutdown_timeout: int = 30
     simple: bool = False  # Write simple text files alongside NDJSON
+    snapshots_enabled: bool = False  # Master switch for periodic and final snapshots
+    snapshot_interval_s: int = 3600  # seconds, periodic snapshot build interval
+    snapshot_keep_last_n: int = 3  # Rotation: keep last N generations (0 = keep all)
+    snapshot_final_max_bytes: int = 2_000_000_000  # Size guard for final build
+
+    def __post_init__(self):
+        """Validate persistence configuration positivity constraints."""
+        if self.batch_size <= 0:
+            raise ValueError("persistence.batch_size must be positive")
+        if self.save_interval <= 0:
+            raise ValueError("persistence.save_interval must be positive")
+        if self.queue_interval <= 0:
+            raise ValueError("persistence.queue_interval must be positive")
+        if self.shutdown_timeout <= 0:
+            raise ValueError("persistence.shutdown_timeout must be positive")
+        if self.snapshot_interval_s <= 0:
+            raise ValueError("persistence.snapshot_interval_s must be positive")
+        if self.snapshot_keep_last_n < 0:
+            raise ValueError("persistence.snapshot_keep_last_n must be non-negative")
+        if self.snapshot_final_max_bytes <= 0:
+            raise ValueError("persistence.snapshot_final_max_bytes must be positive")
 
 
 @dataclass

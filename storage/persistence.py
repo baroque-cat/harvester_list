@@ -96,6 +96,8 @@ class ResultManager:
         save_interval: float = 30.0,
         simple: bool = False,
         shutdown_timeout: float = 5.0,
+        snapshots_enabled: bool = False,
+        snapshot_final_max_bytes: int = 2_000_000_000,
     ):
         self.name = provider.name
         self.provider = provider
@@ -103,6 +105,8 @@ class ResultManager:
         self.batch_size = batch_size
         self.save_interval = save_interval
         self.shutdown_timeout = float(max(1.0, shutdown_timeout))
+        self.snapshots_enabled = snapshots_enabled
+        self.snapshot_final_max_bytes = snapshot_final_max_bytes
 
         # Create provider directory
         self.directory = os.path.join(workspace, "providers", self.provider.result.folder)
@@ -493,6 +497,7 @@ class ResultManager:
         """Build snapshots for all result types."""
         if not self.snapshot_manager:
             return {}
+        # Note: keep_last_n is managed at the MultiResultManager level
         return self.snapshot_manager.build_all_snapshots()
 
     def _deserialize_service(self, line: str) -> Optional[Service]:
@@ -520,11 +525,21 @@ class ResultManager:
         # Flush all remaining data
         self.flush_all()
 
-        # Build final snapshots if supported
-        try:
-            self.build_all_snapshots()
-        except Exception as e:
-            logger.error(f"[persist] failed to build snapshots for {self.name} on stop: {e}")
+        # Build final snapshots if enabled and within size guard
+        if self.snapshots_enabled and self.snapshot_manager:
+            # Check size guard
+            total_shard_size = self._calculate_shard_size()
+            if total_shard_size > self.snapshot_final_max_bytes:
+                logger.warning(
+                    f"[persist] Skipping final snapshot for {self.name}: "
+                    f"shard size {total_shard_size} bytes exceeds limit "
+                    f"{self.snapshot_final_max_bytes} bytes"
+                )
+            else:
+                try:
+                    self.build_all_snapshots()
+                except Exception as e:
+                    logger.error(f"[persist] failed to build snapshots for {self.name} on stop: {e}")
 
         # Cleanup strategy resources
         try:
@@ -545,6 +560,22 @@ class ResultManager:
         if not self.snapshot_manager:
             return
         self.snapshot_manager.stop()
+
+    def _calculate_shard_size(self) -> int:
+        """Calculate total size of all shard files for size-guard check."""
+        total_size = 0
+        shard_base = os.path.join(self.directory, "shards")
+        if not os.path.isdir(shard_base):
+            return 0
+        for root, _, files in os.walk(shard_base):
+            for fn in files:
+                if fn.endswith(".ndjson"):
+                    fp = os.path.join(root, fn)
+                    try:
+                        total_size += os.path.getsize(fp)
+                    except Exception:
+                        pass
+        return total_size
 
     def _periodic_flush(self):
         """Periodic flush thread"""
@@ -631,6 +662,10 @@ class MultiResultManager:
         save_interval: float = 30.0,
         simple: bool = False,
         shutdown_timeout: float = 5.0,
+        snapshots_enabled: bool = False,
+        snapshot_interval_s: int = 3600,
+        snapshot_keep_last_n: int = 3,
+        snapshot_final_max_bytes: int = 2_000_000_000,
     ):
         self.workspace = workspace
         self.providers = providers or {}
@@ -638,6 +673,10 @@ class MultiResultManager:
         self.save_interval = save_interval
         self.simple = simple
         self.shutdown_timeout = float(max(1.0, shutdown_timeout))
+        self.snapshots_enabled = snapshots_enabled
+        self.snapshot_interval_s = snapshot_interval_s
+        self.snapshot_keep_last_n = snapshot_keep_last_n
+        self.snapshot_final_max_bytes = snapshot_final_max_bytes
         self.managers: Dict[str, ResultManager] = {}
         self.lock = threading.Lock()
 
@@ -659,7 +698,12 @@ class MultiResultManager:
                     self.save_interval,
                     simple=self.simple,
                     shutdown_timeout=self.shutdown_timeout,
+                    snapshots_enabled=self.snapshots_enabled,
+                    snapshot_final_max_bytes=self.snapshot_final_max_bytes,
                 )
+                # Auto-start periodic snapshots if enabled (starter-ordering fix)
+                if self.snapshots_enabled and not self.simple and self.managers[name].snapshot_manager:
+                    self.managers[name].start_periodic_snapshot(self.snapshot_interval_s)
             return self.managers[name]
 
     def add_result(self, provider: str, result_type: str, data: Any):

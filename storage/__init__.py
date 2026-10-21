@@ -27,7 +27,7 @@ from .persistence import MultiResultManager, ResultBuffer, ResultManager
 from .shard import NDJSONShardWriter
 
 # Snapshot and backup management
-from .snapshot import SnapshotManager
+from .strategies import SnapshotManager
 
 __all__ = [
     # Result management
