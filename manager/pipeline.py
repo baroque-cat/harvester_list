@@ -26,6 +26,7 @@ from storage.gather_skip import GatherSkipEngine
 from manager.gather_share import GatherShareLedger
 from storage.key_ledger import KeyLedger
 from storage.registry import Registry, config_digest as build_config_digest, init_registry
+from core.exceptions import RegistryUnavailableError
 from storage.priority import top_candidates
 from storage.repo_meta import RepoMetaEnricher, RepoMetaStore, tokens_cooling_down
 from storage.file_dating import FileDater
@@ -475,20 +476,30 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         logger.info("Stopped all pipeline stages")
 
     def start_registry_run(self) -> None:
-        """Journal the start of a run (write-only, fail-open)."""
+        """Journal the start of a run (write-only).
+
+        RegistryUnavailableError propagates (fail-CLOSED, Д14).
+        """
         try:
             if self.link_registry.available:
                 self.link_registry.start_run(config_digest=build_config_digest(self.config))
                 self.gather_skip.run_id = self.link_registry.run_id
                 self.early_stop.run_id = self.link_registry.run_id
+        except RegistryUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to journal registry run start: {e}")
             self.link_registry.mark_degraded()
 
     def finish_registry_run(self) -> None:
-        """Journal the graceful finish of a run (write-only, fail-open)."""
+        """Journal the graceful finish of a run (write-only).
+
+        RegistryUnavailableError propagates (fail-CLOSED, Д14).
+        """
         try:
             self.link_registry.finish_run()
+        except RegistryUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to journal registry run finish: {e}")
 
@@ -575,15 +586,27 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         Defensive best-effort read from ``self.link_registry``: when the
         attribute is missing or ``get_stats()`` raises, degrade to ``{}`` so
         the status render never fails because of a registry defect.
+        RegistryUnavailableError propagates (fail-CLOSED, Д14).
         """
         registry = getattr(self, "link_registry", None)
         if registry is None:
             return {}
         try:
             return registry.get_stats()
+        except RegistryUnavailableError:
+            raise
         except Exception as e:  # pragma: no cover - cosmetic best-effort
             logger.debug(f"Failed to read registry metrics: {e}")
             return {}
+
+    def check_registry_liveness(self) -> None:
+        """Poll the registry for fatal errors (liveness check, Д14).
+
+        Raises RegistryUnavailableError if the registry database has died.
+        Called from the periodic status path so the main loop can detect
+        the failure and trigger shutdown.
+        """
+        self.link_registry.check_alive()
 
     def add_initial_tasks(self, initial_tasks: List[ProviderTask]) -> None:
         """Add initial search tasks to pipeline"""

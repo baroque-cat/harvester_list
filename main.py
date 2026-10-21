@@ -26,6 +26,7 @@ from constant.system import (
     FORCE_EXIT_GRACE_PERIOD,
 )
 from core.enums import PipelineStage, SystemState
+from core.exceptions import RegistryUnavailableError
 from manager.base import LifecycleManager
 from manager.shutdown import ShutdownCoordinator
 from manager.status import StatusManager
@@ -206,6 +207,21 @@ class HarvesterApp:
                 if self.shutdown_coordinator.is_shutdown_requested():
                     logger.info("Shutdown coordinator signaled completion")
                     break
+
+                # Registry liveness poll (fail-CLOSED, Д14)
+                if (
+                    self.task_manager
+                    and self.task_manager.pipeline
+                    and self.task_manager.pipeline.link_registry.enabled
+                ):
+                    try:
+                        self.task_manager.pipeline.check_registry_liveness()
+                    except RegistryUnavailableError as exc:
+                        logger.critical(
+                            f"FATAL: registry database died — aborting run: {exc}"
+                        )
+                        self.shutdown_event.set()
+                        return False
 
                 # Interruptible wait
                 if self.shutdown_event.wait(timeout=0.5):
@@ -485,6 +501,7 @@ Examples:
     # Set stats interval from command line
     app.stats_interval = args.stats_interval
 
+    success = False
     try:
         logger.info("Starting Async Pipeline Application")
         logger.info("=" * 60)
@@ -562,5 +579,5 @@ Examples:
         except Exception as e:
             logger.error(f"Error flushing logs: {e}")
 
-        # Clean exit
-        sys.exit(0)
+        # Exit with appropriate code
+        sys.exit(0 if success else 1)

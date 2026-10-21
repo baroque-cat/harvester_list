@@ -6,6 +6,8 @@ Traceability: link-registry-S1..S3, S7, S9..S18.
 import json
 import os
 
+import pytest
+
 from storage.registry import Registry
 
 URL = "https://github.com/o/r/blob/main/a.py"
@@ -204,17 +206,25 @@ def test_s15_degraded_run_is_marked(workspace, db_scalar, monkeypatch):
 
 
 def test_s16_corrupt_database_does_not_stop_the_pipeline(workspace, registry_path):
-    """link-registry-S16: a corrupt file degrades to a no-op, never raises."""
+    """link-registry-S16: a corrupt file with registry enabled raises
+    RegistryUnavailableError (fail-CLOSED, Д14, 2026-10-22).
+
+    Adapted from fail-open to fail-CLOSED: under Д14 the program MUST crash
+    loudly when the registry is enabled and its database is dead.
+    """
+    from core.exceptions import RegistryUnavailableError
+
     path = registry_path(workspace)
     with open(path, "wb") as f:
         f.write(b"this is definitely not a sqlite database")
 
     registry = Registry(workspace, enabled=True)
-    assert registry.start() is False
+    with pytest.raises(RegistryUnavailableError):
+        registry.start()
     assert registry.available is False
     assert registry.degraded is True
 
-    # Hooks must remain safe no-ops.
+    # Hooks must remain safe no-ops (registry never started).
     registry.record_link(URL, ts=1.0)
     registry.record_gather(URL, provider="openai", patterns_hash="ph", success=True, ts=2.0)
     registry.stop()

@@ -5,9 +5,13 @@ Persistent global link registry.
 
 A write-only SQLite ledger (WAL mode) recording every GitHub link the
 harvester discovers and gathers, per-provider gather coverage, and a run
-journal.  Integration is fail-open: any registry error logs a warning,
-marks the run degraded, and the pipeline keeps running exactly as if the
-registry were disabled.
+journal.  When the registry is enabled (``registry.enabled=true``) and its
+SQLite store dies (open failure or database-class error), the program
+terminates loudly — fail-CLOSED (Д14, 2026-10-22, OPEN-5 resolution).
+When the registry is disabled, the module is a complete no-op.
+
+Transient busy/locked errors are NOT fatal — they keep the existing
+degrade-and-retry behaviour.
 
 This module never influences a pipeline decision in this change; it only
 records.  See ``docs/specs/url_canonicalization.md`` for the identity canon.
@@ -34,7 +38,40 @@ from storage.priority import (
 )
 from tools.logger import get_logger
 
+from core.exceptions import RegistryUnavailableError
+
 logger = get_logger("storage")
+
+
+# ---------------------------------------------------------------------------
+# Fatal vs transient database error classification (Д14, 2026-10-22).
+# ---------------------------------------------------------------------------
+
+# Transient patterns in sqlite3.OperationalError messages that are NOT fatal.
+_TRANSIENT_PATTERNS = (
+    "database is locked",
+    "database is busy",
+    "[sqlite_busy]",
+    "[sqlite_locked]",
+)
+
+
+def _is_fatal_db_error(exc: BaseException) -> bool:
+    """Classify a database exception as fatal (store is dead) or transient.
+
+    FATAL: any ``sqlite3.DatabaseError`` EXCEPT ``sqlite3.OperationalError``
+    whose message matches transient busy/locked patterns (case-insensitive).
+    Note: ``sqlite3.OperationalError`` IS a subclass of ``sqlite3.DatabaseError``.
+
+    NON-fatal: busy/locked transients (retry path unchanged).
+    """
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    if isinstance(exc, sqlite3.OperationalError):
+        msg = str(exc).lower()
+        return not any(pattern in msg for pattern in _TRANSIENT_PATTERNS)
+    # Other DatabaseError subclasses (DataError, etc.) are fatal.
+    return True
 
 # Bump when the schema changes; later changes may only ADD columns/tables.
 SCHEMA_VERSION = 6
@@ -575,6 +612,8 @@ class Registry:
         self._suppress_writes = False
         self._degraded = False
         self._degraded_kinds: set = set()
+        self._fatal: Optional[BaseException] = None
+        self._fatal_logged = False
         self.dropped = 0
         self._dropped_lock = threading.Lock()
         self._metadata_noops = 0
@@ -595,7 +634,12 @@ class Registry:
         return self._degraded
 
     def start(self, run_id: Optional[str] = None, config_digest_value: Optional[str] = None) -> bool:
-        """Open the database and start the writer thread. Never raises."""
+        """Open the database and start the writer thread.
+
+        When the registry is disabled, returns False (no-op).
+        When the registry is enabled and the database cannot be opened,
+        raises :class:`RegistryUnavailableError` (fail-CLOSED, Д14).
+        """
         if not self.enabled:
             return False
         if self._available:
@@ -618,13 +662,20 @@ class Registry:
             self._available = True
         except Exception as exc:  # corrupt file, permission, disk, ...
             self._degrade("open", exc)
+            self._fatal = exc
             try:
                 if "conn" in locals() and conn is not None:
                     conn.close()
             except Exception:
                 pass
             self._available = False
-            return False
+            logger.critical(
+                f"[registry_fatal] FATAL: registry enabled but cannot open "
+                f"database at {self.path!r}: {exc}"
+            )
+            raise RegistryUnavailableError(
+                f"Registry enabled but database cannot be opened: {exc}"
+            ) from exc
 
         self._start_writer()
         if run_id is not None:
@@ -680,7 +731,10 @@ class Registry:
         cadence).  Read through a dedicated read-only connection following the
         house pattern of ``get_link_fetch_state()``; ANY exception degrades to
         zeros and never raises into a caller.
+
+        Calls :meth:`check_alive` first so a fatal mid-run error propagates.
         """
+        self.check_alive()
         base = {
             "path": self.path,
             "enabled": self.enabled,
@@ -1081,26 +1135,47 @@ class Registry:
         """Flag the active run degraded (no I/O; persisted at finish_run)."""
         self._degraded = True
 
+    def check_alive(self) -> None:
+        """Raise RegistryUnavailableError if a fatal error has been recorded.
+
+        Cheap, no I/O.  Called by the pipeline liveness poll and by
+        synchronous public entry points.
+        """
+        if self.enabled and self._fatal is not None:
+            raise RegistryUnavailableError(
+                f"Registry database is dead: {self._fatal}"
+            ) from self._fatal
+
     def flush(self, timeout: float = 10.0) -> None:
-        """Block until queued writes are processed. Never raises."""
+        """Block until queued writes are processed.
+
+        Calls :meth:`check_alive` first so a fatal mid-run error propagates.
+        """
         if not self.enabled or not self._available:
+            self.check_alive()
             return
+        self.check_alive()
         deadline = time.time() + max(0.0, timeout)
         while self._queue.unfinished_tasks and time.time() < deadline:
             time.sleep(0.001)
 
     def sweep_priorities(self, weights: Any = None, now: Optional[float] = None) -> int:
-        """Recompute and persist priority for every repository (fail-open).
+        """Recompute and persist priority for every repository.
 
         Drains pending writes first so the sweep observes a settled ledger, then
         runs the full ``DISTINCT owner, repo`` recomputation through the writer
         connection.  Returns the number of repositories scored (0 when the
         registry is disabled/unavailable).
+
+        Calls :meth:`check_alive` first so a fatal mid-run error propagates.
         """
+        self.check_alive()
         if not self.enabled or not self._available or self._conn is None:
             return 0
         try:
             self.flush(max(10.0, self.flush_interval * 2))
+        except RegistryUnavailableError:
+            raise
         except Exception:
             pass
         resolved = weights_from_config(weights) if weights is not None else self.priority_weights
@@ -1193,7 +1268,18 @@ class Registry:
                 self._flush_batch(batch)
         except Exception as exc:
             self._degrade("write", exc)
-            self._suppress_writes = True
+            if _is_fatal_db_error(exc):
+                if self._fatal is None:
+                    self._fatal = exc
+                if not self._fatal_logged:
+                    self._fatal_logged = True
+                    logger.critical(
+                        f"[registry_fatal] FATAL: database error mid-run: {exc}"
+                    )
+                # Do NOT set _suppress_writes for fatal — writes must not
+                # silently continue; the run must abort via check_alive().
+            else:
+                self._suppress_writes = True
             self._safe_rollback()
         finally:
             for _ in batch:
@@ -1459,6 +1545,14 @@ class Registry:
                     self._conn.commit()
         except Exception as exc:
             self._degrade(kind, exc)
+            if _is_fatal_db_error(exc):
+                if self._fatal is None:
+                    self._fatal = exc
+                if not self._fatal_logged:
+                    self._fatal_logged = True
+                    logger.critical(
+                        f"[registry_fatal] FATAL: database error in {kind}: {exc}"
+                    )
             self._safe_rollback()
 
     def _safe_rollback(self) -> None:

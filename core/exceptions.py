@@ -135,3 +135,17 @@ class ConfigurationError(BaseError):
 
     def __init__(self, message: str, **kwargs):
         super().__init__(message=message, **kwargs)
+
+
+class RegistryUnavailableError(RuntimeError):
+    """The link registry is enabled but its SQLite store is dead.
+
+    Raised when the registry is enabled (``registry.enabled=true``) and its
+    database cannot be opened (connect/migration failure) or a database-class
+    error occurs mid-run (corruption, disk image malformed, etc.).  The
+    program MUST NOT continue operating — the pipeline crashes loudly with a
+    nonzero exit code (Д14, 2026-10-22, OPEN-5 resolution).
+
+    Transient ``sqlite3.OperationalError`` with busy/locked messages is NOT
+    fatal — those keep the existing degrade-and-retry behaviour.
+    """

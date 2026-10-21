@@ -129,19 +129,31 @@ The system SHALL journal every run in a `runs` table: `run_id`, `started_at`, `f
 - **WHEN** at least one registry write operation failed during a run
 - **THEN** that run's journal entry carries a degraded marker distinguishing it from clean runs
 
-### Requirement: Fail-open degradation
+### Requirement: Fail-closed liveness (Д14, 2026-10-22)
 
-Any error in registry operations (open, write, flush, migrate) SHALL NOT interrupt harvesting: the system SHALL log a warning, continue operating as if the registry were disabled for the remainder of the run, and mark the run degraded. No registry failure SHALL ever raise into stage worker loops.
+When the registry is enabled (`registry.enabled=true`) and its SQLite store is dead (open failure or database-class error), the program SHALL terminate loudly with a nonzero exit code and SHALL NOT continue operating in a degraded state. Transient busy/locked errors (`database is locked`, `database is busy`, `[SQLITE_BUSY]`, `[SQLITE_LOCKED]`) are NOT fatal and keep the existing degrade-and-retry behaviour. When the registry is disabled, the module is a complete no-op (no exceptions raised).
 
-#### Scenario: Corrupt database does not stop the pipeline
+Auxiliary read-side fail-open (gather_skip, key_ledger, priority) is unchanged in this slice — the central fatal path crashes the run; read-side consumers continue to degrade gracefully.
+
+#### Scenario: Corrupt database terminates the run
 
 - **WHEN** the registry file is corrupt or unreadable at startup and `registry.enabled=true`
-- **THEN** the harvester logs a warning, completes the run normally, and produces the same shards as with the registry disabled
+- **THEN** the system raises `RegistryUnavailableError`, logs a CRITICAL message naming the database path and cause, and exits with a nonzero code
 
-#### Scenario: Mid-run write failure degrades silently
+#### Scenario: Mid-run database-class error aborts via liveness poll
 
-- **WHEN** a batch upsert fails mid-run (e.g., disk full)
-- **THEN** subsequent registry writes are suppressed for this run, harvesting continues unaffected, and the run is marked degraded
+- **WHEN** a database-class error (e.g., `database disk image is malformed`) occurs mid-run
+- **THEN** the periodic liveness poll detects the fatal state via `check_alive()` and triggers graceful shutdown with a CRITICAL log and nonzero exit
+
+#### Scenario: Transient busy/locked does not terminate
+
+- **WHEN** a transient `sqlite3.OperationalError` with message matching `database is locked` or `database is busy` occurs
+- **THEN** the existing degrade-and-retry behaviour applies; `check_alive()` does NOT raise
+
+#### Scenario: Disabled registry is a no-op
+
+- **WHEN** `registry.enabled=false`
+- **THEN** no registry file is opened, no exceptions are raised, and pipeline behaviour is identical to the pre-registry implementation
 
 ### Requirement: Durability and shutdown flush
 
