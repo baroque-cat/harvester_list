@@ -117,6 +117,9 @@ class ConfigValidator:
         # Validate persistence/snapshot configuration
         self._validate_persistence_config(config)
 
+        # Validate failure-handling mode coupling (NEW-1: shadow + registry-write hazard)
+        self._validate_failure_handling_coupling(config)
+
         # Surface non-fatal configuration warnings.
         if self.warnings:
             for warning in self.warnings:
@@ -819,3 +822,31 @@ class ConfigValidator:
 
         if int(persistence.snapshot_final_max_bytes) <= 0:
             self.errors.append("persistence.snapshot_final_max_bytes must be positive")
+
+    def _validate_failure_handling_coupling(self, config: Config) -> None:
+        """Validate failure-handling mode coupling with registry-write surface (NEW-1).
+
+        The shadow mode combined with registry-write (skip_known != off) creates
+        a latent poisoning hazard: swallowed TransientFetchErrors write sticky
+        gathered_ok status that suppresses re-gathering for 168 hours.  This is
+        a WARNING (advisory), not an error — the config still loads, but the
+        operator is alerted to the hazard.
+
+        Traceability: NEW-1 (02_critical_fixes.md), failure-handling spec §1.4 delta.
+        """
+        mode = config.pipeline.failure_handling
+        skip_mode = config.skip.skip_known
+
+        # The hazard exists only when:
+        # 1. failure_handling=shadow (swallows transients without raising)
+        # 2. skip_known != off (registry writes are active consumers)
+        # 3. registry is enabled (the poisoning surface exists)
+        if mode == "shadow" and skip_mode != "off" and config.registry.enabled:
+            self.warnings.append(
+                f"failure_handling=shadow combined with skip.skip_known={skip_mode} "
+                "creates a sticky gathered_ok poisoning hazard: swallowed TransientFetchErrors "
+                "write visit_status='gathered_ok' to the registry, which suppresses re-gathering "
+                "for 168 hours via skip_known and is never downgraded by the sticky SQL CASE. "
+                "Consider failure_handling=strict (records 'failed' on transient errors) or "
+                "skip.skip_known=off (no registry-write consumer) to avoid the hazard."
+            )

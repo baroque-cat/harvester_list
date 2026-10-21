@@ -644,6 +644,10 @@ class AcquisitionStage(BasePipelineStage):
     def _acquisition_worker(self, task: AcquisitionTask) -> Optional[StageOutput]:
         """Pure functional acquisition worker implementation"""
         mode = self._failure_handling_mode()
+        # NEW-1: flag to suppress durable writes when shadow swallows a transient.
+        # The in-memory outcome stays pre-change (empty success), but we must NOT
+        # write sticky gathered_ok to the registry (shadow poisoning hazard).
+        shadow_swallowed = False
         try:
             # Conditional re-gather (design D6): look up the stored etag and
             # pass it only when the link is already gathered_ok and the token's
@@ -689,6 +693,9 @@ class AcquisitionStage(BasePipelineStage):
                 # shadow additionally counts and logs the failure-empty.
                 if mode == "shadow":
                     self._detect_failure_empty(task, e)
+                    # NEW-1: shadow swallowed the transient — suppress durable
+                    # writes to prevent sticky gathered_ok poisoning.
+                    shadow_swallowed = True
                 services = []
 
             # add-file-commit-dating D6: a 304 means unchanged content.  Skip
@@ -799,12 +806,16 @@ class AcquisitionStage(BasePipelineStage):
                             )
 
             # Write-only hook: record successful gather + coverage (owner only).
-            self._record_gathered(
-                task, success=True,
-                etag=returned_etag, etag_transport=returned_etag_transport,
-            )
-            # R7 D5: coverage rows for non-owner beneficiaries.
-            self._record_shared_coverage(task, beneficiaries)
+            # NEW-1: suppress durable writes when shadow swallowed a transient —
+            # the in-memory outcome is preserved (empty success), but writing
+            # sticky gathered_ok would poison the registry for 168h.
+            if not shadow_swallowed:
+                self._record_gathered(
+                    task, success=True,
+                    etag=returned_etag, etag_transport=returned_etag_transport,
+                )
+                # R7 D5: coverage rows for non-owner beneficiaries.
+                self._record_shared_coverage(task, beneficiaries)
 
             return output
 

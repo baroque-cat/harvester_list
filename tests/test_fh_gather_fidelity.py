@@ -203,3 +203,53 @@ def test_s21_deferred_gather_writes_no_registry_outcome(workspace, monkeypatch):
         assert coverage[0][0] == 0
     finally:
         registry.stop()
+
+
+# ---------------------------------------------------------------------------
+# NEW-1: shadow-swallowed transient must NOT write gathered_ok / coverage
+# ---------------------------------------------------------------------------
+def test_new1_shadow_swallow_does_not_write_gathered_ok(workspace, monkeypatch):
+    """WHEN failure_handling=shadow AND a TransientFetchError is swallowed by
+    the shadow branch (legacy-style empty success) THEN no durable gathered_ok
+    is written to the registry and no coverage row is fanned out — the
+    in-memory outcome stays pre-change (services=[], task completed, no raise).
+
+    Traceability: NEW-1 (02_critical_fixes.md), failure-handling spec §1.4 delta.
+    """
+    def dead_network(url="", retries=3, interval=1.0, **kwargs):
+        raise ConnectionError("HTTP 503 error: upstream gone")
+
+    monkeypatch.setattr(search_client, "fetch_gather_content", dead_network)
+    registry = _registry(workspace)
+    try:
+        stage = _stage(workspace, registry, mode="shadow")
+
+        # Shadow mode: the transient is swallowed, task completes normally
+        # (no raise), but the durable writes must NOT happen.
+        result = stage.process_task(_task())
+
+        # In-memory outcome is preserved (pre-change behavior):
+        # result is not None (task was "processed"), but services is empty.
+        assert result is not None, "shadow must preserve the success-path outcome"
+
+        registry.flush(10.0)
+        digest = patterns_hash(key_pattern=KEY_PATTERN)
+
+        # The registry must NOT contain gathered_ok for this URL — the shadow
+        # swallow must not poison the sticky status.
+        status = _rows(workspace, "SELECT visit_status FROM links WHERE url_hash=?", (url_hash(URL),))
+        assert status == [], (
+            f"shadow-swallowed transient must NOT write any visit_status, got: {status}"
+        )
+
+        # No coverage row either.
+        coverage = _rows(
+            workspace,
+            "SELECT COUNT(*) FROM link_coverage WHERE url_hash=? AND provider=? AND patterns_hash=?",
+            (url_hash(URL), PROVIDER, digest),
+        )
+        assert coverage[0][0] == 0, (
+            "shadow-swallowed transient must NOT write coverage rows"
+        )
+    finally:
+        registry.stop()

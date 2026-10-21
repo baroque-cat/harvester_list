@@ -95,6 +95,10 @@ When the provider-side rate-limit bucket cannot be acquired even after the sched
 ### Requirement: Tri-mode rollout flag
 The failure-handling contract SHALL be governed by a configuration flag with three modes: `legacy` (behavior byte-equivalent to the pre-change system, with the new detection counters inert — present but zero, never incremented — the pure rollback state), `shadow` (failure-empties detected, counted and logged with stage/provider/task context, while task outcomes remain exactly as in legacy), and `strict` (full enforcement of propagation, requeue and fidelity requirements above). Default at release: `shadow`. Switching modes SHALL require only a configuration change, never code removal.
 
+#### Scenario: Shadow mode does not poison durable registry state
+- **WHEN** the pipeline runs under `failure_handling: shadow` against injected transient failures
+- **THEN** every failure-empty increments `failure_empties_detected` for its stage and emits a contextual log line, the affected tasks complete exactly as they would in legacy mode (in-memory outcome preserved: services=[], task processed, no raise), **but no durable `visit_status='gathered_ok'` is written to the registry and no `link_coverage` row is fanned out** — the shadow swallow MUST NOT poison the sticky registry state that would suppress re-gathering for 168 hours via skip_known
+
 #### Scenario: Legacy mode is indistinguishable from pre-change behavior
 - **WHEN** the pipeline runs under `failure_handling: legacy` against injected transient failures
 - **THEN** task outcomes, statistics and logs match the pre-change behavior, and the new detection counters do not operate
@@ -110,6 +114,10 @@ The failure-handling contract SHALL be governed by a configuration flag with thr
 #### Scenario: Rollback is a config flip
 - **WHEN** an operator switches the flag from `strict` to `legacy` and restarts
 - **THEN** the system exhibits legacy behavior with no code change and no data migration
+
+#### Scenario: Validator warns on shadow + registry-write coupling
+- **WHEN** the configuration specifies `failure_handling: shadow` AND `skip.skip_known != "off"` AND `registry.enabled = true`
+- **THEN** the configuration validator emits a WARNING (not an error — config still loads) naming the sticky gathered_ok poisoning hazard: swallowed TransientFetchErrors write `visit_status='gathered_ok'` to the registry, which suppresses re-gathering for 168 hours via skip_known and is never downgraded by the sticky SQL CASE. The warning recommends `failure_handling=strict` (records 'failed' on transient errors) or `skip.skip_known=off` (no registry-write consumer) to avoid the hazard. No warning is emitted for `failure_handling=strict` (records 'failed', not 'gathered_ok'), `skip.skip_known=off` (no registry-write consumer), or `failure_handling=legacy` (explicit rollback, operator acknowledged the risk)
 
 ### Requirement: Failure observability counters
 The system SHALL expose per-stage counters: `failure_empties_detected` (shadow and strict modes), `tasks_requeued`, and `tasks_dropped_max_retries`, surfaced through the existing status/metrics structures without registry-schema or shard-format changes.

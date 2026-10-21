@@ -46,6 +46,13 @@ pipeline:
   #   strict: propagate failures into the bounded-requeue path; failed gathers record
   #           visit_status='failed' (no false gathered_ok); exhausted retries drop loudly
   # Promotion shadow -> strict is a config flip; rollback is a flip back to legacy.
+  #
+  # WARNING (NEW-1): shadow + skip.skip_known != "off" + registry.enabled = true creates
+  # a sticky gathered_ok poisoning hazard: swallowed TransientFetchErrors write
+  # visit_status='gathered_ok' to the registry, which suppresses re-gathering for 168h
+  # via skip_known and is never downgraded by the sticky SQL CASE. The validator emits
+  # a WARNING for this coupling. Consider strict mode (records 'failed' on transient
+  # errors) or skip_known=off (no registry-write consumer) to avoid the hazard.
   failure_handling: "shadow" # legacy | shadow | strict
 
 # System monitoring configuration
