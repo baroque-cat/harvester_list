@@ -405,8 +405,10 @@ queue:
   # before the periodic sweep returns it to pending (> 0)
   visibility_timeout_s: 300
   # Startup/legacy-import age gate in hours; older rows are purged loudly at
-  # startup and aged snapshots are parked, never imported (> 0)
-  max_age_hours: 24
+  # startup and aged snapshots are parked, never imported (> 0).
+  # C1: raised from 24 to 720 (30 days) — every restart at 24h wiped 430–690k
+  # deferred backlog rows; 720h covers the wave horizon.  Rollback = revert number.
+  max_age_hours: 720
   # Durable dedup (P20): suppress fresh (attempts==0) tasks whose dedup_id is
   # already PENDING, and collapse legacy duplicates at startup keeping MIN(seq).
   # Measured price removed: +12 224 rows and +6 537 216 bytes per restart

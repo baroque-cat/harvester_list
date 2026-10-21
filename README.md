@@ -1646,7 +1646,7 @@ enqueue loss structurally impossible.
 queue:
   backend: "memory"          # memory | sqlite
   visibility_timeout_s: 300  # sqlite: reclaim a claim after this many seconds
-  max_age_hours: 24          # startup/import age gate
+  max_age_hours: 720         # startup/import age gate (C1: raised from 24 to 720h = 30 days)
   durable_dedup: true        # sqlite: suppress fresh duplicates already PENDING
 ```
 
@@ -1720,7 +1720,9 @@ dropped by a runtime storage write error is always logged and counted in
 `StageMetrics.tasks_dropped_backend_errors` — never silent.
 
 **Operations.** `max_age_hours` purges rows older than the gate at startup with a
-loud WARNING stating the count; `visibility_timeout_s` bounds how long a stuck
+loud WARNING stating the count; the gate was raised from 24 to 720 hours (30 days,
+C1) so that restarts no longer wipe the deferred backlog accumulated during a
+wave.  `visibility_timeout_s` bounds how long a stuck
 worker's claim stays invisible. On a first `sqlite` start any legacy
 `{stage}_queue.json` snapshot is imported **once** (both envelope formats, within
 the age gate) into the store and renamed `*.imported-<ts>`; an aged snapshot is
