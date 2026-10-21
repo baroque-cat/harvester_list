@@ -603,3 +603,81 @@ def test_c10_unknown_persistence_key_warns(caplog):
     # Verify config still loaded successfully with defaults
     assert cfg.batch_size == 50
     assert cfg.snapshot_interval_s == 3600  # Default, not the unknown key
+
+
+# ---------------------------------------------------------------------------
+# C11/C12 — L3 gate finding (L3-F1): snapshot_keep_last_n dead at runtime.
+# Production paths (periodic _periodic_loop → build_all_snapshots(), final
+# stop-time build → ResultManager.build_all_snapshots()) call the builder
+# WITHOUT arguments; SnapshotManager defaults keep_last_n=0 ("keep all") and
+# never receives the configured value.  Pin C3 passes only because it feeds
+# keep_last_n explicitly.  Expected RED at creation (before wiring fix):
+# - C11: 4 no-arg builds leave 4 generations on disk (rotation never applied)
+# - C12: SnapshotManager has no keep_last_n attribute (AttributeError)
+# ---------------------------------------------------------------------------
+
+
+def _l3f1_manager(tmpdir, **overrides):
+    from storage.persistence import MultiResultManager
+
+    provider = MagicMock()
+    provider.name = "test_provider"
+    provider.result.folder = "test"
+    provider.result.filenames = {
+        "links": "links.ndjson",
+        "material": "material.ndjson",
+        "invalid": "invalid.ndjson",
+    }
+    kwargs = dict(
+        workspace=tmpdir,
+        providers={"test_provider": provider},
+        batch_size=50,
+        save_interval=30.0,
+        simple=False,
+        shutdown_timeout=5.0,
+        snapshots_enabled=True,
+        snapshot_interval_s=3600,
+        snapshot_keep_last_n=2,
+        snapshot_final_max_bytes=2_000_000_000,
+    )
+    kwargs.update(overrides)
+    return MultiResultManager(**kwargs)
+
+
+def test_c11_configured_rotation_applies_on_noarg_prod_path():
+    """WHEN snapshot_keep_last_n=2 is configured and the PRODUCTION no-arg
+    build path runs 4 times (ResultManager.build_all_snapshots(), the exact
+    call used by periodic loop and stop-time final build)
+    THEN at most 2 generations remain on disk per result type."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _l3f1_manager(tmpdir)
+        rm = mgr.get_manager("test_provider")
+        rm.add_result("links", [{"url": "https://example.com/1"}])
+        rm.flush_all()
+
+        for _ in range(4):
+            rm.build_all_snapshots()  # production call: NO explicit keep_last_n
+            time.sleep(0.01)
+
+        snap_dir = os.path.join(tmpdir, "providers", "test", "snapshots")
+        gens = [f for f in os.listdir(snap_dir) if f.startswith("links.json.")]
+        assert gens, "generations should exist"
+        assert len(gens) <= 2, (
+            f"configured keep_last_n=2 must rotate on the no-arg prod path, "
+            f"got {len(gens)} generations: {sorted(gens)}"
+        )
+
+
+def test_c12_snapshot_manager_receives_configured_keep_last_n():
+    """WHEN MultiResultManager is constructed with snapshot_keep_last_n=2
+    THEN each lazily created SnapshotManager carries that value (wiring pin:
+    auto-start periodic path must rotate without explicit per-call args)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _l3f1_manager(tmpdir)
+        rm = mgr.get_manager("test_provider")
+        assert rm.snapshot_manager is not None
+        assert getattr(rm.snapshot_manager, "keep_last_n", None) == 2, (
+            "SnapshotManager must be constructed with the configured "
+            "snapshot_keep_last_n (found: "
+            f"{getattr(rm.snapshot_manager, 'keep_last_n', '<missing>')})"
+        )

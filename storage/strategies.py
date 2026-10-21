@@ -209,17 +209,20 @@ class SnapshotManager:
     - Rotation removes old generations keeping only last N
     """
 
-    def __init__(self, directory: str, result_types: List[str], provider_name: str):
+    def __init__(self, directory: str, result_types: List[str], provider_name: str, keep_last_n: int = 0):
         """Initialize snapshot manager.
 
         Args:
             directory: Base directory containing shards
             result_types: List of result types to manage
             provider_name: Name of the provider for logging
+            keep_last_n: Configured rotation default for no-arg builds
+                (0 = keep all; explicit per-call arguments override)
         """
         self.directory = directory
         self.result_types = result_types
         self.provider_name = provider_name
+        self.keep_last_n = keep_last_n
 
         # Thread management
         self._periodic_thread: Optional[threading.Thread] = None
@@ -392,11 +395,18 @@ class SnapshotManager:
         """Build snapshots for all result types and increment generation.
 
         Args:
-            keep_last_n: Rotation parameter - keep last N generations (0 = keep all)
+            keep_last_n: Rotation parameter - keep last N generations
+                (0 or negative = fall back to the configured instance default,
+                which is 0 "keep all" unless injected from snapshot_keep_last_n)
 
         Returns:
             Dictionary mapping result types to record counts
         """
+        # L3-F1 fix: production paths (periodic loop, stop-time final build)
+        # call this method without arguments; resolve the configured rotation
+        # so snapshot_keep_last_n is honored outside unit-test call sites.
+        if keep_last_n <= 0:
+            keep_last_n = self.keep_last_n
         results = {}
         
         # Build snapshots for all types

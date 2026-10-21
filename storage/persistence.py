@@ -98,6 +98,7 @@ class ResultManager:
         shutdown_timeout: float = 5.0,
         snapshots_enabled: bool = False,
         snapshot_final_max_bytes: int = 2_000_000_000,
+        snapshot_keep_last_n: int = 0,
     ):
         self.name = provider.name
         self.provider = provider
@@ -107,6 +108,7 @@ class ResultManager:
         self.shutdown_timeout = float(max(1.0, shutdown_timeout))
         self.snapshots_enabled = snapshots_enabled
         self.snapshot_final_max_bytes = snapshot_final_max_bytes
+        self.snapshot_keep_last_n = snapshot_keep_last_n
 
         # Create provider directory
         self.directory = os.path.join(workspace, "providers", self.provider.result.folder)
@@ -128,7 +130,9 @@ class ResultManager:
             self.strategy = ShardStrategy(self.directory, self.files)
             # Create snapshot manager for non-summary result types
             result_types = [rt for rt in self.files.keys() if rt != "summary"]
-            self.snapshot_manager = SnapshotManager(self.directory, result_types, self.name)
+            self.snapshot_manager = SnapshotManager(
+                self.directory, result_types, self.name, keep_last_n=snapshot_keep_last_n
+            )
 
         # Result buffers
         self.buffers = {
@@ -497,7 +501,8 @@ class ResultManager:
         """Build snapshots for all result types."""
         if not self.snapshot_manager:
             return {}
-        # Note: keep_last_n is managed at the MultiResultManager level
+        # Note: configured keep_last_n is injected via the SnapshotManager
+        # constructor (L3-F1 fix); explicit per-call arguments still override.
         return self.snapshot_manager.build_all_snapshots()
 
     def _deserialize_service(self, line: str) -> Optional[Service]:
@@ -700,6 +705,7 @@ class MultiResultManager:
                     shutdown_timeout=self.shutdown_timeout,
                     snapshots_enabled=self.snapshots_enabled,
                     snapshot_final_max_bytes=self.snapshot_final_max_bytes,
+                    snapshot_keep_last_n=self.snapshot_keep_last_n,
                 )
                 # Auto-start periodic snapshots if enabled (starter-ordering fix)
                 if self.snapshots_enabled and not self.simple and self.managers[name].snapshot_manager:
