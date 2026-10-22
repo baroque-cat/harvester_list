@@ -187,3 +187,42 @@ The system SHALL provide a migration tool that populates the registry from exist
 
 - **WHEN** the registry already contains a link with `visit_status='gathered_ok'` and the migration processes an older shard mentioning the same URL
 - **THEN** the existing row keeps its `gathered_ok` status and `gathered_ts`
+
+### Requirement: Wire coverage accounting (schema v7)
+
+The system SHALL maintain a `wire_coverage` table (schema version 7, additive migration from v6) recording which pages of each wire query have been fetched. Identity is `(wire_fp, patterns_hash)` where `wire_fp = sha256("<api|web>|<wire_query>")` (the same fingerprint used by the refine governor). The table SHALL track a gap-safe bitmap of completed pages and a contiguity watermark (`pages_done`) so that later probes can decide whether a bucket is fully covered without being fooled by holes or out-of-order completions.
+
+#### Scenario: Schema contract on fresh bootstrap
+
+- **WHEN** the registry is enabled and bootstraps a new database
+- **THEN** the `wire_coverage` table exists with columns `(wire_fp, patterns_hash, total_count, pages_bitmap, pages_done, pages_needed, results, first_ts, last_ts)`, primary key `(wire_fp, patterns_hash)`, index `idx_wire_coverage_ts`, and `PRAGMA user_version = 7`
+
+#### Scenario: Page-1 seam writes totals and needed
+
+- **WHEN** the search stage processes a first page with `total=950`, `per_page=100`, and 100 results
+- **THEN** a `wire_coverage` row is written with `total_count=950`, `pages_needed=10`, `pages_bitmap` having bit 0 set, `pages_done=1`, and `results=100`
+
+#### Scenario: Bitmap OR and contiguity watermark
+
+- **WHEN** pages are recorded out of order (page 1, then page 5)
+- **THEN** `pages_bitmap` has bits {0, 4} set and `pages_done=1` (only page 1 is contiguous from bit 0); after pages 2, 3, 4 are recorded, `pages_done=5`
+
+#### Scenario: Duplicate page idempotence
+
+- **WHEN** page 3 is recorded twice
+- **THEN** the watermark does not advance on the second recording and `results` is incremented only once (the CASE-guard dedup ensures retries do not double-count)
+
+#### Scenario: Out-of-order safety
+
+- **WHEN** pages 1-4 and 6 are recorded but page 5 is missing
+- **THEN** `pages_done=4 < pages_needed=6` (the hole prevents the watermark from advancing past it)
+
+#### Scenario: Bit-64 clamp insurance
+
+- **WHEN** a page number exceeds 63
+- **THEN** the bit is clamped to bit 62 (SQLite signed 64-bit safe) without crashing; the watermark behavior is sane (bit 0 not set → `pages_done=0`)
+
+#### Scenario: Disabled no-op
+
+- **WHEN** the registry is disabled (`enabled=false`)
+- **THEN** `record_wire_page` does nothing, raises nothing, and no database file is created

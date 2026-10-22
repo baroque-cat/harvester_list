@@ -74,7 +74,7 @@ def _is_fatal_db_error(exc: BaseException) -> bool:
     return True
 
 # Bump when the schema changes; later changes may only ADD columns/tables.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 REGISTRY_FILENAME = "registry.sqlite"
 
 # Operations understood by the writer thread.
@@ -93,6 +93,7 @@ _OP_FILE_UPSERT = "file_upsert"
 _OP_FILE_TOUCH = "file_touch"
 _OP_FILE_GONE = "file_gone"
 _OP_FILE_LINKS = "file_links"
+_OP_WIRE_COVERAGE = "wire_coverage"
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS links(
@@ -206,6 +207,27 @@ CREATE VIEW IF NOT EXISTS key_sources_dated AS
 SELECT ks.key_hash, ks.url_hash, l.url, l.owner, l.repo, l.path,
        l.file_commit_date, l.visit_status, ks.first_seen_ts, ks.last_seen_ts
 FROM key_sources ks JOIN links l ON l.url_hash = ks.url_hash;
+
+-- Wire-level coverage accounting (slice 3a.1, D-03.1 / F-01).  Tracks which
+-- pages of each wire query have been fetched so the probe can decide whether
+-- a bucket is fully covered.  pages_done is a contiguity watermark derived
+-- from pages_bitmap: the number of trailing contiguous set bits from bit 0.
+CREATE TABLE IF NOT EXISTS wire_coverage(
+  wire_fp      TEXT NOT NULL,
+  patterns_hash TEXT NOT NULL,
+  total_count  INTEGER,
+  pages_bitmap INTEGER DEFAULT 0,
+  pages_done   INTEGER DEFAULT 0,
+  pages_needed INTEGER,
+  results      INTEGER DEFAULT 0,
+  first_ts     REAL, last_ts REAL,
+  PRIMARY KEY (wire_fp, patterns_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_wire_coverage_ts ON wire_coverage(last_ts);
+
+-- Pre-registered index for 3a.3 SQL-recovery (D-03.4): supports the
+-- streaming ORDER BY last_seen_ts DESC query on links with visit_status filter.
+CREATE INDEX IF NOT EXISTS idx_links_visit_status ON links(visit_status, last_seen_ts DESC);
 """
 
 _DISCOVER_SQL = """
@@ -407,6 +429,27 @@ UPDATE links SET
 WHERE owner = ? AND repo = ? AND path = ?
 """
 
+# Wire-coverage page upsert (slice 3a.1, D-03.1 / F-01).
+# Parameters: wire_fp, patterns_hash, total_count, new_bitmap, pages_done,
+#             pages_needed, results_addend, ts.
+# The bitmap is OR-ed monotonically; results_addend is precomputed by the
+# caller as n_results when the bit was not previously set, 0 otherwise
+# (CASE-guard dedup so retries do not double-count).  pages_done is the
+# contiguity watermark of the new bitmap, precomputed in Python.
+_WIRE_COVERAGE_SQL = """
+INSERT INTO wire_coverage (wire_fp, patterns_hash, total_count, pages_bitmap,
+                           pages_done, pages_needed, results, first_ts, last_ts)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(wire_fp, patterns_hash) DO UPDATE SET
+  total_count = COALESCE(excluded.total_count, wire_coverage.total_count),
+  pages_bitmap = wire_coverage.pages_bitmap | excluded.pages_bitmap,
+  pages_done = excluded.pages_done,
+  pages_needed = COALESCE(excluded.pages_needed, wire_coverage.pages_needed),
+  results = wire_coverage.results + excluded.results,
+  last_ts = excluded.last_ts,
+  first_ts = COALESCE(wire_coverage.first_ts, excluded.first_ts)
+"""
+
 _RUN_UPSERT_SQL = """
 INSERT INTO runs (run_id, started_at, finished_at, config_digest, degraded)
 VALUES (?, ?, ?, ?, ?)
@@ -422,6 +465,35 @@ def bootstrap_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_DDL)
     _migrate_schema(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _contiguity_watermark(bitmap: int) -> int:
+    """Compute the contiguity watermark: number of trailing contiguous set bits
+    from bit 0.  E.g. bitmap=0b11111 → 5, bitmap=0b10111 → 3, bitmap=0 → 0.
+
+    This is the F-01 gap-safe ``pages_done`` value: it only advances when all
+    pages from 1 through N are present, so a hole at any position prevents
+    the watermark from jumping past it.
+    """
+    k = 0
+    while bitmap & (1 << k):
+        k += 1
+    return k
+
+
+def _page_bit(page: int) -> int:
+    """Return the bitmap bit for a 1-based page number.
+
+    Pages beyond 63 are clamped to bit 62 (the highest safe bit of a 64-bit
+    signed integer; SQLite INTEGER max is 2^63-1).  API_MAX_PAGES=10 makes
+    this unreachable in practice; the clamp is insurance against unexpected
+    inputs.
+    """
+    if page < 1:
+        return 0
+    if page > 63:
+        return 1 << 62
+    return 1 << (page - 1)
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
@@ -466,6 +538,33 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('key_sources_backfill', ?)",
             (f"{inserted}@{time.time()}",)
         )
+
+    # schema_version < 7 (slice 3a.1, D-03.1): create wire_coverage table and
+    # idx_links_visit_status index.  Both are CREATE IF NOT EXISTS so the
+    # migration is idempotent and additive.  The wire_coverage table and the
+    # links visit-status index are pre-registered in one migration step to
+    # avoid a future v8 bump (D-03.4 names the index; 03 §D-03.1 «одной
+    # аддитивной миграцией»).
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS wire_coverage("
+        "  wire_fp      TEXT NOT NULL,"
+        "  patterns_hash TEXT NOT NULL,"
+        "  total_count  INTEGER,"
+        "  pages_bitmap INTEGER DEFAULT 0,"
+        "  pages_done   INTEGER DEFAULT 0,"
+        "  pages_needed INTEGER,"
+        "  results      INTEGER DEFAULT 0,"
+        "  first_ts     REAL, last_ts REAL,"
+        "  PRIMARY KEY (wire_fp, patterns_hash)"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wire_coverage_ts ON wire_coverage(last_ts)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_links_visit_status "
+        "ON links(visit_status, last_seen_ts DESC)"
+    )
 
 
 def canonical_url(url: str) -> str:
@@ -1097,6 +1196,52 @@ class Registry:
                 },
             )
 
+    def record_wire_page(
+        self,
+        *,
+        query: str,
+        use_api: bool,
+        patterns_hash_value: str,
+        page: int,
+        page_size: int,
+        total: Optional[int],
+        n_results: int,
+        pages_needed: Optional[int] = None,
+    ) -> None:
+        """Record one fetched page of a wire query in the wire_coverage table.
+
+        Builds ``wire_fp`` via the reused :func:`search.querykey.fingerprint`
+        so probes match later.  The UPSERT OR-s the bitmap monotonically,
+        recomputes the contiguity watermark, and increments ``results`` only
+        when the page bit was not previously set (dedup so retries do not
+        double-count).
+
+        ``pages_needed`` is passed explicitly from the seam (page-1 knows it
+        from ``ceil(total/page_size)`` clamped to the transport max; page-N
+        passes None and COALESCE preserves the page-1 value).
+        """
+        if not self.enabled or not self._available or self._suppress_writes:
+            return
+
+        from search.querykey import fingerprint
+
+        wire_fp = fingerprint(query, use_api)
+        bit = _page_bit(page)
+        moment = time.time()
+
+        self._enqueue(
+            _OP_WIRE_COVERAGE,
+            {
+                "wire_fp": wire_fp,
+                "patterns_hash": patterns_hash_value or "",
+                "total_count": total,
+                "bit": bit,
+                "n_results": n_results,
+                "ts": moment,
+                "pages_needed": pages_needed,
+            },
+        )
+
     # ------------------------------------------------------------------
     # Run journaling (low frequency, written synchronously)
     # ------------------------------------------------------------------
@@ -1305,6 +1450,7 @@ class Registry:
         file_touches = [payload for op, payload in batch if op == _OP_FILE_TOUCH]
         file_gones = [payload for op, payload in batch if op == _OP_FILE_GONE]
         file_links = [payload for op, payload in batch if op == _OP_FILE_LINKS]
+        wire_coverages = [payload for op, payload in batch if op == _OP_WIRE_COVERAGE]
 
         with self._write_lock:
             conn = self._conn
@@ -1354,6 +1500,39 @@ class Registry:
                 conn.executemany(_FILE_GONE_SQL, [self._file_gone_row(payload) for payload in file_gones])
             if file_links:
                 conn.executemany(_FILE_LINKS_SQL, [self._file_links_row(payload) for payload in file_links])
+
+            # Wire-coverage page upserts (slice 3a.1, F-01).  Each payload
+            # carries a single bit; we read the current bitmap to compute the
+            # contiguity watermark and the results dedup (increment only when
+            # the bit was not previously set).
+            if wire_coverages:
+                for payload in wire_coverages:
+                    wire_fp = payload["wire_fp"]
+                    ph = payload["patterns_hash"]
+                    bit = payload["bit"]
+                    n_results = payload["n_results"]
+                    ts = payload["ts"]
+                    total_count = payload["total_count"]
+                    pages_needed = payload["pages_needed"]
+
+                    # Read current bitmap to compute watermark + dedup.
+                    row = conn.execute(
+                        "SELECT pages_bitmap FROM wire_coverage "
+                        "WHERE wire_fp = ? AND patterns_hash = ?",
+                        (wire_fp, ph),
+                    ).fetchone()
+                    old_bitmap = row[0] if row else 0
+                    new_bitmap = old_bitmap | bit
+                    watermark = _contiguity_watermark(new_bitmap)
+                    results_addend = n_results if (old_bitmap & bit) == 0 else 0
+
+                    conn.execute(
+                        _WIRE_COVERAGE_SQL,
+                        (
+                            wire_fp, ph, total_count, bit, watermark,
+                            pages_needed, results_addend, ts, ts,
+                        ),
+                    )
 
             # Priority denormalization (add-target-prioritization D3): evidence
             # changes mark their owning repositories dirty; the same transaction

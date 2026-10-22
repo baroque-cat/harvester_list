@@ -32,7 +32,7 @@ from core.models import (
 from core.types import IProvider
 from search import client
 from search.github.refine.engine import RefineEngine
-from search.querykey import wire_query
+from search.querykey import wire_query, fingerprint
 from storage.key_ledger import KeyCheckRequest, key_hash, mask_key
 from storage.registry import patterns_hash, url_hash
 from tools.logger import get_logger
@@ -237,8 +237,12 @@ class SearchStage(BasePipelineStage):
             # generation (the detector is inert for web at code level).
             if task.page == 1 and total > 0:
                 self._handle_first_page_results(task, results or [], total, output)
+                # Wire-coverage recording: page-1 seam (D-03.1, slice 3a.1).
+                self._record_wire_coverage(task, results or [], total=total)
             elif task.page > 1:
                 self._handle_page_results(task, results or [], output)
+                # Wire-coverage recording: page-N seam (D-03.1, slice 3a.1).
+                self._record_wire_coverage(task, results or [], total=None)
 
             logger.info(
                 f"[{self.name}] search completed for {task.provider}: {len(results) if results else 0} links, {len(keys)} keys"
@@ -289,6 +293,44 @@ class SearchStage(BasePipelineStage):
                 )
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(f"[{self.name}] registry discovery hook failed: {e}")
+
+    def _record_wire_coverage(
+        self, task: SearchTask, results: List[str], total: Optional[int],
+    ) -> None:
+        """Write-only hook: record one fetched page in wire_coverage (D-03.1).
+
+        Coverage is about WIRE pages fetched, not refine admission outcome.
+        Called at both the page-1 seam (total known) and the page-N seam
+        (total=None; COALESCE preserves the page-1 value).
+        """
+        registry = getattr(self.resources, "registry", None)
+        if registry is None:
+            return
+        try:
+            per_page = API_RESULTS_PER_PAGE if task.use_api else WEB_RESULTS_PER_PAGE
+            max_pages = API_MAX_PAGES if task.use_api else WEB_MAX_PAGES
+            ph = patterns_hash(
+                key_pattern=task.regex,
+                address_pattern=task.address_pattern,
+                endpoint_pattern=task.endpoint_pattern,
+                model_pattern=task.model_pattern,
+            )
+            if total is not None and total > 0:
+                pages_needed = min(math.ceil(total / per_page), max_pages)
+            else:
+                pages_needed = None
+            registry.record_wire_page(
+                query=task.query,
+                use_api=task.use_api,
+                patterns_hash_value=ph,
+                page=task.page,
+                page_size=per_page,
+                total=total,
+                n_results=len(results),
+                pages_needed=pages_needed,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"[{self.name}] registry wire_coverage hook failed: {e}")
 
     def _gather_skip_map(self, task: SearchTask, links: List[str], patterns: Patterns) -> Dict[str, Any]:
         """Compute the gather-skip decision map for one result page (fail-open).

@@ -9,7 +9,7 @@
 
 ## 3a. Wire-покрытие в реестре + восстановление из SQL
 
-### D-03.1 Таблица `wire_coverage` (SCHEMA_VERSION 6 → 7, аддитивно)
+### D-03.1 Таблица `wire_coverage` (SCHEMA_VERSION 6 → 7, аддитивно) — ИСПОЛНЕН срез 3a.1 (suite 842→852, 2026-10-22)
 
 ```sql
 CREATE TABLE IF NOT EXISTS wire_coverage(

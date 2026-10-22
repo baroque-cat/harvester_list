@@ -318,7 +318,7 @@ def test_p22_t6_v5_to_v6_migration(workspace):
     registry.stop()
 
     # Schema version is now 6
-    assert _db_scalar(workspace, "PRAGMA user_version") == 6
+    assert _db_scalar(workspace, "PRAGMA user_version") == 7
 
     # key_sources table exists
     tables = {row["name"] for row in _db_rows(workspace, "SELECT name FROM sqlite_master WHERE type='table'")}
@@ -382,7 +382,7 @@ def test_p22_t7_reopen_is_idempotent(workspace):
     ks_count_2 = _db_scalar(workspace, "SELECT COUNT(*) FROM key_sources")
     version = _db_scalar(workspace, "PRAGMA user_version")
 
-    assert version == 6
+    assert version == 7
     assert ks_count_2 == ks_count_1
     assert marker_2 == marker_1
 

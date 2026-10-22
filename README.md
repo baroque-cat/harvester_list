@@ -904,7 +904,8 @@ Link discovery is recorded twice, by design:
    first-seen/last-seen/gathered timestamps, `visit_status`, transport,
    freshness columns, priority), `link_coverage` (which provider + pattern set
    already gathered the link), `keys` (provider-scoped key ledger), `repos`
-   (metadata cache), `runs` (run journal with config digests), `meta`.
+   (metadata cache), `runs` (run journal with config digests), `meta`,
+   `wire_coverage` (schema v7: per-wire page bitmap + contiguity watermark for coverage probes).
 
 The registry upserts on every encounter (`last_seen_ts` advances, history is
 preserved), survives process restarts and abrupt kills via WAL, and drains its
