@@ -1703,3 +1703,38 @@ def test_k2_f1_governor_refusal_triggers_fallback(monkeypatch):
         # generate_queries (broke CP16/CP17 when test_search_share ran
         # first — test isolation fix).
         del real_engine.generate_queries
+
+
+# ---------------------------------------------------------------------------
+# Render — wsuppr= token (gate 3b.G arm-B observability, 07 §7.4)
+# ---------------------------------------------------------------------------
+def test_render_sshare_wsuppr_token():
+    """WHEN metrics carry would_suppress THEN SShare renders wsuppr=<n>
+    between suppressed= and shared= (arm-B shadow evidence, 07 §7.4)."""
+    from core.metrics import PipelineStatus
+    from state.display import StatusDisplayEngine
+    from state.models import SystemStatus
+
+    status = SystemStatus.__new__(SystemStatus)
+    status.pipeline = PipelineStatus(
+        state=None,
+        active=0,
+        total=0,
+        stages={},
+        runtime=0.0,
+        search_share_metrics={
+            "mode": "shadow",
+            "claims": 8,
+            "would_suppress": 7,
+            "suppressed": 0,
+            "shared_fetches": 0,
+            "fanout_extra": 0,
+            "abandoned": 0,
+            "tracked": 0,
+            "ledger_full": 0,
+        },
+    )
+    line = StatusDisplayEngine._format_search_share_metrics_line(status)
+    assert "wsuppr=7" in line
+    assert "suppressed=0" in line
+    assert line.index("suppressed=") < line.index("wsuppr=") < line.index("shared=")

@@ -542,6 +542,7 @@ class StatusDisplayEngine:
             f"SShare: mode={metrics.get('mode', 'off')} "
             f"claims={metrics.get('claims', 0)} "
             f"suppressed={metrics.get('suppressed', 0)} "
+            f"wsuppr={metrics.get('would_suppress', 0)} "
             f"shared={metrics.get('shared_fetches', 0)} "
             f"extra={metrics.get('fanout_extra', 0)} "
             f"abandoned={metrics.get('abandoned', 0)} "

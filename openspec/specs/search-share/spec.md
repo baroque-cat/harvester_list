@@ -70,7 +70,7 @@ Sharing SHALL be controlled by `search.share_fetch` with values `off` (default),
 #### Scenario: Shadow mode counts but does not suppress
 
 - **WHEN** `search.share_fetch` is `shadow` and two providers claim the same key
-- **THEN** `would_suppress` increments but both tasks are created and `tracked` stays 0
+- **THEN** `would_suppress` increments but both tasks are created and `tracked` stays 0; the counter is observable on the `SShare:` render line as the `wsuppr=<n>` token between `suppressed=` and `shared=` (gate 3b.G arm-B evidence, 07 §7.4)
 
 #### Scenario: On mode enforces suppression
 
