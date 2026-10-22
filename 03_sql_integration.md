@@ -98,7 +98,7 @@ Effort M-L (~280–400 строк продукта по оценке Ф3 + пи�
 
 ### D-03.11 Промоушен file_dating
 
-После гейта 3c: `file_dating.enabled: true`, `transport: graphql`, `scope: gathered` (боевой конфиг прод-хоста; дефолты схемы узкие — §1.3.2). Enrichment (`repo_pushed_at`) остаётся выключенным (§1.3.6). Fill-rate `file_commit_date` — главная наблюдаемая величина (сейчас 0.0000 во всех живых прогонах).
+После гейта 3c: `file_dating.enabled: true`, `transport: graphql`, `scope: gathered` (боевой конфиг прод-хоста; дефолты схемы узкие — §1.3.2). Enrichment (`repo_pushed_at`) остаётся выключенным (§1.3.6). Fill-rate `file_commit_date` — главная наблюдаемая величина (сейчас 0.0000 во всех живых прогонах). **ИСПОЛНЕН 2026-10-23 (гейт 3c.G PASS):** fill 0.0000→**1.0000** живьём (рукав D1: `filled=2418 batches=97 cost=97 refusals=0 budget_stop=0`, drain в стопе 90.2с, gather нейтрален 1.009×); локальный боевой конфиг промоутирован (+`background_batching: true`, `graphql_batch_size: 25`; откат `enabled: false`), прод-хост — сторона оператора; детали в 07 §7.5 статус-блоке. Баланс 3c (D-03.5) подтверждён живьём: `pending=0 dropped=0` на терминале ⇒ `dated == pending_in`.
 
 ## 3d. Миграции, пины, откат
 

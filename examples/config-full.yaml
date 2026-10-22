@@ -286,6 +286,13 @@ enrichment:
 # full dating costs ~5.6 h and one 300 s run reaches ~1.8 % of them. Hence the
 # separate github_graphql bucket below plus a hard per-run request ceiling.
 # Requires registry.enabled for a durable cache. Default is off (inert).
+# COMBAT PROFILE (promotion D-03.11, gate 3c.G PASS 2026-10-23): for production
+# runs use enabled: true / transport: "graphql" / scope: "gathered" /
+# graphql_batch_size: 25 / background_batching: true.  Measured at the gate:
+# fill=1.0000 (from 0.0000), cost==batches (1/batch), budget_stop=0, refusals=0,
+# gather throughput neutral (1.009x), drain inside graceful stop (90.2s).
+# Rollback: enabled: false (single flag, invariant 4).  Values below stay at the
+# narrow schema defaults on purpose (boundary 2).
 file_dating:
   # Master switch; rollback is flipping this back to false, no code removal
   enabled: false

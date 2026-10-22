@@ -1183,6 +1183,13 @@ drains batches through GraphQL. Enabled with `file_dating.background_batching: t
 (requires `enabled: true` and `transport: graphql`). Pending cap, drain timeout
 and batch sizing are independently configurable.
 
+**Promotion (D-03.11).** After gate 3c.G PASS (2026-10-23) the combat profile is
+`enabled: true`, `transport: graphql`, `scope: gathered`, `graphql_batch_size: 25`,
+`background_batching: true` — measured live: `fill=1.0000` (from 0.0000),
+`cost == batches` (1 per batch), `budget_stop=0`, `refusals=0`, gather throughput
+neutral (1.009×), bounded drain inside graceful stop (90.2 s). Rollback remains a
+single flag: `enabled: false`.
+
 See `docs/specs/registry_flags_metrics.md` for the flag/metrics dictionary and
 the enrichment semantics.
 
