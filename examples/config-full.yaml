@@ -555,6 +555,24 @@ gather:
   # Rollback: return to 50000.
   share_ledger_max_tracked: 50000
 
+# Search-stage cross-provider share (D-03.6/D-03.7, F-07, NEW-3/N-09)
+# Mirror of the gather-stage share ledger (R17) for the search stage.
+# The key is (wire_fp, page) — the answer is a function of the wire query
+# and page, not the provider. When two providers request the same (wire_fp, page),
+# only the first creates a search task; the second becomes a beneficiary.
+# Run-scoped in-RAM; lost on restart (skip.skip_known covers post-restart).
+# Rollback: share_fetch: off restores byte-identical pre-change behavior.
+search:
+  # Three-position rollout flag: off | shadow | on.
+  #   off    - no sharing, byte-for-byte pre-change behaviour (default, invariant 4)
+  #   shadow - compute + count every would-suppress, still create every task
+  #   on     - enforce suppression; first claimant owns, later claimants suppressed
+  share_fetch: "off"
+  # Maximum number of distinct search keys tracked in the ledger (and in shadow
+  # mode, the seen-set). Default 50 000 mirrors the gather ledger default.
+  # Rollback: return to 50000.
+  share_ledger_max_tracked: 50000
+
 # LLM-provider refusal classification (fix-provider-failure-classification)
 # A capacity refusal on the provider surface (check/inspect stages) is a typed
 # deferral, never a task failure: recognised by the same one wire-signal rule the

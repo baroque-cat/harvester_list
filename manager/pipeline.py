@@ -24,6 +24,7 @@ from storage.persistence import MultiResultManager
 from storage.early_stop import EarlyStopEngine
 from storage.gather_skip import GatherSkipEngine
 from manager.gather_share import GatherShareLedger
+from manager.search_share import SearchShareLedger
 from storage.key_ledger import KeyLedger
 from storage.registry import Registry, config_digest as build_config_digest, init_registry
 from core.exceptions import RegistryUnavailableError
@@ -107,6 +108,14 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         self.share_ledger = GatherShareLedger(
             mode=config.gather.share_fetch,
             max_tracked=config.gather.share_ledger_max_tracked,
+        )
+
+        # D-03.6: search-side cross-provider share ledger (run-scoped RAM; inert when off).
+        # Key is (wire_fp, page) — provider is NOT part of the key.
+        self.search_share = SearchShareLedger(
+            mode=config.search.share_fetch,
+            max_tracked=config.search.share_ledger_max_tracked,
+            beneficiaries_resolver=self._build_search_share_resolver(config),
         )
 
         # Frontier-based API pagination early-stop detector (off by default;
@@ -302,6 +311,41 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             governor = RefineGovernor()
         self.refine_governor = governor
 
+    def _build_search_share_resolver(self, config: Config):
+        """Build the beneficiaries resolver for the search share ledger (F-07).
+
+        Returns a callable that maps a patterns_hash to the sorted list of
+        enabled provider names that share that hash.  Unknown hash ⇒ [].
+        """
+        from storage.registry import patterns_hash as _ph
+
+        # Build the {patterns_hash → [provider_names]} map from enabled tasks.
+        ph_map: Dict[str, List[str]] = {}
+        for task in config.tasks:
+            if not task.enabled:
+                continue
+            # Iterate over conditions (each has its own patterns).
+            for condition in task.conditions:
+                pats = condition.patterns
+                h = _ph(
+                    key_pattern=getattr(pats, 'key_pattern', '') or '',
+                    address_pattern=getattr(pats, 'address_pattern', '') or '',
+                    endpoint_pattern=getattr(pats, 'endpoint_pattern', '') or '',
+                    model_pattern=getattr(pats, 'model_pattern', '') or '',
+                )
+                ph_map_entry = ph_map.setdefault(h, [])
+                if task.name not in ph_map_entry:
+                    ph_map_entry.append(task.name)
+
+        # Sort each list for determinism.
+        for h in ph_map:
+            ph_map[h] = sorted(ph_map[h])
+
+        def resolver(patterns_hash_value: str) -> List[str]:
+            return ph_map.get(patterns_hash_value, [])
+
+        return resolver
+
     def get_refine_metrics(self) -> Dict[str, Any]:
         """Refinement governance metrics for ``PipelineStatus.refine_metrics``."""
         governor = getattr(self, "refine_governor", None)
@@ -366,6 +410,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             refine_governor=self.refine_governor,
             file_dating=self.file_dating,
             share_ledger=self.share_ledger,
+            search_share=self.search_share,
         )
 
         # Create stages in dependency order
@@ -458,6 +503,8 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         self.gather_skip.close()
         if hasattr(self, "share_ledger"):
             self.share_ledger.close()
+        if hasattr(self, "search_share"):
+            self.search_share.close()
         self.enrichment.close()
         if hasattr(self, "file_dating"):
             self.file_dating.close()
@@ -562,6 +609,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             key_ledger_metrics=self.key_ledger.to_stats(),
             registry_metrics=self._registry_metrics(),
             share_metrics=self.share_ledger.to_stats() if hasattr(self, "share_ledger") else {},
+            search_share_metrics=self.search_share.to_stats() if hasattr(self, "search_share") else {},
             recheck_metrics=self.recheck.to_stats(),
             prioritization_metrics=self._prioritization_metrics(),
             aggregation_metrics=get_aggregation_metrics(),
@@ -618,7 +666,29 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
 
         search_stage = self.stages.get(PipelineStage.SEARCH.value)
         if search_stage:
+            from search.querykey import fingerprint
+            from storage.registry import patterns_hash
+            from core.models import SearchTask
+
+            ledger = getattr(self, "search_share", None)
+            ledger_enabled = ledger is not None and ledger.enabled
+
             for task in initial_tasks:
+                # D-03.6: claim at root creation time.
+                if ledger_enabled and isinstance(task, SearchTask):
+                    wire_fp = fingerprint(task.query, task.use_api)
+                    ph = patterns_hash(
+                        key_pattern=task.regex,
+                        address_pattern=getattr(task, 'address_pattern', '') or '',
+                        endpoint_pattern=getattr(task, 'endpoint_pattern', '') or '',
+                        model_pattern=getattr(task, 'model_pattern', '') or '',
+                    )
+                    if ledger.claim(wire_fp, task.page, task.provider, ph):
+                        logger.debug(
+                            f"search-share suppressed root task for provider={task.provider} "
+                            f"query={task.query} page={task.page}"
+                        )
+                        continue
                 search_stage.put_task(task)
         else:
             logger.warning("Search stage not created, cannot add initial tasks")

@@ -259,6 +259,10 @@ class PipelineStatus:
     # while the ledger is off — mirrors the skip_metrics pattern.
     share_metrics: Dict[str, Any] = field(default_factory=dict)
 
+    # Search-side cross-provider share counters (D-03.6/D-03.7): same shape as
+    # share_metrics but for the search stage.  Empty while the ledger is off.
+    search_share_metrics: Dict[str, Any] = field(default_factory=dict)
+
     def queue_size(self) -> int:
         """Get total queue size across all stages"""
         return sum(stage.queue_size for stage in self.stages.values())

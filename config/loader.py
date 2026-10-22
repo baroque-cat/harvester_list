@@ -46,6 +46,7 @@ from .schemas import (
     RefineGovernorConfig,
     RegistryConfig,
     SkipConfig,
+    SearchConfig,
     StageConfig,
     StorageConfig,
     TaskConfig,
@@ -179,6 +180,10 @@ class ConfigLoader:
         # Parse gather transport configuration
         if "gather" in data:
             config.gather = self._parse_gather_config(data["gather"])
+
+        # Parse search-stage cross-provider share configuration
+        if "search" in data:
+            config.search = self._parse_search_config(data["search"])
 
         # Parse credential-liveness / bounded-wait configuration
         if "credential_liveness" in data:
@@ -584,6 +589,23 @@ class ConfigLoader:
             # R7 D9: cross-provider fetch-sharing rollout flag.
             share_fetch=data.get("share_fetch", "off"),
             # Slice 2.1 (C2): configurable cap on tracked keys in the share ledger.
+            share_ledger_max_tracked=data.get("share_ledger_max_tracked", 50_000),
+        )
+
+    def _parse_search_config(self, data: Dict[str, Any]) -> SearchConfig:
+        """Parse the search-stage cross-provider share configuration section.
+
+        Unknown keys are ignored like the sibling parse methods; validation
+        is delegated to the dataclass ``__post_init__``.
+
+        Args:
+            data: Search configuration data
+
+        Returns:
+            SearchConfig: Parsed search configuration
+        """
+        return SearchConfig(
+            share_fetch=data.get("share_fetch", "off"),
             share_ledger_max_tracked=data.get("share_ledger_max_tracked", 50_000),
         )
 

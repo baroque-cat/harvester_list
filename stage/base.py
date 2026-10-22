@@ -66,6 +66,7 @@ class StageResources:
     refine_governor: Any = None  # RefineGovernor (add-refine-fanout-governor; fail-open None == off)
     file_dating: Any = None  # FileDater (add-file-commit-dating; inert when disabled)
     share_ledger: Any = None  # GatherShareLedger (R7 D11; inert when None/off)
+    search_share: Any = None  # SearchShareLedger (D-03.6; inert when None/off)
 
     def is_enabled(self, provider: str, stage: str) -> bool:
         """Check if stage is enabled for provider"""

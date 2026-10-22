@@ -102,6 +102,9 @@ class ConfigValidator:
         # Validate gather transport configuration
         self._validate_gather_config(config)
 
+        # Validate search-stage cross-provider share configuration
+        self._validate_search_config(config)
+
         # Validate credential-liveness / bounded-wait configuration
         self._validate_credential_liveness_config(config)
 
@@ -697,6 +700,25 @@ class ConfigValidator:
                     f"strictly less than queue.visibility_timeout_s ({config.queue.visibility_timeout_s}) "
                     f"so no worker sleeps inside a claimed durable row past its visibility window"
                 )
+
+    def _validate_search_config(self, config: Config) -> None:
+        """Validate the search-stage cross-provider share configuration section.
+
+        Re-checks the enum and positivity constraints enforced by the dataclass
+        (they can be bypassed by attribute mutation).  Byte-identical messages
+        to ``SearchConfig.__post_init__`` (house doctrine: validator collects
+        all errors, dataclass raises on first).
+        """
+        search_config = config.search
+
+        # share_fetch — deliberate duplication of __post_init__ check.
+        share_mode = str(search_config.share_fetch).strip().lower()
+        if share_mode not in ("off", "shadow", "on"):
+            self.errors.append("search.share_fetch must be one of: off, shadow, on")
+
+        # Positive-int cap on tracked keys.
+        if int(search_config.share_ledger_max_tracked) <= 0:
+            self.errors.append("search.share_ledger_max_tracked must be positive")
 
     def _validate_provider_config(self, config: Config) -> None:
         """Validate the LLM-provider refusal-classification configuration section.

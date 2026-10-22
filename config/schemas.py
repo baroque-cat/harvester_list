@@ -787,6 +787,32 @@ class TaskQueueConfig:
 
 
 @dataclass
+class SearchConfig:
+    """Search-stage cross-provider share configuration (D-03.6/D-03.7, F-07).
+
+    ``share_fetch`` is the three-position rollout flag: ``off`` (default,
+    byte-identical pre-change), ``shadow`` (counts would-be suppressions
+    without acting), ``on`` (enforces cross-provider search-task sharing).
+    ``share_ledger_max_tracked`` bounds the in-RAM tracked-key cap.
+    """
+
+    share_fetch: str = "off"
+    share_ledger_max_tracked: int = 50_000
+
+    def __post_init__(self):
+        # Mirrors ConfigValidator._validate_search_config on purpose: this
+        # guards direct (non-loader) construction in tests and embedding.
+        share_mode = str(self.share_fetch).strip().lower()
+        if share_mode not in ("off", "shadow", "on"):
+            raise ValueError("search.share_fetch must be one of: off, shadow, on")
+        self.share_fetch = share_mode
+
+        self.share_ledger_max_tracked = int(self.share_ledger_max_tracked)
+        if self.share_ledger_max_tracked <= 0:
+            raise ValueError("search.share_ledger_max_tracked must be positive")
+
+
+@dataclass
 class GatherConfig:
     """Gather-stage content transport configuration (fix-gather-transport).
 
@@ -1103,6 +1129,7 @@ class Config:
     refine_governor: RefineGovernorConfig = field(default_factory=RefineGovernorConfig)
     queue: TaskQueueConfig = field(default_factory=TaskQueueConfig)
     gather: GatherConfig = field(default_factory=GatherConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
     credential_liveness: CredentialLivenessConfig = field(default_factory=CredentialLivenessConfig)
     provider: ProviderConfig = field(default_factory=ProviderConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
@@ -1143,6 +1170,7 @@ class Config:
             "refine_governor": self._dataclass_to_dict(self.refine_governor),
             "queue": self._dataclass_to_dict(self.queue),
             "gather": self._dataclass_to_dict(self.gather),
+            "search": self._dataclass_to_dict(self.search),
             "credential_liveness": self._dataclass_to_dict(self.credential_liveness),
             "provider": self._dataclass_to_dict(self.provider),
             "recovery": self._dataclass_to_dict(self.recovery),

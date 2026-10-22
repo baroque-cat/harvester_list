@@ -132,6 +132,55 @@ class SearchStage(BasePipelineStage):
 
         return True
 
+    def process_task(self, task: ProviderTask) -> Optional[StageOutput]:
+        """Override process_task to add abandon-in-finally (NEW-3/N-09).
+        
+        Calls super().process_task() and handles:
+        - RateLimitDeferral: rethrow WITHOUT abandon (deferral exits before take)
+        - Other exceptions: abandon + rethrow
+        - None return: abandon (shadow-swallow case)
+        """
+        sshare = getattr(self.resources, "search_share", None)
+        sshare_enforce = sshare is not None and sshare.enforce
+        
+        # Compute wire_fp for this task (needed for abandon)
+        search_task = task if isinstance(task, SearchTask) else None
+        if sshare_enforce and search_task is not None:
+            try:
+                wire_fp = fingerprint(search_task.query, search_task.use_api)
+                page = search_task.page
+            except Exception:
+                wire_fp = None
+                page = None
+        else:
+            wire_fp = None
+            page = None
+        
+        try:
+            result = super().process_task(task)
+            
+            # If result is None (shadow-swallow), call abandon
+            if result is None and sshare_enforce and wire_fp is not None:
+                try:
+                    sshare.abandon(wire_fp, page)
+                except Exception:
+                    pass  # fail-open
+            
+            return result
+            
+        except RateLimitDeferral:
+            # NEW-3: deferral exits BEFORE take, so do NOT abandon
+            raise
+            
+        except Exception:
+            # Any other exception: abandon + rethrow
+            if sshare_enforce and wire_fp is not None:
+                try:
+                    sshare.abandon(wire_fp, page)
+                except Exception:
+                    pass  # fail-open
+            raise
+
     def _execute_task(self, task: ProviderTask) -> Optional[StageOutput]:
         """Execute search task processing."""
         return self._search_worker(task)
@@ -152,13 +201,31 @@ class SearchStage(BasePipelineStage):
             # Create output object
             output = StageOutput(task=task)
 
+            # D-03.7: determine beneficiaries for fan-out (F-07).
+            # If search_share.enforce, call take() to get all beneficiaries.
+            # Otherwise, just the owner.
+            sshare = getattr(self.resources, "search_share", None)
+            sshare_enforce = sshare is not None and sshare.enforce
+            if sshare_enforce:
+                try:
+                    wire_fp = fingerprint(task.query, task.use_api)
+                    beneficiaries = sshare.take(wire_fp, task.page)
+                    if not beneficiaries:
+                        beneficiaries = [task.provider]
+                except Exception:
+                    beneficiaries = [task.provider]  # fail-open
+            else:
+                beneficiaries = [task.provider]
+
             # Extract keys directly from search content
             keys = []
             if content and task.regex:
                 keys = self._extract_keys_from_content(content, task)
-                for key_service in keys:
-                    check_task = TaskFactory.create_check_task(task.provider, key_service)
-                    output.add_task(check_task, PipelineStage.CHECK.value)
+                # D-03.7: create check-tasks for each beneficiary
+                for B in beneficiaries:
+                    for key_service in keys:
+                        check_task = TaskFactory.create_check_task(B, key_service)
+                        output.add_task(check_task, PipelineStage.CHECK.value)
 
                 if keys:
                     logger.info(
@@ -167,59 +234,128 @@ class SearchStage(BasePipelineStage):
 
             # Create acquisition tasks for links
             if results:
-                patterns = Patterns(
-                    key_pattern=task.regex,
-                    address_pattern=task.address_pattern,
-                    endpoint_pattern=task.endpoint_pattern,
-                    model_pattern=task.model_pattern,
-                )
-                skip_map = self._gather_skip_map(task, results, patterns)
-                enforce = bool(getattr(getattr(self.resources, "gather_skip", None), "enforce", False))
-                # R7 D4: cross-provider share ledger (resolved once per page).
-                share_ledger = getattr(self.resources, "share_ledger", None)
-                share_enabled = share_ledger is not None and share_ledger.enabled
-                if share_enabled:
-                    share_digest = patterns_hash(
-                        key_pattern=patterns.key_pattern,
-                        address_pattern=patterns.address_pattern,
-                        endpoint_pattern=patterns.endpoint_pattern,
-                        model_pattern=patterns.model_pattern,
+                # D-03.7: for each beneficiary, create gather-tasks with their patterns
+                # Owner's _record_discovered already wrote links rows ONCE above the loop.
+                # For each B we need: per-B skip-map, per-B R17 claim, per-B link_coverage,
+                # and per-B early-stop observe.
+                registry = getattr(self.resources, "registry", None)
+                registry_available = registry is not None and getattr(registry, "available", False)
+                early_stop_engine = self._early_stop_engine(task)
+                
+                for B in beneficiaries:
+                    # Get B's TaskConfig (may differ from owner's patterns)
+                    B_task_config = self.resources.task_configs.get(B)
+                    if B_task_config is None:
+                        B_task_config = self.resources.task_configs.get(task.provider)
+                    
+                    B_patterns = Patterns(
+                        key_pattern=B_task_config.patterns.key_pattern,
+                        address_pattern=B_task_config.patterns.address_pattern,
+                        endpoint_pattern=B_task_config.patterns.endpoint_pattern,
+                        model_pattern=B_task_config.patterns.model_pattern,
                     )
-                    share_transport = self.resources.config.gather.transport
-                share_suppressed = 0
-                suppressed = 0
-                for link in results:
-                    decision = skip_map.get(link)
-                    if enforce and decision is not None and decision.skip:
-                        suppressed += 1
-                        continue
-                    # R7 D4: consult the share ledger after gather-skip.
+                    
+                    # (a) Per-B gather-skip: use B's provider name and B's patterns
+                    skip_map = self._gather_skip_map_for(B, results, B_patterns)
+                    enforce = bool(getattr(getattr(self.resources, "gather_skip", None), "enforce", False))
+                    
+                    # (b) Per-B R17 claim: use B's patterns_hash and B as provider
+                    share_ledger = getattr(self.resources, "share_ledger", None)
+                    share_enabled = share_ledger is not None and share_ledger.enabled
                     if share_enabled:
+                        share_digest_B = patterns_hash(
+                            key_pattern=B_patterns.key_pattern,
+                            address_pattern=B_patterns.address_pattern,
+                            endpoint_pattern=B_patterns.endpoint_pattern,
+                            model_pattern=B_patterns.model_pattern,
+                        )
+                        share_transport = self.resources.config.gather.transport
+                    share_suppressed = 0
+                    suppressed = 0
+                    for link in results:
+                        decision = skip_map.get(link)
+                        if enforce and decision is not None and decision.skip:
+                            suppressed += 1
+                            continue
+                        # (b) R17 D4: consult the share ledger with B's identity
+                        if share_enabled:
+                            try:
+                                if share_ledger.claim(url_hash(link), share_digest_B, share_transport, B):
+                                    share_suppressed += 1
+                                    continue
+                            except Exception:
+                                pass  # fail-open: create the task
+                        acquisition_task = TaskFactory.create_acquisition_task(B, link, B_patterns)
+                        output.add_task(acquisition_task, PipelineStage.GATHER.value)
+
+                    if suppressed:
+                        logger.info(
+                            f"[{self.name}] suppressed {suppressed} already-known links, provider: {B}"
+                        )
+                    # R7 D4: aggregated INFO line for share suppressions.
+                    if share_suppressed:
+                        logger.info(
+                            f"[{self.name}] shared {share_suppressed} fetch(es) with another provider, provider: {B}"
+                        )
+
+                    # D-03.7: add links for each beneficiary
+                    output.add_links(B, results)
+
+                    # Carry API-extracted freshness metadata to the registry writer.
+                    if link_metadata:
+                        output.add_link_metadata(B, link_metadata)
+
+                    # (в) Per-B link_coverage: write coverage for non-owner beneficiaries.
+                    # Owner's coverage is written by gather stage after successful fetch.
+                    # For non-owner beneficiaries, we write coverage here so that gather-skip
+                    # in subsequent runs sees them as covered (D-03.7 F-07 goal 2).
+                    if registry_available and B != task.provider:
+                        ph_B = patterns_hash(
+                            key_pattern=B_patterns.key_pattern,
+                            address_pattern=B_patterns.address_pattern,
+                            endpoint_pattern=B_patterns.endpoint_pattern,
+                            model_pattern=B_patterns.model_pattern,
+                        )
+                        for link in results:
+                            try:
+                                registry.record_coverage(link, provider=B, patterns_hash=ph_B)
+                            except Exception:
+                                pass  # fail-open
+
+                # (г) Per-B early-stop observe: update early-stop state for each B.
+                # Owner's observe is called in _handle_first_page_results/_paginate_first_page
+                # (controls chaining). For non-owner beneficiaries, we do best-effort
+                # observe to update their frontier state (doesn't control chaining).
+                if early_stop_engine is not None and len(beneficiaries) > 1:
+                    for B in beneficiaries:
+                        if B == task.provider:
+                            continue  # owner's observe handled by pagination logic
+                        B_task_config = self.resources.task_configs.get(B)
+                        if B_task_config is None:
+                            B_task_config = self.resources.task_configs.get(task.provider)
+                        B_patterns = Patterns(
+                            key_pattern=B_task_config.patterns.key_pattern,
+                            address_pattern=B_task_config.patterns.address_pattern,
+                            endpoint_pattern=B_task_config.patterns.endpoint_pattern,
+                            model_pattern=B_task_config.patterns.model_pattern,
+                        )
                         try:
-                            if share_ledger.claim(url_hash(link), share_digest, share_transport, task.provider):
-                                share_suppressed += 1
-                                continue
+                            ph_B = patterns_hash(
+                                key_pattern=B_patterns.key_pattern,
+                                address_pattern=B_patterns.address_pattern,
+                                endpoint_pattern=B_patterns.endpoint_pattern,
+                                model_pattern=B_patterns.model_pattern,
+                            )
+                            early_stop_engine.observe(
+                                provider=B,
+                                query=task.query,
+                                page=task.page,
+                                links=results,
+                                patterns_hash=ph_B,
+                                max_pages=None,
+                            )
                         except Exception:
-                            pass  # fail-open: create the task
-                    acquisition_task = TaskFactory.create_acquisition_task(task.provider, link, patterns)
-                    output.add_task(acquisition_task, PipelineStage.GATHER.value)
-
-                if suppressed:
-                    logger.info(
-                        f"[{self.name}] suppressed {suppressed} already-known links, provider: {task.provider}"
-                    )
-                # R7 D4: aggregated INFO line for share suppressions.
-                if share_suppressed:
-                    logger.info(
-                        f"[{self.name}] shared {share_suppressed} fetch(es) with another provider, provider: {task.provider}"
-                    )
-
-                # Add links to be saved (audit log stays complete regardless of skips)
-                output.add_links(task.provider, results)
-
-                # Carry API-extracted freshness metadata to the registry writer.
-                if link_metadata:
-                    output.add_link_metadata(task.provider, link_metadata)
+                            pass  # fail-open, state update only
 
                 # Fill-rate observability: only the API transport yields dates
                 # at search stage (web dates arrive at gather stage).
@@ -229,12 +365,13 @@ class SearchStage(BasePipelineStage):
                         item = link_metadata.get(link)
                         date_metrics.record_api(bool(item and item.has_repo_date))
 
-                # Write-only hook: record discovered links
+                # Write-only hook: record discovered links ONCE (not per beneficiary)
                 self._record_discovered(task, results)
 
             # Handle pagination/refinement.  API transport may chain pages
             # through the early-stop detector; web keeps the pre-change bulk
             # generation (the detector is inert for web at code level).
+            # D-03.7: refine/pagination ONCE (owner only, not per beneficiary)
             if task.page == 1 and total > 0:
                 self._handle_first_page_results(task, results or [], total, output)
                 # Wire-coverage recording: page-1 seam (D-03.1, slice 3a.1).
@@ -338,6 +475,14 @@ class SearchStage(BasePipelineStage):
         Returns ``{}`` when the engine is absent/off or the lookup errors, so
         every link produces a task in the safe direction.
         """
+        return self._gather_skip_map_for(task.provider, links, patterns)
+
+    def _gather_skip_map_for(self, provider_name: str, links: List[str], patterns: Patterns) -> Dict[str, Any]:
+        """Compute the gather-skip decision map for a specific provider (fail-open).
+
+        Parameterized version of _gather_skip_map for per-beneficiary attribution.
+        Returns ``{}`` when the engine is absent/off or the lookup errors.
+        """
         engine = getattr(self.resources, "gather_skip", None)
         if engine is None or not engine.enabled:
             return {}
@@ -358,7 +503,7 @@ class SearchStage(BasePipelineStage):
                 endpoint_pattern=patterns.endpoint_pattern,
                 model_pattern=patterns.model_pattern,
             )
-            decisions = engine.decide(links, provider=task.provider, patterns_hash=digest)
+            decisions = engine.decide(links, provider=provider_name, patterns_hash=digest)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(f"[{self.name}] gather-skip decision failed: {e}")
             return {}
@@ -504,6 +649,9 @@ class SearchStage(BasePipelineStage):
 
             # Add new query tasks to output
             enqueued = 0
+            share_suppressed = 0
+            sshare = getattr(self.resources, "search_share", None)
+            sshare_enabled = sshare is not None and sshare.enabled
             for query in queries:
                 if not query:
                     logger.warning(
@@ -528,6 +676,22 @@ class SearchStage(BasePipelineStage):
                     refine_depth=task.refine_depth + 1,
                 )
 
+                # D-03.6: claim refined child before enqueue.
+                if sshare_enabled:
+                    try:
+                        wire_fp = fingerprint(refined_task.query, refined_task.use_api)
+                        ph = patterns_hash(
+                            key_pattern=refined_task.regex,
+                            address_pattern=refined_task.address_pattern,
+                            endpoint_pattern=refined_task.endpoint_pattern,
+                            model_pattern=refined_task.model_pattern,
+                        )
+                        if sshare.claim(wire_fp, refined_task.page, refined_task.provider, ph):
+                            share_suppressed += 1
+                            continue
+                    except Exception:
+                        pass  # fail-open
+
                 output.add_task(refined_task, PipelineStage.SEARCH.value)
                 enqueued += 1
 
@@ -538,7 +702,9 @@ class SearchStage(BasePipelineStage):
 
             # F1: when refine admitted nothing but there are more pages,
             # fall back to pagination so the parent's pages 2..N are not lost.
-            if enqueued == 0 and total > per_page:
+            # D-03.6: also skip when all children were suppressed by the share
+            # ledger (their work is done by the subtree of the twin).
+            if enqueued == 0 and share_suppressed == 0 and total > per_page:
                 if governor is not None:
                     governor.record_pagination_fallback()
                 self._paginate_first_page(task, results, total, per_page, output)
@@ -561,13 +727,31 @@ class SearchStage(BasePipelineStage):
             API_MAX_PAGES if task.use_api else WEB_MAX_PAGES,
         )
 
+        sshare = getattr(self.resources, "search_share", None)
+        sshare_enabled = sshare is not None and sshare.enabled
+
         engine = self._early_stop_engine(task)
         if engine is not None:
             # API-only chained pagination: record page 1, then emit only the
             # next page so every later boundary can be evaluated.
             stopped = self._observe_page(task, results, page=1, max_pages=max_pages, engine=engine)
             if not stopped and max_pages >= 2:
-                output.add_task(self._generate_page_task(task, 2), PipelineStage.SEARCH.value)
+                page_task = self._generate_page_task(task, 2)
+                # D-03.6: claim page task before enqueue.
+                if sshare_enabled:
+                    try:
+                        wire_fp = fingerprint(page_task.query, page_task.use_api)
+                        ph = patterns_hash(
+                            key_pattern=page_task.regex,
+                            address_pattern=page_task.address_pattern,
+                            endpoint_pattern=page_task.endpoint_pattern,
+                            model_pattern=page_task.model_pattern,
+                        )
+                        if sshare.claim(wire_fp, page_task.page, page_task.provider, ph):
+                            return
+                    except Exception:
+                        pass  # fail-open
+                output.add_task(page_task, PipelineStage.SEARCH.value)
                 logger.info(
                     f"[{self.name}] early-stop chaining page tasks for provider: {task.provider}, "
                     f"query: {task.query}, max_pages: {max_pages}"
@@ -576,6 +760,20 @@ class SearchStage(BasePipelineStage):
 
         page_tasks = self._generate_page_tasks(task, total, per_page)
         for page_task in page_tasks:
+            # D-03.6: claim page task before enqueue.
+            if sshare_enabled:
+                try:
+                    wire_fp = fingerprint(page_task.query, page_task.use_api)
+                    ph = patterns_hash(
+                        key_pattern=page_task.regex,
+                        address_pattern=page_task.address_pattern,
+                        endpoint_pattern=page_task.endpoint_pattern,
+                        model_pattern=page_task.model_pattern,
+                    )
+                    if sshare.claim(wire_fp, page_task.page, page_task.provider, ph):
+                        continue
+                except Exception:
+                    pass  # fail-open
             output.add_task(page_task, PipelineStage.SEARCH.value)
         logger.info(
             f"[{self.name}] generated {len(page_tasks)} page tasks for provider: {task.provider}, query: {task.query}"
@@ -597,7 +795,24 @@ class SearchStage(BasePipelineStage):
 
         max_pages = engine.max_pages(task.provider, task.query)
         if task.page + 1 <= max_pages:
-            output.add_task(self._generate_page_task(task, task.page + 1), PipelineStage.SEARCH.value)
+            page_task = self._generate_page_task(task, task.page + 1)
+            # D-03.6: claim page-N task before enqueue.
+            sshare = getattr(self.resources, "search_share", None)
+            sshare_enabled = sshare is not None and sshare.enabled
+            if sshare_enabled:
+                try:
+                    wire_fp = fingerprint(page_task.query, page_task.use_api)
+                    ph = patterns_hash(
+                        key_pattern=page_task.regex,
+                        address_pattern=page_task.address_pattern,
+                        endpoint_pattern=page_task.endpoint_pattern,
+                        model_pattern=page_task.model_pattern,
+                    )
+                    if sshare.claim(wire_fp, page_task.page, page_task.provider, ph):
+                        return
+                except Exception:
+                    pass  # fail-open
+            output.add_task(page_task, PipelineStage.SEARCH.value)
 
     def _early_stop_engine(self, task: SearchTask):
         """Return the early-stop engine for API tasks, else None (web inert)."""

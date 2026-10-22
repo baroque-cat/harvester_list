@@ -2101,6 +2101,43 @@ In shadow mode the seen-set is bounded by the same cap.
 The ledger is never constructed and no `claim()` / `take()` calls are made; the
 run is byte-for-byte indistinguishable from pre-change.
 
+### Search-stage cross-provider share (`search.share_fetch`)
+
+Optional, default-off suppression of duplicate search-task creation when multiple
+providers request the same wire query. The key is `(wire_fp, page)` — the answer
+is a function of the wire query and page, not the provider. When two providers
+request the same `(wire_fp, page)`, only the first creates a search task; the
+second becomes a beneficiary. This is the search-stage mirror of the gather-stage
+share ledger (R17), addressing the same multiplication problem at the search
+layer rather than the gather layer.
+
+```yaml
+search:
+  share_fetch: "off"   # off | shadow | on
+  share_ledger_max_tracked: 50000
+```
+
+**Share key.** `(wire_fp, page)` — the provider is deliberately absent. The wire
+fingerprint includes the transport (API vs web), so different transports are
+different keys. Beneficiaries are resolved via a callback that maps patterns_hash
+to the sorted list of enabled providers with that hash (F-07 fan-out).
+
+**Abandon on failure (NEW-3/N-09).** When a search task fails after claiming a
+key, the ledger releases the key so another provider can claim it. Abandon is
+called on TransientFetchError and shadow-swallow (None return), but NEVER on
+RateLimitDeferral (the deferral exits before take).
+
+**Observability.** `PipelineStatus.search_share_metrics` publishes the counters,
+and a `SShare:` line is rendered in the status display only when `mode != off`:
+
+```
+SShare: mode=on claims=14800 suppressed=9102 shared=2067 extra=6080 abandoned=0 tracked=0 full=0
+```
+
+**Rollback:** set `search.share_fetch: "off"` — a config flip, no code removal.
+The ledger is never constructed and no `claim()` / `take()` calls are made; the
+run is byte-for-byte indistinguishable from pre-change.
+
 ### Provider refusal classification (`provider`)
 
 A capacity refusal encountered while talking to an LLM provider (the `check`
