@@ -432,6 +432,18 @@ class FileDatingConfig:
     # Coalesce window for P21 batching; mirrors DEFAULT_COALESCE_WINDOW_SECONDS.
     # ≤ 0 disables coalescing entirely (rollback knob — no positivity check).
     coalesce_window_s: float = 0.25
+    # Background batching master switch (P21 step 2, D-03.10).
+    # False ⇒ synchronous P21 path byte-identical.  Active only when
+    # enabled=True AND transport="graphql"; ignored with a DEBUG/WARNING note
+    # otherwise (dates less important than files — fail-open).
+    background_batching: bool = False
+    # In-RAM pending-set cap (>0).  At cap, new submissions are dropped with
+    # a loud-once WARNING and dating_pending_dropped counter increment.
+    background_pending_cap: int = 10_000
+    # Bounded drain timeout on close() (>0).  The background thread drains
+    # remaining pending items in batches for at most this long; undrained
+    # items are dropped with a WARNING.  60 s << TimeoutStopSec=1800.
+    background_drain_timeout_s: float = 60.0
 
     def __post_init__(self):
         # Mirrors ConfigValidator._validate_file_dating_config on purpose: this
@@ -472,6 +484,18 @@ class FileDatingConfig:
 
         # Coalesce window: float-coerce, no positivity check (≤ 0 disables = rollback).
         self.coalesce_window_s = float(self.coalesce_window_s)
+
+        # Background batching (P21 step 2, D-03.10).
+        if not isinstance(self.background_batching, bool):
+            raise ValueError("file_dating.background_batching must be a boolean")
+
+        self.background_pending_cap = int(self.background_pending_cap)
+        if self.background_pending_cap <= 0:
+            raise ValueError("file_dating.background_pending_cap must be positive")
+
+        self.background_drain_timeout_s = float(self.background_drain_timeout_s)
+        if self.background_drain_timeout_s <= 0:
+            raise ValueError("file_dating.background_drain_timeout_s must be positive")
 
 
 @dataclass

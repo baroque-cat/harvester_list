@@ -313,6 +313,21 @@ file_dating:
   # no code change needed (invariant 4).  Default 0.25 mirrors the storage
   # constant DEFAULT_COALESCE_WINDOW_SECONDS.
   coalesce_window_s: 0.25
+  # Background batching (P21 step 2, D-03.10).  Master switch for the
+  # background pending-set + batcher thread.  Active only when enabled=true
+  # AND transport="graphql"; ignored otherwise.  Default false (sync path).
+  background_batching: false
+  # In-RAM pending-set cap (>0).  At cap, new submissions are dropped with a
+  # loud-once WARNING and dating_pending_dropped counter increment.
+  # Dates are less important than files — fail-open.
+  background_pending_cap: 10000
+  # Bounded drain timeout on close() (>0).  The background thread drains
+  # remaining pending items for at most this long; undrained items are dropped.
+  # 60 s << TimeoutStopSec=1800.
+  background_drain_timeout_s: 60.0
+  # NOTE: for background mode, graphql_batch_size 20–50 is recommended.
+  # At λ≈4 files/s and batch=25, ~0.16 POST/s ≪ github_graphql basket capacity.
+  # Rollback: background_batching: false (config flip, no code change).
 
 # Frontier-based API pagination early-stop configuration
 # (add-search-early-stop; API transport only, gated by registry trust)

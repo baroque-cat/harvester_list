@@ -47,6 +47,12 @@ DEFAULT_DATING_BUDGET_SECONDS = 5.0
 # is the de-facto rollback knob.
 DEFAULT_COALESCE_WINDOW_SECONDS = 0.25
 
+# Background batcher poll interval (P21 step 2).  The background thread wakes
+# at this interval to check pending depth even when the depth threshold is not
+# yet reached.  Short enough to keep drain responsive, long enough to avoid
+# busy-waiting.
+_BACKGROUND_POLL_INTERVAL_S = 0.5
+
 
 class FileDater:
     """Cache-first, budgeted, fail-open per-file commit-date fetcher.
@@ -77,6 +83,10 @@ class FileDater:
         flush_timeout: float = 10.0,
         max_credential_retries: int = 3,
         coalesce_window_s: Optional[float] = None,
+        background_batching: bool = False,
+        background_pending_cap: int = 10_000,
+        background_drain_timeout_s: float = 60.0,
+        metadata_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self.store = store
         self.enabled = bool(enabled)
@@ -99,6 +109,24 @@ class FileDater:
         else:
             self.coalesce_window_s = float(coalesce_window_s)
 
+        # Background batching (P21 step 2, D-03.10).  Active only when the
+        # dater is enabled AND transport is graphql (the batcher dispatches
+        # GraphQL aliases); otherwise normalized OFF with a loud note
+        # (fail-open: dates are less important than files).
+        self.background_batching = bool(background_batching)
+        if self.background_batching and not (
+            self.enabled and self.transport == "graphql"
+        ):
+            logger.warning(
+                "[file_dating] background_batching requested but inactive "
+                "(requires file_dating.enabled=true and transport=graphql); "
+                "ignoring"
+            )
+            self.background_batching = False
+        self.background_pending_cap = max(1, int(background_pending_cap))
+        self.background_drain_timeout_s = float(background_drain_timeout_s)
+        self._metadata_sink = metadata_sink
+
         self._lock = threading.Lock()
         self._counters_lock = threading.Lock()
         self._cached_hits = 0
@@ -111,6 +139,20 @@ class FileDater:
         # enabled and transport is graphql.
         self._assembly: Optional[Dict[str, Any]] = None
         self._assembly_cond = threading.Condition(self._lock)
+
+        # Background batching state (P21 step 2).
+        # _pending: dict mapping dedup key (url) -> (owner, repo, path, ref)
+        self._pending: Dict[str, Tuple[str, str, str, str]] = {}
+        self._pending_cond = threading.Condition(threading.Lock())
+        self._closing_event = threading.Event()
+        self._bg_thread: Optional[threading.Thread] = None
+        self._bg_started = False
+        # Counters for background mode.
+        self._pending_in = 0       # unique keys accepted
+        self._dated = 0            # results delivered (filled + absent)
+        self._pending_dropped = 0  # keys dropped (cap or drain timeout)
+        self._batches_dispatched = 0
+        self._warned_full = False  # loud-once guard for cap WARNING
 
     # -- public API ----------------------------------------------------
     def date_urls_map(
@@ -224,6 +266,228 @@ class FileDater:
         date_map = self.date_urls_map(url_list, flush=flush)
         return sum(1 for v in date_map.values() if v is not None)
 
+    # -- background batching (P21 step 2, D-03.10) -----------------------
+    def submit_urls(self, urls: Iterable[str]) -> int:
+        """Submit URLs for background dating (P21 step 2).
+
+        O(1) insertion per URL into the in-RAM pending set.  Never blocks the
+        caller and never raises (fail-open: dates are less important than files).
+        Dedup: same key (url) submitted twice does NOT increment pending_in
+        twice.  Returns the number of URLs accepted (unique new insertions).
+
+        When the pending set reaches ``background_pending_cap``, new submissions
+        are discarded with a loud-once WARNING and ``dating_pending_dropped``
+        counter increment.
+        """
+        if not self.enabled or not self.background_batching:
+            return 0
+
+        accepted = 0
+        for url in urls or []:
+            parsed = _parse_blob_link(url)
+            if parsed is None:
+                with self._counters_lock:
+                    self._undateable_links += 1
+                continue
+            key = url  # dedup by url
+            with self._pending_cond:
+                if key in self._pending:
+                    # Duplicate: do not increment pending_in.
+                    continue
+                if len(self._pending) >= self.background_pending_cap:
+                    # Cap reached: drop with loud-once WARNING.
+                    with self._counters_lock:
+                        self._pending_dropped += 1
+                    if not self._warned_full:
+                        self._warned_full = True
+                        logger.warning(
+                            "[file_dating] pending cap reached (%d); "
+                            "dates are less important than files — dropping new submissions",
+                            self.background_pending_cap,
+                        )
+                    continue
+                self._pending[key] = (
+                    parsed["owner"],
+                    parsed["repo"],
+                    parsed["path"],
+                    parsed["ref"],
+                )
+                with self._counters_lock:
+                    self._pending_in += 1
+                accepted += 1
+                self._pending_cond.notify_all()
+
+            # Lazy start of the background thread on first successful submit.
+            if not self._bg_started:
+                self._ensure_bg_thread()
+
+        return accepted
+
+    def _ensure_bg_thread(self) -> None:
+        """Start the background batching thread if not already running."""
+        with self._pending_cond:
+            if self._bg_started:
+                return
+            self._bg_started = True
+            t = threading.Thread(
+                target=self._bg_worker,
+                name="file-dating-bg",
+                daemon=True,
+            )
+            self._bg_thread = t
+            t.start()
+
+    def _bg_worker(self) -> None:
+        """Background batching loop (P21 step 2).
+
+        Waits until pending depth >= graphql_batch_size OR closing event, then
+        atomically takes up to graphql_batch_size items and dispatches them.
+        On close, drains remaining items within background_drain_timeout_s.
+        """
+        try:
+            while True:
+                batch = self._bg_take_batch(blocking=True)
+                if batch is None:
+                    # Closing event set and pending is empty.
+                    break
+                self._bg_dispatch_batch(batch)
+
+            # Drain phase: after closing, drain remaining within timeout.
+            self._bg_drain()
+        except Exception as exc:
+            # Fail-open: the thread must not kill the process.
+            logger.warning(
+                "[file_dating] background thread died (fail-open): %s", exc
+            )
+
+    def _bg_take_batch(self, blocking: bool) -> Optional[List[Tuple[str, str, str, str, str]]]:
+        """Take up to graphql_batch_size items from pending.
+
+        Returns None when closing and pending is empty.
+        """
+        with self._pending_cond:
+            while len(self._pending) < self.graphql_batch_size:
+                if self._closing_event.is_set():
+                    if not self._pending:
+                        return None
+                    # Closing with remaining items: take what we have.
+                    break
+                self._pending_cond.wait(timeout=_BACKGROUND_POLL_INTERVAL_S)
+
+            # Take up to graphql_batch_size items.
+            keys = list(self._pending.keys())[:self.graphql_batch_size]
+            batch: List[Tuple[str, str, str, str, str]] = []
+            for k in keys:
+                owner, repo, path, ref = self._pending.pop(k)
+                batch.append((k, owner, repo, path, ref))
+            return batch
+
+    def _bg_dispatch_batch(
+        self, batch: List[Tuple[str, str, str, str, str]]
+    ) -> None:
+        """Dispatch one batch through the GraphQL client and deliver results."""
+        items = [(o, r, p, ref) for _, o, r, p, ref in batch if ref and len(ref) == 40]
+
+        if not items:
+            # Items without usable shas: drop them.
+            with self._counters_lock:
+                self._pending_dropped += len(batch)
+            return
+
+        credential = self._next_credential()
+        if credential is None:
+            # No credential: drop the batch.
+            with self._counters_lock:
+                self._pending_dropped += len(batch)
+            return
+
+        try:
+            results = fetch_file_commit_dates_batch(
+                items,
+                credential=credential,
+                client=self._client,
+                timeout=self.timeout,
+                retries=self.retries,
+            )
+        except Exception as exc:
+            # Fail-open: drop the batch, increment refusals if the client did.
+            logger.debug("[file_dating] background batch failed (fail-open): %s", exc)
+            with self._counters_lock:
+                self._pending_dropped += len(batch)
+            return
+
+        with self._counters_lock:
+            self._requests_this_run += 1
+            self._batches_dispatched += 1
+
+        if not results:
+            # Total failure without exception (e.g. credential exhaustion
+            # returns {}): account the whole batch as dropped so the balance
+            # dated + dropped == pending_in stays exact (D-03.5).
+            with self._counters_lock:
+                self._pending_dropped += len(batch)
+            return
+
+        # Deliver per BATCH ENTRY via key lookup — never by index alignment:
+        # the client dict is keyed by (owner, repo, path) and duplicate keys
+        # collapse (last-wins), so enumerate()+idx would misattribute dates
+        # across URLs of the same batch.  Every taken entry is accounted:
+        # delivered (dated) or undeliverable (dropped) — balance invariant.
+        delivered = 0
+        undeliverable = 0
+        applied_keys = set()
+        for url, owner, repo, path, ref in batch:
+            key = (owner, repo, path)
+            result = results.get(key)
+            if result is None or not (ref and len(ref) == 40):
+                undeliverable += 1
+                continue
+            if key not in applied_keys:
+                applied_keys.add(key)
+                # Apply to cache (FileMetaStore) once per unique file key.
+                self._apply_result(owner, repo, path, ref, result, flush=False)
+            # Deliver through metadata sink if available (URL-keyed channel,
+            # monotonic MAX-merge downstream — D-03.10 p.3).
+            if self._metadata_sink is not None:
+                try:
+                    from core.models import LinkMetadata
+                    meta = LinkMetadata(file_commit_date=result.committed_date)
+                    self._metadata_sink({url: meta})
+                except Exception as exc:
+                    logger.debug("[file_dating] metadata sink failed (fail-open): %s", exc)
+            delivered += 1
+
+        with self._counters_lock:
+            self._dated += delivered
+            self._pending_dropped += undeliverable
+
+    def _bg_drain(self) -> None:
+        """Drain remaining pending items within the bounded timeout."""
+        deadline = time.monotonic() + self.background_drain_timeout_s
+        while self._pending:
+            if time.monotonic() >= deadline:
+                break
+            with self._pending_cond:
+                keys = list(self._pending.keys())[:self.graphql_batch_size]
+                batch: List[Tuple[str, str, str, str, str]] = []
+                for k in keys:
+                    owner, repo, path, ref = self._pending.pop(k)
+                    batch.append((k, owner, repo, path, ref))
+            if batch:
+                self._bg_dispatch_batch(batch)
+
+        # Drop any remaining items after timeout.
+        with self._pending_cond:
+            remaining = len(self._pending)
+            self._pending.clear()
+        if remaining > 0:
+            with self._counters_lock:
+                self._pending_dropped += remaining
+            logger.warning(
+                "[file_dating] drain timeout reached; dropped %d undrained items",
+                remaining,
+            )
+
     def to_stats(self) -> Dict[str, Any]:
         """Flatten counters for ``PipelineStatus.file_dating_metrics`` (design D12).
 
@@ -262,10 +526,30 @@ class FileDater:
                 "requests_this_run": self._requests_this_run,
                 "budget_remaining": max(0, self.max_requests_per_run - self._requests_this_run),
                 "fill_rate": fill_rate,
+                # Background batching counters (P21 step 2).
+                "pending_size": len(self._pending),
+                "pending_in": self._pending_in,
+                "dated": self._dated,
+                "dating_pending_dropped": self._pending_dropped,
+                "batches_dispatched": self._batches_dispatched,
             }
 
     def close(self) -> None:
-        """Flush and close the underlying store (mirrors ``RepoMetaEnricher.close``)."""
+        """Flush and close the underlying store (mirrors ``RepoMetaEnricher.close``).
+
+        When background batching is active, signals the background thread to
+        drain and joins it with a bounded timeout.  Idempotent.
+        """
+        # Signal the background thread to stop and drain.
+        if self._bg_started:
+            self._closing_event.set()
+            with self._pending_cond:
+                self._pending_cond.notify_all()
+            if self._bg_thread is not None:
+                # Bounded join: drain timeout + slack.
+                join_timeout = self.background_drain_timeout_s + 5.0
+                self._bg_thread.join(timeout=join_timeout)
+
         try:
             self.store.flush(self.flush_timeout)
         except Exception:  # pragma: no cover - defensive

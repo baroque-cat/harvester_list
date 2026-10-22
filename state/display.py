@@ -591,6 +591,8 @@ class StatusDisplayEngine:
             f"budget_stop={metric_int(metrics.get('file_dating_budget_stopped'))} "
             f"cached={metric_int(metrics.get('cached_hits'))} "
             f"fill={metric_rate(metrics.get('fill_rate')):.4f}"
+            f" pending={metric_int(metrics.get('pending_size', 0))}"
+            f" dropped={metric_int(metrics.get('dating_pending_dropped', 0))}"
         )
 
     @staticmethod

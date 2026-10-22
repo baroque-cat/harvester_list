@@ -451,6 +451,18 @@ class ConfigValidator:
                 "file_dating.graphql_batch_size must not exceed file_dating.graphql_batch_max"
             )
 
+        # Background batching (P21 step 2, D-03.10).
+        if not isinstance(fd.background_batching, bool):
+            self.errors.append("file_dating.background_batching must be a boolean")
+
+        bg_cap = int(fd.background_pending_cap)
+        if bg_cap <= 0:
+            self.errors.append("file_dating.background_pending_cap must be positive")
+
+        bg_drain = float(fd.background_drain_timeout_s)
+        if bg_drain <= 0:
+            self.errors.append("file_dating.background_drain_timeout_s must be positive")
+
         # Cross-check: dating results live in the registry; without it the
         # cache has nowhere durable to read/write and silently degrades to
         # re-fetching on every encounter.

@@ -210,6 +210,10 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
             graphql_batch_size=config.file_dating.graphql_batch_size,
             cooling_probe=tokens_cooling_down,
             coalesce_window_s=config.file_dating.coalesce_window_s,
+            background_batching=config.file_dating.background_batching,
+            background_pending_cap=config.file_dating.background_pending_cap,
+            background_drain_timeout_s=config.file_dating.background_drain_timeout_s,
+            metadata_sink=self.link_registry.record_metadata,
         )
 
         self.queue_manager = QueueManager(

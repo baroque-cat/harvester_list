@@ -145,3 +145,55 @@ Each run SHALL expose dating figures sufficient to judge coverage without inspec
 #### Scenario: Zero-evidence run is distinguishable from a disabled run
 - **WHEN** dating is enabled but every response lacked a usable date
 - **THEN** the fill rate reports zero while the request and absence counters report the work actually performed, so the run is visibly distinct from one where dating never ran
+
+### Requirement: Background batching decouples dating latency from gather workers (P21 step 2, D-03.10)
+
+The system SHALL support a background batching mode in which gather workers submit URLs to an in-RAM pending set in O(1) time without blocking, and a dedicated background thread drains the set in batches through the GraphQL transport. The mode SHALL be inactive by default and active only when explicitly enabled together with the GraphQL transport.
+
+#### Scenario: submit_urls is O(1) and fail-open
+- **WHEN** a gather worker calls submit_urls with one or more URLs while background batching is active
+- **THEN** the call returns immediately with the count of unique URLs accepted, never raises, and never blocks the caller
+
+#### Scenario: Pending cap drops with loud-once WARNING
+- **WHEN** the pending set reaches its configured cap and a new URL is submitted
+- **THEN** the new URL is discarded, a dating_pending_dropped counter increments, and a WARNING is logged exactly once (loud-once pattern)
+
+#### Scenario: Background thread dispatches batches of bounded size
+- **WHEN** the pending depth reaches the configured batch size threshold
+- **THEN** the background thread atomically takes up to graphql_batch_size items and dispatches them through the GraphQL batch client with cost=1 per batch
+
+#### Scenario: Delivery through record_metadata with MAX-merge
+- **WHEN** a batch result carries a file_commit_date
+- **THEN** the date is delivered through the metadata sink (record_metadata) which applies the monotonic MAX-merge policy (D7 R12), so an older date never overwrites a newer one
+
+#### Scenario: Bounded drain on close
+- **WHEN** close() is called while items remain in the pending set
+- **THEN** the background thread drains remaining items in batches for at most background_drain_timeout_s seconds, and any undrained items are dropped with a WARNING and counted in dating_pending_dropped
+
+#### Scenario: Background thread death does not kill gather
+- **WHEN** the background batching thread dies due to an unhandled exception
+- **THEN** submit_urls continues to accept URLs (pending grows to cap, then drops), and the gather path is unaffected
+
+#### Scenario: Balance dated + dropped = pending_in at terminal
+- **WHEN** close() completes
+- **THEN** the counters satisfy dated + dating_pending_dropped = pending_in exactly (every accepted key is either delivered or dropped)
+
+#### Scenario: Background mode does not touch wall-clock budget
+- **WHEN** background batching is active
+- **THEN** file_dating_budget_stopped and file_dating_time_stopped remain zero (the background path has no wall-clock budget)
+
+#### Scenario: Neutral when off
+- **WHEN** background_batching is false
+- **THEN** no background thread is started, submit_urls returns 0, and the new counters (pending_size, pending_in, dating_pending_dropped, batches_dispatched) are all zero
+
+#### Scenario: Inactive unless enabled together with the GraphQL transport
+- **WHEN** background_batching is requested but the dater is disabled or transport is not graphql
+- **THEN** the constructor normalizes the flag to false with a loud WARNING note, submit_urls refuses (returns 0), and no background thread can start (the batcher dispatches GraphQL aliases only)
+
+#### Scenario: Attribution under duplicate (owner, repo, path) keys
+- **WHEN** one batch contains several URLs whose (owner, repo, path) key collapses in the client result dict (same file via different revisions)
+- **THEN** delivery maps results per batch ENTRY by key lookup — never by index alignment — so every URL receives its own file's date, the cache is applied once per unique key, and no entry is starved by the collapse
+
+#### Scenario: Undeliverable entries are accounted, never silent
+- **WHEN** a taken batch entry cannot be delivered (its ref is not a 40-hex sha, the client returned no result for its key, or the whole batch returned an empty result set such as credential exhaustion without exception)
+- **THEN** the entry increments dating_pending_dropped so that the balance dated + dating_pending_dropped = pending_in remains exact at every terminal observation

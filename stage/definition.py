@@ -79,6 +79,11 @@ def _date_file_links(resources: StageResources, urls: List[str]) -> Dict[str, Op
     if dater is None or not getattr(dater, "enabled", False):
         return {}
     try:
+        # P21 step 2: when background batching is active, submit URLs to the
+        # pending set instead of blocking the gather worker synchronously.
+        if getattr(dater, "background_batching", False):
+            dater.submit_urls(urls)
+            return {}
         # F3: pass the default wall-clock budget so dating cannot starve the
         # search thread for an entire run (gate arm C).
         from storage.file_dating import DEFAULT_DATING_BUDGET_SECONDS

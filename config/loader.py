@@ -444,6 +444,9 @@ class ConfigLoader:
             graphql_batch_size=data.get("graphql_batch_size", 4),
             graphql_batch_max=data.get("graphql_batch_max", 50),
             coalesce_window_s=data.get("coalesce_window_s", 0.25),
+            background_batching=data.get("background_batching", False),
+            background_pending_cap=data.get("background_pending_cap", 10_000),
+            background_drain_timeout_s=data.get("background_drain_timeout_s", 60.0),
         )
 
     def _parse_early_stop_config(self, data: Dict[str, Any]) -> EarlyStopConfig:

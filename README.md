@@ -1177,6 +1177,11 @@ precondition on already-gathered links) can be disabled independently with
 pre-change byte-for-byte behavior without touching the dating subsystem.
 The opportunistic coalescing window (P21) can be disabled with
 `file_dating.coalesce_window_s: 0` — a config flip, no code change.
+Background batching (P21 step 2) decouples dating latency from gather workers:
+gather submits URLs to an in-RAM pending set in O(1) and a background thread
+drains batches through GraphQL. Enabled with `file_dating.background_batching: true`
+(requires `enabled: true` and `transport: graphql`). Pending cap, drain timeout
+and batch sizing are independently configurable.
 
 See `docs/specs/registry_flags_metrics.md` for the flag/metrics dictionary and
 the enrichment semantics.
