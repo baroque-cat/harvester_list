@@ -465,6 +465,7 @@ class SearchStage(BasePipelineStage):
                 total=total,
                 n_results=len(results),
                 pages_needed=pages_needed,
+                owner_provider=task.provider,
             )
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(f"[{self.name}] registry wire_coverage hook failed: {e}")

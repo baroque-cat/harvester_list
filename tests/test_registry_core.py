@@ -68,7 +68,7 @@ def test_s3_schema_bootstrap_on_empty_workspace(workspace, db_rows, db_scalar, r
     indexes = {row["name"] for row in db_rows(workspace, "SELECT name FROM sqlite_master WHERE type='index'")}
     assert {"idx_links_repo", "idx_links_last_seen", "idx_file_meta_fetched", "idx_key_sources_url"} <= indexes
 
-    assert db_scalar(workspace, "PRAGMA user_version") == 7
+    assert db_scalar(workspace, "PRAGMA user_version") == 8
 
 
 def test_s7_flag_off_behaves_exactly_as_today(workspace, registry_path):

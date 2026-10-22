@@ -74,7 +74,7 @@ def _is_fatal_db_error(exc: BaseException) -> bool:
     return True
 
 # Bump when the schema changes; later changes may only ADD columns/tables.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 REGISTRY_FILENAME = "registry.sqlite"
 
 # Operations understood by the writer thread.
@@ -212,6 +212,9 @@ FROM key_sources ks JOIN links l ON l.url_hash = ks.url_hash;
 -- pages of each wire query have been fetched so the probe can decide whether
 -- a bucket is fully covered.  pages_done is a contiguity watermark derived
 -- from pages_bitmap: the number of trailing contiguous set bits from bit 0.
+-- owner_provider (slice 3b.2, F-03a/F-18) records which provider paid the
+-- basket for the most recent fetch of this wire (LAST-WINS: rotation changes
+-- the payer between runs, attribution reflects the current payer).
 CREATE TABLE IF NOT EXISTS wire_coverage(
   wire_fp      TEXT NOT NULL,
   patterns_hash TEXT NOT NULL,
@@ -221,6 +224,7 @@ CREATE TABLE IF NOT EXISTS wire_coverage(
   pages_needed INTEGER,
   results      INTEGER DEFAULT 0,
   first_ts     REAL, last_ts REAL,
+  owner_provider TEXT,
   PRIMARY KEY (wire_fp, patterns_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_wire_coverage_ts ON wire_coverage(last_ts);
@@ -436,10 +440,14 @@ WHERE owner = ? AND repo = ? AND path = ?
 # caller as n_results when the bit was not previously set, 0 otherwise
 # (CASE-guard dedup so retries do not double-count).  pages_done is the
 # contiguity watermark of the new bitmap, precomputed in Python.
+# owner_provider (slice 3b.2, F-03a/F-18): LAST-WINS semantics — the most
+# recent fetch overwrites the payer attribution.  Rotation changes the payer
+# between runs, so the column reflects the current payer, not the first.
 _WIRE_COVERAGE_SQL = """
 INSERT INTO wire_coverage (wire_fp, patterns_hash, total_count, pages_bitmap,
-                           pages_done, pages_needed, results, first_ts, last_ts)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           pages_done, pages_needed, results, first_ts, last_ts,
+                           owner_provider)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(wire_fp, patterns_hash) DO UPDATE SET
   total_count = COALESCE(excluded.total_count, wire_coverage.total_count),
   pages_bitmap = wire_coverage.pages_bitmap | excluded.pages_bitmap,
@@ -447,7 +455,8 @@ ON CONFLICT(wire_fp, patterns_hash) DO UPDATE SET
   pages_needed = COALESCE(excluded.pages_needed, wire_coverage.pages_needed),
   results = wire_coverage.results + excluded.results,
   last_ts = excluded.last_ts,
-  first_ts = COALESCE(wire_coverage.first_ts, excluded.first_ts)
+  first_ts = COALESCE(wire_coverage.first_ts, excluded.first_ts),
+  owner_provider = excluded.owner_provider
 """
 
 _RUN_UPSERT_SQL = """
@@ -565,6 +574,17 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_links_visit_status "
         "ON links(visit_status, last_seen_ts DESC)"
     )
+
+    # schema_version < 8 (slice 3b.2, F-03a/F-18): add owner_provider column
+    # to wire_coverage.  Guarded ALTER TABLE for idempotency (pattern from
+    # task_queue v2→v3).  LAST-WINS semantics: rotation changes the payer
+    # between runs, attribution reflects the current payer.
+    wire_columns = {row[1] for row in conn.execute("PRAGMA table_info(wire_coverage)")}
+    if "owner_provider" not in wire_columns:
+        try:
+            conn.execute("ALTER TABLE wire_coverage ADD COLUMN owner_provider TEXT")
+        except sqlite3.OperationalError:
+            pass  # Idempotent: column already exists.
 
 
 def canonical_url(url: str) -> str:
@@ -1207,6 +1227,7 @@ class Registry:
         total: Optional[int],
         n_results: int,
         pages_needed: Optional[int] = None,
+        owner_provider: Optional[str] = None,
     ) -> None:
         """Record one fetched page of a wire query in the wire_coverage table.
 
@@ -1219,6 +1240,11 @@ class Registry:
         ``pages_needed`` is passed explicitly from the seam (page-1 knows it
         from ``ceil(total/page_size)`` clamped to the transport max; page-N
         passes None and COALESCE preserves the page-1 value).
+
+        ``owner_provider`` (slice 3b.2, F-03a/F-18) records which provider
+        paid the basket for this fetch.  LAST-WINS semantics: the most recent
+        fetch overwrites the payer attribution (rotation changes the payer
+        between runs, so the column reflects the current payer).
         """
         if not self.enabled or not self._available or self._suppress_writes:
             return
@@ -1239,6 +1265,7 @@ class Registry:
                 "n_results": n_results,
                 "ts": moment,
                 "pages_needed": pages_needed,
+                "owner_provider": owner_provider,
             },
         )
 
@@ -1778,6 +1805,7 @@ class Registry:
                     ts = payload["ts"]
                     total_count = payload["total_count"]
                     pages_needed = payload["pages_needed"]
+                    owner_provider = payload.get("owner_provider")
 
                     # Read current bitmap to compute watermark + dedup.
                     row = conn.execute(
@@ -1795,6 +1823,7 @@ class Registry:
                         (
                             wire_fp, ph, total_count, bit, watermark,
                             pages_needed, results_addend, ts, ts,
+                            owner_provider,
                         ),
                     )
 

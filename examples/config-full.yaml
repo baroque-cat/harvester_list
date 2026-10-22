@@ -572,6 +572,11 @@ search:
   # mode, the seen-set). Default 50 000 mirrors the gather ledger default.
   # Rollback: return to 50000.
   share_ledger_max_tracked: 50000
+  # Root-order rotation seed (F-03a, slice 3b.2). 0 = random per run (seeded
+  # from os.urandom), >0 = fixed seed for reproducibility (drills/tests).
+  # Active ONLY when share_fetch=on; off/shadow ⇒ byte-identical pre-change order.
+  # Rollback: share_fetch: off makes rotation inactive (invariant 4).
+  root_order_seed: 0
 
 # LLM-provider refusal classification (fix-provider-failure-classification)
 # A capacity refusal on the provider surface (check/inspect stages) is a typed

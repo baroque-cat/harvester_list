@@ -109,6 +109,35 @@ The ledger SHALL be run-scoped and in-RAM. It SHALL NOT be persisted to disk. On
 - **WHEN** the pipeline restarts
 - **THEN** the ledger is empty and providers can re-claim keys they claimed in the previous run
 
+### Requirement: Root-order rotation (F-03a, slice 3b.2)
+
+When `search.share_fetch` is `on`, the pipeline SHALL rotate the order in which providers are iterated when creating initial search tasks. The rotation SHALL be deterministic given a seed (`search.root_order_seed`): 0 = random per run (seeded from os.urandom), >0 = fixed seed for reproducibility. The rotation SHALL be a pure permutation (multiset-invariant: same elements, different order). The rotation SHALL be logged at INFO level with the seed and resulting order. When `search.share_fetch` is `off` or `shadow`, the rotation SHALL NOT be applied (byte-identical to pre-change behavior).
+
+#### Scenario: Rotation active only when share_fetch=on
+
+- **WHEN** `search.share_fetch` is `on` and `search.root_order_seed` is 42
+- **THEN** the provider iteration order is permuted deterministically, and an INFO log records `seed=42` and the resulting order
+
+#### Scenario: Rotation inactive when share_fetch=off
+
+- **WHEN** `search.share_fetch` is `off`
+- **THEN** the provider iteration order is byte-identical to the config declaration order (no rotation applied)
+
+#### Scenario: Seed reproducibility
+
+- **WHEN** `search.root_order_seed` is 42 and the pipeline is run twice
+- **THEN** both runs produce the same provider iteration order
+
+#### Scenario: Uniform distribution
+
+- **WHEN** the pipeline is run 40 times with seeds 1..40 and 4 providers
+- **THEN** each provider is first in the iteration order approximately 10 times (±5 tolerance)
+
+#### Scenario: Locality preserved
+
+- **WHEN** rotation is applied and `order_tasks_for_locality` is called
+- **THEN** tasks with the same (transport, fingerprint) remain adjacent (locality grouping is not broken by rotation)
+
 ### Requirement: F1 × ledger interaction
 
 When all refine children are suppressed by the ledger (share_suppressed > 0), the F1 pagination fallback SHALL NOT fire. The fallback condition changes from `enqueued == 0 and total > per_page` to `enqueued == 0 and share_suppressed == 0 and total > per_page`. This prevents creating pagination tasks for a parent whose children are already being handled by the twin's subtree.

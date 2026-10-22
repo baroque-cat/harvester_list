@@ -794,10 +794,14 @@ class SearchConfig:
     byte-identical pre-change), ``shadow`` (counts would-be suppressions
     without acting), ``on`` (enforces cross-provider search-task sharing).
     ``share_ledger_max_tracked`` bounds the in-RAM tracked-key cap.
+    ``root_order_seed`` controls the deterministic rotation of provider order
+    for root-order rotation (F-03a): 0 = random per run, >0 = fixed seed for
+    reproducibility.
     """
 
     share_fetch: str = "off"
     share_ledger_max_tracked: int = 50_000
+    root_order_seed: int = 0
 
     def __post_init__(self):
         # Mirrors ConfigValidator._validate_search_config on purpose: this
@@ -810,6 +814,10 @@ class SearchConfig:
         self.share_ledger_max_tracked = int(self.share_ledger_max_tracked)
         if self.share_ledger_max_tracked <= 0:
             raise ValueError("search.share_ledger_max_tracked must be positive")
+
+        self.root_order_seed = int(self.root_order_seed)
+        if self.root_order_seed < 0:
+            raise ValueError("search.root_order_seed must be non-negative")
 
 
 @dataclass

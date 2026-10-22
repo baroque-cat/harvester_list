@@ -188,14 +188,19 @@ The system SHALL provide a migration tool that populates the registry from exist
 - **WHEN** the registry already contains a link with `visit_status='gathered_ok'` and the migration processes an older shard mentioning the same URL
 - **THEN** the existing row keeps its `gathered_ok` status and `gathered_ts`
 
-### Requirement: Wire coverage accounting (schema v7)
+### Requirement: Wire coverage accounting (schema v8)
 
-The system SHALL maintain a `wire_coverage` table (schema version 7, additive migration from v6) recording which pages of each wire query have been fetched. Identity is `(wire_fp, patterns_hash)` where `wire_fp = sha256("<api|web>|<wire_query>")` (the same fingerprint used by the refine governor). The table SHALL track a gap-safe bitmap of completed pages and a contiguity watermark (`pages_done`) so that later probes can decide whether a bucket is fully covered without being fooled by holes or out-of-order completions.
+The system SHALL maintain a `wire_coverage` table (schema version 8, additive migration from v7) recording which pages of each wire query have been fetched. Identity is `(wire_fp, patterns_hash)` where `wire_fp = sha256("<api|web>|<wire_query>")` (the same fingerprint used by the refine governor). The table SHALL track a gap-safe bitmap of completed pages and a contiguity watermark (`pages_done`) so that later probes can decide whether a bucket is fully covered without being fooled by holes or out-of-order completions. The table SHALL include an `owner_provider TEXT` column (slice 3b.2, F-03a/F-18) recording which provider paid the basket for the most recent fetch of this wire (LAST-WINS semantics: rotation changes the payer between runs, attribution reflects the current payer). NULL is permitted for legacy rows.
 
 #### Scenario: Schema contract on fresh bootstrap
 
 - **WHEN** the registry is enabled and bootstraps a new database
-- **THEN** the `wire_coverage` table exists with columns `(wire_fp, patterns_hash, total_count, pages_bitmap, pages_done, pages_needed, results, first_ts, last_ts)`, primary key `(wire_fp, patterns_hash)`, index `idx_wire_coverage_ts`, and `PRAGMA user_version = 7`
+- **THEN** the `wire_coverage` table exists with columns `(wire_fp, patterns_hash, total_count, pages_bitmap, pages_done, pages_needed, results, first_ts, last_ts, owner_provider)`, primary key `(wire_fp, patterns_hash)`, index `idx_wire_coverage_ts`, and `PRAGMA user_version = 8`
+
+#### Scenario: Migration v7→v8 adds owner_provider
+
+- **WHEN** the registry opens a v7 database
+- **THEN** the `owner_provider TEXT` column is added (NULL for existing rows), `PRAGMA user_version` becomes 8, and the migration is idempotent on reopen
 
 #### Scenario: Page-1 seam writes totals and needed
 

@@ -74,6 +74,30 @@ def _search_identity(task: SearchTask) -> tuple:
     return (use_api, fingerprint(task.query, use_api))
 
 
+def rotate_provider_order(names: List[str], seed: int) -> List[str]:
+    """Deterministic permutation of provider names for root-order rotation (F-03a).
+
+    Pure function: same seed ⇒ same order.  Multiset-invariant: the output
+    contains exactly the same elements as the input.  Used to rotate the order
+    in which providers are iterated when creating initial search tasks, so that
+    the first-claimant (who owns the root in search-share ledger) varies between
+    runs, balancing basket consumption across providers.
+
+    Args:
+        names: List of provider names.
+        seed: Integer seed for deterministic permutation.
+
+    Returns:
+        Permuted list with same elements.
+    """
+    import random
+
+    rng = random.Random(seed)
+    result = list(names)
+    rng.shuffle(result)
+    return result
+
+
 def order_tasks_for_locality(tasks: List[SearchTask]) -> List[SearchTask]:
     """Stably group initial tasks by (transport, fingerprint) (design D9).
 
@@ -437,7 +461,26 @@ class TaskManager(LifecycleManager, TaskDataProvider):
         # never blocks startup (design D8).
         has_token, has_session = _probe_github_credentials()
 
-        for task_config in self.config.tasks:
+        # F-03a: rotate provider order when share_fetch=on to balance root claims.
+        # Gate: active ONLY when share_fetch="on"; off/shadow ⇒ byte-identical order.
+        tasks_list = list(self.config.tasks)
+        share_mode = getattr(self.config.search, "share_fetch", "off")
+        if share_mode == "on":
+            provider_names = [tc.name for tc in tasks_list]
+            seed = getattr(self.config.search, "root_order_seed", 0)
+            if seed == 0:
+                import os
+                seed = int.from_bytes(os.urandom(4), "little")
+            rotated_names = rotate_provider_order(provider_names, seed)
+            # Reorder tasks_list to match rotated provider names.
+            name_to_task = {tc.name: tc for tc in tasks_list}
+            tasks_list = [name_to_task[n] for n in rotated_names if n in name_to_task]
+            logger.info(
+                f"search-share root-order rotation: seed={seed}, "
+                f"order={rotated_names}"
+            )
+
+        for task_config in tasks_list:
             if not task_config.enabled:
                 continue
 

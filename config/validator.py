@@ -720,6 +720,10 @@ class ConfigValidator:
         if int(search_config.share_ledger_max_tracked) <= 0:
             self.errors.append("search.share_ledger_max_tracked must be positive")
 
+        # Non-negative seed for root-order rotation.
+        if int(search_config.root_order_seed) < 0:
+            self.errors.append("search.root_order_seed must be non-negative")
+
     def _validate_provider_config(self, config: Config) -> None:
         """Validate the LLM-provider refusal-classification configuration section.
 

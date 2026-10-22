@@ -1,4 +1,4 @@
-"""wire_coverage table (schema v7) + record_wire_page + page seams (F-01, slice 3a.1).
+"""wire_coverage table (schema v8) + record_wire_page + page seams (F-01, slice 3a.1).
 
 Traceability: 03_sql_integration.md D-03.1, F-01 (gap-safe bitmap+watermark).
 
@@ -29,14 +29,14 @@ from storage.registry import Registry, SCHEMA_VERSION
 # ---------------------------------------------------------------------------
 def test_w1_contract_fresh_registry(workspace, db_rows, db_scalar, registry_path):
     """W1: fresh bootstrap creates wire_coverage with exact DDL, PK, indexes,
-    user_version==7, SCHEMA_VERSION==7, and idx_links_visit_status."""
+    user_version==8, SCHEMA_VERSION==8, and idx_links_visit_status."""
     registry = Registry(workspace, enabled=True)
     registry.start()
     registry.stop()
 
     # Schema version bumped.
-    assert SCHEMA_VERSION == 7
-    assert db_scalar(workspace, "PRAGMA user_version") == 7
+    assert SCHEMA_VERSION == 8
+    assert db_scalar(workspace, "PRAGMA user_version") == 8
 
     # wire_coverage table exists with exact column set/order.
     columns = db_rows(workspace, "PRAGMA table_info(wire_coverage)")
@@ -44,6 +44,7 @@ def test_w1_contract_fresh_registry(workspace, db_rows, db_scalar, registry_path
     assert col_names == [
         "wire_fp", "patterns_hash", "total_count", "pages_bitmap",
         "pages_done", "pages_needed", "results", "first_ts", "last_ts",
+        "owner_provider",
     ]
 
     # PK is (wire_fp, patterns_hash).
@@ -62,7 +63,7 @@ def test_w1_contract_fresh_registry(workspace, db_rows, db_scalar, registry_path
 # W2: migration v6 -> v7
 # ---------------------------------------------------------------------------
 def test_w2_migration_v6_to_v7(workspace, db_rows, db_scalar, registry_path):
-    """W2: a v6 database migrates to v7 with wire_coverage present and
+    """W2: a v6 database migrates to v8 with wire_coverage present and
     pre-existing links rows untouched."""
     path = registry_path(workspace)
     conn = sqlite3.connect(path)
@@ -176,8 +177,8 @@ def test_w2_migration_v6_to_v7(workspace, db_rows, db_scalar, registry_path):
     registry.start()
     registry.stop()
 
-    # user_version is now 7.
-    assert db_scalar(workspace, "PRAGMA user_version") == 7
+    # user_version is now 8.
+    assert db_scalar(workspace, "PRAGMA user_version") == 8
 
     # wire_coverage table exists.
     tables = {row["name"] for row in db_rows(workspace, "SELECT name FROM sqlite_master WHERE type='table'")}

@@ -199,7 +199,7 @@ def test_s4_schema_v4_migrates_to_v5(workspace, db_rows, db_scalar, registry_pat
     registry.stop()
 
     # Schema version is now 7.
-    assert db_scalar(workspace, "PRAGMA user_version") == 7
+    assert db_scalar(workspace, "PRAGMA user_version") == 8
 
     # New columns exist.
     columns = {row["name"] for row in db_rows(workspace, "PRAGMA table_info(links)")}
@@ -233,10 +233,10 @@ def test_s5_migration_is_idempotent_at_v5(workspace, db_scalar):
     registry = Registry(workspace, enabled=True)
     registry.start()
     registry.stop()
-    assert db_scalar(workspace, "PRAGMA user_version") == 7
+    assert db_scalar(workspace, "PRAGMA user_version") == 8
 
     # Second open: migration guard runs again, must be a no-op.
     registry2 = Registry(workspace, enabled=True)
     registry2.start()
     registry2.stop()
-    assert db_scalar(workspace, "PRAGMA user_version") == 7
+    assert db_scalar(workspace, "PRAGMA user_version") == 8

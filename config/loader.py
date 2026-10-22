@@ -607,6 +607,7 @@ class ConfigLoader:
         return SearchConfig(
             share_fetch=data.get("share_fetch", "off"),
             share_ledger_max_tracked=data.get("share_ledger_max_tracked", 50_000),
+            root_order_seed=data.get("root_order_seed", 0),
         )
 
     def _parse_credential_liveness_config(self, data: Dict[str, Any]) -> CredentialLivenessConfig:

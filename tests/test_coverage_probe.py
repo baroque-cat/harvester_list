@@ -42,16 +42,18 @@ def _make_registry(workspace):
 
 
 def _insert_wire_coverage(conn, wire_fp, patterns_hash, pages_done,
-                          pages_needed, last_ts, total_count=1000):
+                          pages_needed, last_ts, total_count=1000,
+                          owner_provider=None):
     """Direct SQL insert for test setup."""
     conn.execute(
         "INSERT OR REPLACE INTO wire_coverage "
         "(wire_fp, patterns_hash, total_count, pages_bitmap, pages_done, "
-        "pages_needed, results, first_ts, last_ts) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "pages_needed, results, first_ts, last_ts, owner_provider) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (wire_fp, patterns_hash, total_count,
          (1 << pages_needed) - 1 if pages_done >= pages_needed else 1,
-         pages_done, pages_needed, 100, last_ts - 10, last_ts),
+         pages_done, pages_needed, 100, last_ts - 10, last_ts,
+         owner_provider),
     )
     conn.commit()
 
