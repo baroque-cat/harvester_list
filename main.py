@@ -446,6 +446,8 @@ Examples:
   %(prog)s -c custom.yaml           # Run with custom config
   %(prog)s --validate               # Validate configuration
   %(prog)s --create-config          # Create sample configuration
+  %(prog)s purge links --dry-run    # Dry-run purge of links
+  %(prog)s purge all --yes          # Purge all workspace data
   %(prog)s --log-level DEBUG        # Enable debug logging
   %(prog)s --timeout 300            # Set maximum runtime
         """,
@@ -475,7 +477,55 @@ Examples:
 
     parser.add_argument("--create-config", action="store_true", help="Create sample configuration file and exit")
 
+    # Purge subparser (slice 4.2, wave 4): dest="command", default=None
+    # ensures all existing invocation forms remain byte-identical.
+    subparsers = parser.add_subparsers(dest="command")
+    purge_parser = subparsers.add_parser("purge", help="Purge workspace data by profile")
+    purge_parser.add_argument("profile", choices=["all", "links", "keys", "queues", "telemetry", "shards"],
+                              help="Purge profile")
+    purge_parser.add_argument("--workspace", help="Workspace directory (overrides config)")
+    purge_parser.add_argument("--dry-run", action="store_true", help="Enumerate what would be deleted, make no changes")
+    purge_parser.add_argument("--backup-to", help="Backup directory for deleted data")
+    purge_parser.add_argument("--yes", action="store_true", help="Confirm purge (required without --dry-run)")
+    purge_parser.add_argument("--force", action="store_true", help="Force purge even if pre-conditions are not met")
+
     args = parser.parse_args()
+
+    # Handle purge command (slice 4.2) — before config validation, lock check, etc.
+    if args.command == "purge":
+        # Require --yes or --dry-run
+        if not args.yes and not args.dry_run:
+            print("Error: purge requires --yes (to confirm) or --dry-run (to preview)", file=sys.stderr)
+            sys.exit(1)
+
+        # Resolve workspace
+        if args.workspace:
+            ws = args.workspace
+        else:
+            # Read workspace from config YAML (YAML-only parse, no credentials needed)
+            try:
+                import yaml as _yaml
+                with open(args.config, "r", encoding="utf-8") as _f:
+                    _raw = _yaml.safe_load(_f) or {}
+                ws = (_raw.get("global") or {}).get("workspace", "./data")
+            except Exception as exc:
+                print(f"Error: failed to read workspace from config: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+        # Initialize logging
+        init_logging(args.log_level)
+
+        # Execute purge
+        from tools.purge import purge as purge_fn
+        exit_code = purge_fn(
+            profile=args.profile,
+            workspace=ws,
+            config_path=args.config,
+            dry_run=args.dry_run,
+            backup_to=args.backup_to,
+            force=args.force,
+        )
+        sys.exit(exit_code)
 
     # Handle special commands first
     if args.create_config:

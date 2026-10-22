@@ -981,6 +981,65 @@ python -m tools.registry_migrate --workspace ./data --registry /path/registry.sq
 - **Degraded runs:** any registry error logs a warning, marks the run degraded
   in `runs.degraded`, and continues harvesting unchanged.
 
+### Workspace Purge
+
+The `purge` command provides profile-based deletion of workspace data with
+fail-CLOSED interlocks, optional backup, and atomic receipt generation.
+
+```bash
+# Preview what would be deleted (no changes)
+python main.py purge links --dry-run
+
+# Delete links and related tables (requires --yes)
+python main.py purge links --yes
+
+# Delete with backup
+python main.py purge all --yes --backup-to /path/to/backup
+
+# Force shards deletion even without wire_coverage table
+python main.py purge shards --yes --force
+```
+
+**Profiles:**
+
+| Profile   | Deletes                                                                 | Effect                                                        |
+|-----------|-------------------------------------------------------------------------|---------------------------------------------------------------|
+| `all`     | Everything in workspace (queues → shards → telemetry → registry last)   | Full reset to fresh workspace                                 |
+| `links`   | Tables: links, link_coverage, file_meta, repos, wire_coverage          | Re-gather everything; dates lost                              |
+| `keys`    | Tables: keys, key_sources                                               | Keys re-checked from scratch                                  |
+| `queues`  | `<workspace>/queue_state/*` (only when pipeline stopped)               | Unfinished work dropped; recovery from registry/shards        |
+| `telemetry`| Decision JSONL ×2, provider snapshots                                  | Observability reset; product intact                           |
+| `shards`  | `providers/*/shards/**` + snapshots                                     | Audit log lost; recovery from SQL only (post-3a)              |
+
+**Interlocks (fail-CLOSED):**
+
+- **Lock symmetry**: purge acquires the run-lock; refuses if pipeline is live
+- **WAL freshness**: refuses if WAL files are < 120s old (conservative)
+- **Shards gate**: requires `wire_coverage` table (post-3a); `--force` bypasses with warning
+- **Idempotent**: second run exits 0 with zero counters
+
+**Backup (F-29):**
+
+- Registry: NDJSON dumps (one file per table)
+- Shards/snapshots: tar.gz archive
+- Queues: byte copies
+- Backup directory: mode 0700; artifacts: mode 0600
+- Receipt records backup path and MD5 hashes
+
+> **⚠️ Warning**: Backups contain collected secrets in plaintext (category 2).
+> Store backups securely and delete when no longer needed.
+
+**Receipt:**
+
+After successful purge, a receipt is written to `<workspace>/purge_receipts/receipt_<ts>.json`
+containing: profile, argv, areas (counters only, no values), backup info, config MD5, git HEAD,
+timestamps, duration, and warnings. The receipt contains ONLY counters and names — never secret values.
+
+**N-11 caveat**: Legacy `bulk_insert` rows have `dedup_id=''` (invisible to both dedup layers).
+This is relevant for future restore (slice 4.3).
+
+See `openspec/specs/purge-cli/spec.md` for the full specification.
+
 ### Date extraction (free freshness metadata)
 
 While the registry is enabled, the harvester also fills the reserved

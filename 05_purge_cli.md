@@ -2,6 +2,8 @@
 
 **Статус:** проект; профили утверждены оператором (ответов оператора, раунд 2, п.7: «всё что описал более чем достаточно»), парсер + `--dry-run` подтверждены (ответов оператора, раунд 2, п.6). **Поправка 2026-10-21 (аудит):** F-10 (TOCTOU интерлоков → симметричный lock + startup-refuse), N-10 (wal/shm sidecar реестра), F-29 (права backup-артефактов), F-15 (последствие shards-профиля для recheck/check-recovery), пин T14. **Дата:** 2026-10-21.
 
+**4.2 ИСПОЛНЕН 2026-10-23**: срез 4.2 (purge CLI) реализован: `tools/purge.py` + subparser в `main.py`, 24 пина в `tests/test_purge_cli.py` (T1–T14, N-10, parser compatibility), suite 983→1007. Спека: `openspec/specs/purge-cli/spec.md`. README: секция «Workspace Purge».
+
 ---
 
 ## 5.1 Форма команды
