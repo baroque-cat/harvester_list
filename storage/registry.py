@@ -1520,7 +1520,6 @@ class Registry:
         limit: int = 0,
         before_ts: Optional[float] = None,
         before_hash: Optional[str] = None,
-        provider: Optional[str] = None,
         chunk_size: int = 1000,
     ) -> Generator[Tuple[str, str, float], None, None]:
         """Stream recoverable acquisition URLs from the registry (slice 3a.3).
@@ -1533,18 +1532,21 @@ class Registry:
 
         Uses keyset pagination with bounded RAM: each fetch retrieves at most
         ``chunk_size`` rows (default 1000, the canonical D-03.4 chunk).  The
-        caller controls ``limit`` (0 = unlimited), ``before_ts``/``before_hash``
-        (composite continuation marker from a prior boot), and ``provider``
-        (optional per-provider filter for legacy shard-path attribution, D3 fix).
+        caller controls ``limit`` (0 = unlimited) and ``before_ts``/``before_hash``
+        (composite continuation marker from a prior boot).
+
+        The selection is GLOBAL — no provider filter (C-3aG-3, gate 3a.G G2,
+        2026-10-22): ``links.provider`` records the FIRST discoverer only
+        (links rows are written once per url_hash), so filtering by it starves
+        every non-first-discovering provider.  Each provider iterates the same
+        freshest-first set; per-provider suppression happens below in the P26
+        stack (skip decide → share claim), mirroring the legacy overlapping
+        shard lists.
 
         When both ``before_ts`` and ``before_hash`` are provided, the reader
         applies the full keyset condition:
         ``(last_seen_ts < before_ts OR (last_seen_ts = before_ts AND url_hash > before_hash))``
         This ensures zero data loss at equal-ts boundaries (D2 fix).
-
-        When ``provider`` is specified, the reader adds ``AND provider = ?``
-        to the WHERE clause (D3 fix: per-provider attribution, prevents marker
-        pollution across providers within one boot).
 
         Fail-CLOSED: a fatal database error during reading propagates as
         :class:`RegistryUnavailableError` (no silent swallow, no shard-fallback).
@@ -1574,10 +1576,6 @@ class Registry:
                 # Build WHERE clause dynamically.
                 where_parts = ["visit_status IN (?, ?)"]
                 params: List[Any] = list(_STATUS_FILTER)
-
-                if provider is not None:
-                    where_parts.append("provider = ?")
-                    params.append(provider)
 
                 if before_ts is not None and before_hash is not None:
                     # Cross-boot continuation with composite marker (D2 fix).

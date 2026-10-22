@@ -218,7 +218,6 @@ class TaskRecoveryManager:
             limit=per_boot_cap if per_boot_cap > 0 else 0,
             before_ts=cursor_ts,
             before_hash=cursor_hash,
-            provider=name,
         ):
             total_available += 1
             if uh in seen_hashes:

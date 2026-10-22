@@ -604,8 +604,52 @@ def test_sr18_per_provider_marker_isolation(registry, cap):
     marker_b = registry.get_meta("recovery_cursor:prov-b")
     assert marker_b is not None
 
-    # Markers are different (different providers, different URLs).
-    assert marker_a != marker_b
+    # Independence (C-3aG-3 adaptation): with the GLOBAL discovered-set both
+    # providers share one ordering space, so marker values may coincide; the
+    # guarantee is that A's next boot advances ONLY A's cursor, never B's.
+    tasks_a2 = RecoveredTasks()
+    tasks_a2.acquisition = []
+    mgr._recover_provider_tasks(PROV_A, tasks_a2)
+    marker_a2 = registry.get_meta("recovery_cursor:prov-a")
+    assert marker_a2 is not None
+    assert marker_a2 != marker_a, "A's second boot must advance A's cursor"
+    assert registry.get_meta("recovery_cursor:prov-b") == marker_b, (
+        "A's second boot must not touch B's cursor"
+    )
+
+
+# SR21 — Global discovered-set: every provider recovers the same URLs (C-3aG-3)
+def test_sr21_second_provider_recovers_global_set(registry, cap):
+    """links.provider records the FIRST discoverer only (measured live at gate
+    3a.G G2, 2026-10-22: all 11784 rows carried the single first-discovering
+    provider while per-provider fan-out lives in link_coverage), so filtering
+    the recovery SELECT by links.provider starves every other provider.
+    Canonical D-03.4 selects the GLOBAL discovered/failed set; each provider
+    iterates it and per-provider suppression happens below in the P26 stack
+    (skip decide -> share claim)."""
+    for i in range(3):
+        _seed(registry, _url(i), ts=NOW - i, provider=PROV_A)
+
+    stage = FakeStage()
+    pipe = FakePipeline(
+        stage, registry=registry,
+        recovery_cfg=_RecoveryCfg(source="registry", per_boot_cap=0),
+    )
+    pipe.task_configs = {
+        PROV_A: FakeTaskConfig(PROV_A),
+        PROV_B: FakeTaskConfig(PROV_B),
+    }
+    mgr = _mgr(pipe, providers=(PROV_A, PROV_B))
+
+    urls_b, label_b = mgr._resolve_acquisition_urls(PROV_B, [])
+    assert label_b == "registry"
+    assert len(urls_b) == 3, (
+        f"second provider must see the global set, got {len(urls_b)}"
+    )
+
+    urls_a, label_a = mgr._resolve_acquisition_urls(PROV_A, [])
+    assert label_a == "registry"
+    assert sorted(urls_a) == sorted(urls_b)
 
 
 # ---------------------------------------------------------------------------
