@@ -382,6 +382,7 @@ def test_r8_f18_composition_budget_vs_basket(monkeypatch, workspace, db_rows):
     from core.models import Patterns, SearchTask
     from search import client as search_client
     from search.refine_governor import RefineGovernor
+    from search.github.refine.engine import RefineEngine
     from manager.search_share import SearchShareLedger
     from stage.base import StageResources
     from stage.definition import SearchStage
@@ -407,15 +408,16 @@ def test_r8_f18_composition_budget_vs_basket(monkeypatch, workspace, db_rows):
         stages=StageConfig(search=True, gather=True, check=True, inspect=True),
         patterns=Patterns(key_pattern=KEY_PATTERN),
     )
+    # F-18: mode="on" enables admission control and budget tracking.
     gov = RefineGovernor(
-        mode="off", max_refine_depth=2, max_partitions_per_refine=128,
+        mode="on", max_refine_depth=2, max_partitions_per_refine=128,
         max_search_tasks_per_run=10000, drop_wire_indistinguishable=False,
     )
     cfg = Config()
     cfg.pipeline.failure_handling = "legacy"
     cfg.search = SearchConfig(share_fetch="on")
     cfg.refine_governor = RefineGovernorConfig(
-        mode="off", max_refine_depth=2, max_partitions_per_refine=128,
+        mode="on", max_refine_depth=2, max_partitions_per_refine=128,
         max_search_tasks_per_run=10000,
     )
 
@@ -443,21 +445,25 @@ def test_r8_f18_composition_budget_vs_basket(monkeypatch, workspace, db_rows):
         refine_governor=gov,
     )
     outputs = []
-    stage = StageResources = StageResources(
-        limiter=None, providers={}, config=cfg,
-        task_configs={PROVIDER_A: task_config_a, PROVIDER_B: task_config_b},
-        auth=FakeAuth(), registry=registry,
-        refine_governor=gov,
-    )
     stage = SearchStage(resources, outputs.append, thread_count=1)
 
+    # Mock search to return total > API_LIMIT (1000) to trigger refine.
     def fake_search(**kwargs):
-        total = 950
-        n = min(total, 100)
+        total = 5000  # > API_LIMIT, triggers refine
+        n = 100
         urls = [f"https://github.com/o/r/blob/main/f{i}.py" for i in range(n)]
         return urls, total, ""
 
     monkeypatch.setattr(search_client, "search_with_count", fake_search)
+
+    # Mock RefineEngine.generate_queries to return predictable children.
+    def fake_generate_queries(self, query, partitions):
+        return ["/sk-aaa[a-z]{29}/", "/sk-bbb[a-z]{29}/"]
+
+    monkeypatch.setattr(
+        RefineEngine, "generate_queries",
+        fake_generate_queries,
+    )
 
     # A executes the search (it owns the claim).
     task_a = SearchTask(
@@ -466,6 +472,15 @@ def test_r8_f18_composition_budget_vs_basket(monkeypatch, workspace, db_rows):
     )
     out_a = stage.process_task(task_a)
     assert out_a is not None
+
+    # F-18: governor budget reflects ONLY A's admitted children.
+    # A executed and generated/admitted children (refine happened).
+    # B's suppressed root did NOT consume budget (B never called governor).
+    # This is structural: B was suppressed at ledger.claim(), before governor.
+    metrics = gov.metrics
+    assert metrics["children_generated"] > 0, "A should have generated children via refine"
+    assert metrics["children_admitted"] > 0, "A should have admitted some children"
+    assert metrics["parents_refined"] == 1, "Only A's root should be refined (B was suppressed)"
 
     registry.stop()
 
@@ -476,22 +491,137 @@ def test_r8_f18_composition_budget_vs_basket(monkeypatch, workspace, db_rows):
 
 
 # ---------------------------------------------------------------------------
-# R9: gate neutrality — share_fetch=off/shadow ⇒ no rotation
+# R9: gate end-to-end — share_fetch=off/shadow ⇒ no rotation, on ⇒ rotation
 # ---------------------------------------------------------------------------
-def test_r9_gate_neutrality_no_rotation():
-    """R9: when share_fetch=off or shadow, rotate_provider_order is NOT called
-    (or is a no-op). The order must be byte-identical to pre-change."""
-    from manager.task import rotate_provider_order
+def test_r9_gate_end_to_end(monkeypatch):
+    """R9: drive TaskManager._create_initial_tasks end-to-end.
+    (a) share_fetch=off ⇒ order = config.tasks declaration order (byte-identical).
+    (b) share_fetch=shadow ⇒ same (gate is on-only).
+    (c) share_fetch=on + root_order_seed=42 ⇒ order == rotate_provider_order(names, 42).
+    """
+    from unittest.mock import MagicMock
+    from config.schemas import Config, SearchConfig, StageConfig, TaskConfig
+    from core.models import Patterns
+    from manager.task import TaskManager, rotate_provider_order
 
-    providers = ["prov_a", "prov_b", "prov_c", "prov_d"]
+    # Build minimal config with 4 providers.
+    cfg = Config()
+    cfg.search = SearchConfig(share_fetch="off")
+    cfg.tasks = [
+        TaskConfig(name="prov_a", enabled=True, provider_type="openai_like", use_api=True,
+                   stages=StageConfig(search=True, gather=True, check=True, inspect=True),
+                   patterns=Patterns(key_pattern="sk-[A-Za-z0-9]{16}")),
+        TaskConfig(name="prov_b", enabled=True, provider_type="openai_like", use_api=True,
+                   stages=StageConfig(search=True, gather=True, check=True, inspect=True),
+                   patterns=Patterns(key_pattern="sk-[A-Za-z0-9]{16}")),
+        TaskConfig(name="prov_c", enabled=True, provider_type="openai_like", use_api=True,
+                   stages=StageConfig(search=True, gather=True, check=True, inspect=True),
+                   patterns=Patterns(key_pattern="sk-[A-Za-z0-9]{16}")),
+        TaskConfig(name="prov_d", enabled=True, provider_type="openai_like", use_api=True,
+                   stages=StageConfig(search=True, gather=True, check=True, inspect=True),
+                   patterns=Patterns(key_pattern="sk-[A-Za-z0-9]{16}")),
+    ]
 
-    # With seed=0 (random), the function should still be deterministic given same seed.
-    order1 = rotate_provider_order(providers, seed=42)
-    order2 = rotate_provider_order(providers, seed=42)
-    assert order1 == order2
+    # Create TaskManager without __init__ (avoid heavy provider/pipeline init).
+    tm = TaskManager.__new__(TaskManager)
+    tm.config = cfg
+    tm.providers = {}
+    tm.pipeline = MagicMock()
+    tm.start_time = 0
 
-    # Multiset invariant.
-    assert sorted(order1) == sorted(providers)
+    # Mock _probe_github_credentials to return (True, False).
+    monkeypatch.setattr("manager.task._probe_github_credentials", lambda: (True, False))
+
+    # Mock provider.conditions to return one condition per provider.
+    class FakeProvider:
+        def __init__(self, name):
+            self.name = name
+            from core.models import Condition, Patterns
+            self.conditions = [Condition(patterns=Patterns(key_pattern="sk-[A-Za-z0-9]{16}"))]
+
+    tm.providers = {f"prov_{x}": FakeProvider(f"prov_{x}") for x in ["a", "b", "c", "d"]}
+
+    # (a) share_fetch=off ⇒ order = config.tasks declaration order.
+    cfg.search = SearchConfig(share_fetch="off")
+    tasks_off = tm._create_initial_tasks()
+    providers_off = [t.provider for t in tasks_off]
+    assert providers_off == ["prov_a", "prov_b", "prov_c", "prov_d"], \
+        f"off mode: expected declaration order, got {providers_off}"
+
+    # (b) share_fetch=shadow ⇒ same (gate is on-only).
+    cfg.search = SearchConfig(share_fetch="shadow")
+    tasks_shadow = tm._create_initial_tasks()
+    providers_shadow = [t.provider for t in tasks_shadow]
+    assert providers_shadow == ["prov_a", "prov_b", "prov_c", "prov_d"], \
+        f"shadow mode: expected declaration order, got {providers_shadow}"
+
+    # (c) share_fetch=on + root_order_seed=42 ⇒ order == rotate_provider_order(names, 42).
+    cfg.search = SearchConfig(share_fetch="on", root_order_seed=42)
+    tasks_on = tm._create_initial_tasks()
+    providers_on = [t.provider for t in tasks_on]
+    expected_order = rotate_provider_order(["prov_a", "prov_b", "prov_c", "prov_d"], seed=42)
+    assert providers_on == expected_order, \
+        f"on mode: expected {expected_order}, got {providers_on}"
+
+
+# ---------------------------------------------------------------------------
+# R9b: seed=0 ⇒ INFO log with seed value
+# ---------------------------------------------------------------------------
+def test_r9b_seed_zero_logs_info(caplog, monkeypatch):
+    """R9b: share_fetch=on + root_order_seed=0 ⇒ INFO log 'root-order rotation: seed='
+    with an integer seed, order is a permutation of declared providers."""
+    import logging
+    from unittest.mock import MagicMock
+    from config.schemas import Config, SearchConfig, StageConfig, TaskConfig
+    from core.models import Patterns
+    from manager.task import TaskManager
+
+    cfg = Config()
+    cfg.search = SearchConfig(share_fetch="on", root_order_seed=0)
+    cfg.tasks = [
+        TaskConfig(name="prov_a", enabled=True, provider_type="openai_like", use_api=True,
+                   stages=StageConfig(search=True, gather=True, check=True, inspect=True),
+                   patterns=Patterns(key_pattern="sk-[A-Za-z0-9]{16}")),
+        TaskConfig(name="prov_b", enabled=True, provider_type="openai_like", use_api=True,
+                   stages=StageConfig(search=True, gather=True, check=True, inspect=True),
+                   patterns=Patterns(key_pattern="sk-[A-Za-z0-9]{16}")),
+    ]
+
+    tm = TaskManager.__new__(TaskManager)
+    tm.config = cfg
+    tm.providers = {}
+    tm.pipeline = MagicMock()
+    tm.start_time = 0
+
+    monkeypatch.setattr("manager.task._probe_github_credentials", lambda: (True, False))
+
+    class FakeProvider:
+        def __init__(self, name):
+            self.name = name
+            from core.models import Condition, Patterns
+            self.conditions = [Condition(patterns=Patterns(key_pattern="sk-[A-Za-z0-9]{16}"))]
+
+    tm.providers = {"prov_a": FakeProvider("prov_a"), "prov_b": FakeProvider("prov_b")}
+
+    with caplog.at_level(logging.INFO):
+        tasks = tm._create_initial_tasks()
+
+    # Check INFO log contains 'root-order rotation: seed=' with an integer.
+    log_messages = [record.message for record in caplog.records]
+    rotation_logs = [msg for msg in log_messages if "root-order rotation: seed=" in msg]
+    assert len(rotation_logs) >= 1, f"Expected INFO log with seed, got {log_messages}"
+
+    # Extract seed from log message.
+    import re
+    match = re.search(r"seed=(\d+)", rotation_logs[0])
+    assert match, f"Could not extract seed from log: {rotation_logs[0]}"
+    seed_value = int(match.group(1))
+    assert seed_value > 0, f"seed=0 should be replaced with random >0, got {seed_value}"
+
+    # Order is a permutation of declared providers.
+    providers = [t.provider for t in tasks]
+    assert sorted(providers) == ["prov_a", "prov_b"], \
+        f"Expected permutation of [prov_a, prov_b], got {providers}"
 
 
 # ---------------------------------------------------------------------------
