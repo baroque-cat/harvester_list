@@ -462,6 +462,12 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
 
     def _on_start(self) -> None:
         """Start all pipeline stages"""
+        # Acquire the run lock (fail-CLOSED, slice 4.1).
+        # LockHeldError propagates — main.py catches it for a loud refuse.
+        from tools.run_lock import acquire_lock
+
+        acquire_lock(self.config.global_config.workspace, holder="pipeline")
+
         # Open the write-only registry before stages begin producing
         self.link_registry.start()
 
@@ -490,45 +496,56 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(f"Failed to stop recheck manager: {e}")
 
-        if not self.stages:
-            return
-
-        # Stop stages in reverse dependency order
-        ordered_stages = self.get_order()
-        stage_timeout = 30.0 / len(self.stages) if self.stages else 30.0
-
-        for stage_name in reversed(ordered_stages):
-            stage = self.stages.get(stage_name)
-            if stage:
-                stage.stop(stage_timeout)
-
-        # Drain and close the registry before result managers flush
-        self.link_registry.stop()
-        self.gather_skip.close()
-        if hasattr(self, "share_ledger"):
-            self.share_ledger.close()
-        if hasattr(self, "search_share"):
-            self.search_share.close()
-        self.enrichment.close()
-        if hasattr(self, "file_dating"):
-            self.file_dating.close()
-        self.early_stop.close()
-        self.key_ledger.close()
-        self.recheck.close()
-
-        # Persist final queue state before the queue manager stops (both
-        # backends).  Stages are already stopped, so this observes a quiescent
-        # system; a failure is logged and never aborts shutdown (design D10).
         try:
-            self.queue_manager.save_all_queues(self.stages)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.error(f"Final queue save failed: {e}")
+            if not self.stages:
+                return
 
-        # Stop managers
-        self.queue_manager.stop()
-        self.result_manager.stop_all()
+            # Stop stages in reverse dependency order
+            ordered_stages = self.get_order()
+            stage_timeout = 30.0 / len(self.stages) if self.stages else 30.0
 
-        logger.info("Stopped all pipeline stages")
+            for stage_name in reversed(ordered_stages):
+                stage = self.stages.get(stage_name)
+                if stage:
+                    stage.stop(stage_timeout)
+
+            # Drain and close the registry before result managers flush
+            self.link_registry.stop()
+            self.gather_skip.close()
+            if hasattr(self, "share_ledger"):
+                self.share_ledger.close()
+            if hasattr(self, "search_share"):
+                self.search_share.close()
+            self.enrichment.close()
+            if hasattr(self, "file_dating"):
+                self.file_dating.close()
+            self.early_stop.close()
+            self.key_ledger.close()
+            self.recheck.close()
+
+            # Persist final queue state before the queue manager stops (both
+            # backends).  Stages are already stopped, so this observes a quiescent
+            # system; a failure is logged and never aborts shutdown (design D10).
+            try:
+                self.queue_manager.save_all_queues(self.stages)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.error(f"Final queue save failed: {e}")
+
+            # Stop managers
+            self.queue_manager.stop()
+            self.result_manager.stop_all()
+
+            logger.info("Stopped all pipeline stages")
+        finally:
+            # Release the run lock (slice 4.1, idempotent — only removes own lock).
+            # In a finally block so it runs even on early return or exception.
+            # Defensive: if config is not available (e.g., test stub), skip release.
+            try:
+                from tools.run_lock import release_lock
+
+                release_lock(self.config.global_config.workspace)
+            except AttributeError:
+                pass  # Test stub without config — lock release not applicable
 
     def start_registry_run(self) -> None:
         """Journal the start of a run (write-only).

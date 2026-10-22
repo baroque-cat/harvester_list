@@ -149,3 +149,15 @@ class RegistryUnavailableError(RuntimeError):
     Transient ``sqlite3.OperationalError`` with busy/locked messages is NOT
     fatal — those keep the existing degrade-and-retry behaviour.
     """
+
+
+class LockHeldError(RuntimeError):
+    """The run lock is held by another live process.
+
+    Raised by ``tools.run_lock.acquire_lock`` when ``<workspace>/.harvester.lock``
+    exists and its pid is alive (``os.kill(pid, 0)`` succeeds).  The program
+    MUST NOT start a second instance against the same workspace — the lock
+    provides mutual exclusion between the pipeline and destructive commands
+    (purge, future restore).  Stale locks (dead pid) are taken over loudly
+    by ``acquire_lock`` and do NOT raise this exception (slice 4.1, wave 4).
+    """

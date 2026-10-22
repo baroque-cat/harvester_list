@@ -495,6 +495,37 @@ Examples:
     # Initialize logging with specified level
     init_logging(args.log_level)
 
+    # Run-lock refuse check (slice 4.1, wave 4): before heavy initialization,
+    # check if another process holds the lock.  --validate and --create-config
+    # are handled above and never reach this point.
+    from tools.run_lock import read_lock, is_alive
+
+    try:
+        # Read workspace directly from YAML without full validation — the lock
+        # check must work even if the config has invalid credentials/tasks.
+        import yaml as _yaml
+        with open(args.config, "r", encoding="utf-8") as _f:
+            _raw = _yaml.safe_load(_f) or {}
+        _ws = (_raw.get("global") or {}).get("workspace", "./data")
+        _lock_info = read_lock(_ws)
+        if _lock_info is not None and is_alive(_lock_info):
+            _msg = (
+                f"REFUSE: run lock held by live process — "
+                f"pid={_lock_info['pid']} holder={_lock_info['holder']} "
+                f"boot_ts={_lock_info.get('boot_ts', '?')}"
+            )
+            logger.critical(_msg)
+            print(_msg, file=sys.stderr)
+            sys.exit(1)
+        elif _lock_info is not None and not is_alive(_lock_info):
+            logger.info(
+                f"stale lock ignored (holder={_lock_info['holder']}, pid={_lock_info['pid']})"
+            )
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logger.debug(f"run-lock pre-check failed (non-fatal): {exc}")
+
     # Create and configure application
     app = HarvesterApp(args.config)
 

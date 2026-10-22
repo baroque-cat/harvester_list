@@ -2283,6 +2283,15 @@ The former `backoff_factor`, `recovery_factor`, `max_rate_multiplier`, and
 `min_rate_multiplier` keys never influenced behavior and were removed; if still
 present in an operator config they are ignored with a one-time WARNING per key.
 
+## Run Lock (Mutual Exclusion)
+
+The pipeline writes a lock file at `<workspace>/.harvester.lock` on startup (atomically, mode 0600) and removes it on graceful shutdown. The lock contains `{"pid": <int>, "boot_ts": <float>, "holder": "pipeline"|"purge"}` and provides mutual exclusion between the pipeline and destructive commands (purge, future restore).
+
+- **Live lock** (pid is alive): `main.py` refuses to start (exit≠0, loud message with pid/holder).
+- **Stale lock** (pid is dead): automatically taken over with a loud INFO log message.
+- **Manual removal**: if the pipeline crashed and left a stale lock, simply delete `<workspace>/.harvester.lock` — the next start will proceed normally.
+- **Safety**: the lock is crash-safe; if the process dies without cleanup, the next start detects the stale lock and takes over.
+
 ## Troubleshooting
 
 ### **Common Issues**
