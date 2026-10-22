@@ -1623,13 +1623,13 @@ silent zero would be a false comfort instrument. Recomputing the denominator
 
 **Metrics.** Exposed in `PipelineStatus.refine_metrics`: `mode`,
 `children_generated`, `children_admitted`, `refused_depth`, `refused_budget`,
-`refused_wire_collapse`, `truncated_to_cap`, `distinct_wire_admitted`,
+`refused_wire_collapse`, `refused_wire_covered`, `truncated_to_cap`, `distinct_wire_admitted`,
 `parents_refined`, `parents_at_depth_cap_paginated`,
 `budget_remaining`, `coverage_estimate_min` / `coverage_estimate_avg`. Each
 refined parent also logs an INFO line (`generated` / `admitted` / `truncated` /
 `refused_budget` / `coverage`), and a parent that withheld anything logs one
 aggregated `wire_collapse` INFO line. The rendered `Refine:` status line carries
-`refused[depth=…, budget=…, wire=…]` and `uniq_wires=…`.
+`refused[depth=…, budget=…, wire=…]`, `uniq_wires=…`, `wcovered=…`, and `wshadow=…`.
 
 **Relationships.** The env seatbelts `REGEX_MAX_QUERIES` / `REGEX_MAX_DEPTH`
 (`search/github/refine/config.py`) remain as engine-level defense in depth but are

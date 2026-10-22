@@ -158,3 +158,51 @@ When the governor enforces (`mode: on`) and `refine_governor.drop_wire_indisting
 #### Scenario: A live enforced run collapses fan-out without losing distinguishable work
 - **WHEN** the shipped tree runs two duration-matched soaks on the same live configuration differing only in this boolean (**Manual** — live gate, credential handling and run-root placement per the repository's operational rules)
 - **THEN** the enforcing arm reports a non-zero wire-collapse counter, `children_admitted == distinct_wire_admitted`, distinct wire queries and unique harvested links not lower than the legacy arm, search queue rows and harvested-bytes down by at least an order of magnitude, gather and check throughput unchanged, and zero capacity refusals from the code-hosting service
+
+### Requirement: Coverage-probe consultation (slice 3a.2, F-05)
+
+When the registry carries wire-coverage rows (schema v7) the governor SHALL consult a coverage probe between the wire-collapse guard and the partition cap. A child whose wire fingerprint is fully covered (watermark ≥ needed AND fresh within `wire_ttl_hours` AND matching `patterns_hash`) SHALL be excluded from the population BEFORE cap/budget accounting, so covered children consume neither the partition cap nor the per-run task budget (mirror S22 wire-collapse accounting). The probe is passed as a trailing keyword `coverage_probe: Optional[Callable[[List[str], bool], Set[str]]] = None`. When `coverage_probe` is None or raises an exception, the governor SHALL suppress zero children (fail-open). A new counter `refused_wire_covered` SHALL count the excluded children and SHALL appear in the metrics property. The admission identity SHALL satisfy `generated == admitted + refused_wire_collapse + refused_wire_covered + truncated_to_cap + refused_budget`.
+
+#### Scenario: Consultation order is guard → coverage → cap → budget
+
+- **WHEN** a batch of children enters admission and some are wire-collapsed, some are covered, some exceed the cap, and some exceed the budget
+- **THEN** the wire-collapse guard runs first, the coverage probe runs second, the partition cap runs third, and the budget runs fourth, and each layer's refusals are disjoint from the others
+
+#### Scenario: Covered children consume neither cap nor budget
+
+- **WHEN** a coverage probe reports some children as covered
+- **THEN** those children are excluded before the cap and budget are applied, the partition cap and budget remaining are unaffected by the covered children, and the `refused_wire_covered` counter increments by the number excluded
+
+#### Scenario: Shadow mode counts but does not suppress
+
+- **WHEN** `coverage_mode` is `shadow` and the coverage probe reports covered children
+- **THEN** the `wire_covered_shadow_hits` counter increments for covered children, `refused_wire_covered` stays at zero (preserving the disjoint admission identity), and all children are still admitted (no suppression)
+
+#### Scenario: Fail-open probe
+
+- **WHEN** the coverage probe raises an exception
+- **THEN** zero children are suppressed for coverage, the governor continues without crashing, and the `refused_wire_covered` counter stays at zero for that batch
+
+#### Scenario: Probe None is inert
+
+- **WHEN** `coverage_probe` is None
+- **THEN** the governor behaves identically to the pre-change implementation: no coverage consultation, no `refused_wire_covered` increments
+
+### Requirement: Coverage-probe tri-mode rollout (slice 3a.2, F-05)
+
+The coverage-probe feature SHALL be controlled by `refine_governor.coverage_mode`: `off` (probe not constructed, byte-pre-change behavior), `shadow` (probe called, `wire_covered_shadow_hits` counter grows, `refused_wire_covered` stays zero, no suppression), `on` (active suppression, `refused_wire_covered` increments). The default SHALL be `off`. The wire-coverage TTL SHALL be controlled by `refine_governor.wire_ttl_hours` (default 168, must be positive). The stage SHALL construct the probe closure per-task with the task's `patterns_hash` and pass it as a trailing keyword to `select_children` only when `coverage_mode != "off"` and the registry is available.
+
+#### Scenario: Off mode is byte-identical to pre-change
+
+- **WHEN** `coverage_mode` is `off`
+- **THEN** no probe is constructed or passed, and the governor's behavior and metrics are byte-identical to the pre-change implementation (with `refused_wire_covered` always zero)
+
+#### Scenario: TTL freshness
+
+- **WHEN** a wire-coverage row has `last_ts` older than `wire_ttl_hours * 3600` seconds before the current time
+- **THEN** the probe does NOT consider that row covered, even if `pages_done >= pages_needed`
+
+#### Scenario: Patterns-change isolation
+
+- **WHEN** a wire-coverage row exists with a different `patterns_hash` than the current task's
+- **THEN** the probe does NOT consider that row covered (pattern change ⇒ re-execute)

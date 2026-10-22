@@ -1242,6 +1242,95 @@ class Registry:
             },
         )
 
+    def probe_wire_covered(
+        self,
+        queries: List[str],
+        use_api: bool,
+        patterns_hash_value: str,
+        wire_ttl_hours: float = 168,
+    ) -> "set":
+        """Return the subset of ``queries`` that are fully covered.
+
+        A wire query is covered iff:
+        - ``pages_done >= pages_needed`` (watermark ≥ needed; pages_needed > 0)
+        - ``last_ts > time.time() - wire_ttl_hours * 3600`` (freshness)
+        - The row's ``patterns_hash`` matches ``patterns_hash_value`` (pattern
+          change ⇒ previous coverage does NOT suppress re-execution).
+
+        Uses a dedicated read-only connection (fail-open).  Any exception
+        returns an empty set and logs a WARNING (loud-once).  Does NOT suppress
+        ``RegistryUnavailableError`` from ``check_alive()`` — typed fatals
+        escalate to the central crash path (Д14).
+
+        Chunks IN queries to ≤ 897 wires per SELECT (900 minus 3 extra bind
+        params: patterns_hash, ttl_cutoff, and the wire_fp itself), mirroring
+        the C3 precedent.
+
+        Returns the original query strings (not fingerprints) that are covered.
+        """
+        if not self.enabled or not self._available:
+            return set()
+
+        # Let typed fatals propagate (Д14: fail-CLOSED central path).
+        self.check_alive()
+
+        if not queries:
+            return set()
+
+        from search.querykey import fingerprint as _fp
+
+        now = time.time()
+        ttl_cutoff = now - float(wire_ttl_hours) * 3600
+
+        # Build a mapping: wire_fp → original query string
+        fp_to_query = {}
+        for q in queries:
+            fp = _fp(q, use_api)
+            fp_to_query[fp] = q
+
+        covered = set()
+        # Chunk size: SQLite bind limit is 999 by default (C3 precedent: 900).
+        # We have 3 extra binds per query (patterns_hash, ttl_cutoff, and the
+        # wire_fp itself in the IN clause), so chunk = (900 - 3) = 897.
+        _CHUNK_SIZE = 897
+        fps = list(fp_to_query.keys())
+
+        try:
+            uri = f"{self.path}?mode=ro" if not self.path.startswith("file:") else self.path
+            if not uri.startswith("file:"):
+                uri = f"file:{uri}"
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            try:
+                for i in range(0, len(fps), _CHUNK_SIZE):
+                    chunk = fps[i:i + _CHUNK_SIZE]
+                    placeholders = ",".join("?" for _ in chunk)
+                    params = list(chunk) + [patterns_hash_value, ttl_cutoff]
+                    sql = (
+                        f"SELECT wire_fp FROM wire_coverage "
+                        f"WHERE wire_fp IN ({placeholders}) "
+                        f"AND patterns_hash = ? "
+                        f"AND pages_needed IS NOT NULL AND pages_needed > 0 "
+                        f"AND pages_done >= pages_needed "
+                        f"AND last_ts > ?"
+                    )
+                    rows = conn.execute(sql, params).fetchall()
+                    for row in rows:
+                        fp = row[0]
+                        if fp in fp_to_query:
+                            covered.add(fp_to_query[fp])
+            finally:
+                conn.close()
+        except Exception as exc:
+            # Fail-open: log once, return empty set.
+            if not getattr(self, "_probe_warned", False):
+                self._probe_warned = True
+                logger.warning(
+                    f"[registry] probe_wire_covered failed (fail-open): {exc}"
+                )
+            return set()
+
+        return covered
+
     # ------------------------------------------------------------------
     # Run journaling (low frequency, written synchronously)
     # ------------------------------------------------------------------

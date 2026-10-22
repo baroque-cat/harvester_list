@@ -535,6 +535,8 @@ class ConfigLoader:
             max_partitions_per_refine=data.get("max_partitions_per_refine", 128),
             max_search_tasks_per_run=data.get("max_search_tasks_per_run", 10000),
             drop_wire_indistinguishable=data.get("drop_wire_indistinguishable", True),
+            coverage_mode=data.get("coverage_mode", "off"),
+            wire_ttl_hours=data.get("wire_ttl_hours", 168),
         )
 
     def _parse_task_queue_config(self, data: Dict[str, Any]) -> TaskQueueConfig:

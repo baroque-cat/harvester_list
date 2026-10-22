@@ -54,7 +54,7 @@ All mutable state lives behind a single ``threading.Lock`` because
 """
 
 import threading
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from search.querykey import fingerprint, wire_query
 from tools.logger import get_logger
@@ -74,6 +74,8 @@ class RefineGovernor:
         max_partitions_per_refine: int = 128,
         max_search_tasks_per_run: int = 10000,
         drop_wire_indistinguishable: bool = True,
+        coverage_mode: str = "off",
+        wire_ttl_hours: int = 168,
     ) -> None:
         normalized = str(mode).strip().lower()
         if normalized not in _VALID_MODES:
@@ -93,11 +95,21 @@ class RefineGovernor:
                 "refine_governor.drop_wire_indistinguishable must be a boolean"
             )
 
+        # Coverage-probe rollout (slice 3a.2, F-05).
+        coverage_mode_normalized = str(coverage_mode).strip().lower()
+        if coverage_mode_normalized not in _VALID_MODES:
+            raise ValueError("refine_governor.coverage_mode must be one of: off, shadow, on")
+        wire_ttl = int(wire_ttl_hours)
+        if wire_ttl <= 0:
+            raise ValueError("refine_governor.wire_ttl_hours must be positive")
+
         self.mode = normalized
         self.max_refine_depth = depth
         self.max_partitions_per_refine = partitions
         self.max_search_tasks_per_run = budget
         self.drop_wire_indistinguishable = drop_wire_indistinguishable
+        self.coverage_mode = coverage_mode_normalized
+        self.wire_ttl_hours = wire_ttl
 
         self._lock = threading.Lock()
         self._children_generated = 0
@@ -105,6 +117,8 @@ class RefineGovernor:
         self._refused_depth = 0
         self._refused_budget = 0
         self._refused_wire_collapse = 0
+        self._refused_wire_covered = 0
+        self._wire_covered_shadow_hits = 0
         self._truncated_to_cap = 0
         self._parents_refined = 0
         self._parents_at_depth_cap_paginated = 0
@@ -169,6 +183,7 @@ class RefineGovernor:
         transport_limit: int,
         total: int,
         use_api: bool = True,
+        coverage_probe: Optional[Callable[[List[str], bool], Set[str]]] = None,
     ) -> List[str]:
         """Filter, (clamp + sort + truncate), and admit refined children.
 
@@ -191,6 +206,13 @@ class RefineGovernor:
         ``use_api`` supplies the transport half of the admission fingerprint
         (design D5).  It is a trailing keyword with a default so the pinned
         positional signature is unchanged.
+
+        ``coverage_probe`` (slice 3a.2, F-05): optional callable that returns
+        the subset of queries already covered.  When provided and ``coverage_mode``
+        is ``on``, covered children are excluded BEFORE cap/budget (mirror S22
+        wire-collapse).  When ``coverage_mode`` is ``shadow``, covered children
+        are counted but NOT excluded.  When ``coverage_mode`` is ``off``, the
+        probe is ignored.  Fail-open: probe exceptions yield zero suppressions.
         """
         if self.mode == "off":
             return list(queries)
@@ -229,6 +251,35 @@ class RefineGovernor:
             collapsed = 0
             population = ordered
 
+        # Coverage probe (slice 3a.2, F-05): tri-mode rollout.
+        # Order: guard → coverage → cap → budget.
+        # off: probe ignored (stage doesn't pass it).
+        # shadow: probe called, count shadow hits, don't suppress.
+        # on: probe called, suppress covered children, increment refused_wire_covered.
+        covered_count = 0
+        shadow_hits = 0
+        if self.coverage_mode != "off" and coverage_probe is not None:
+            try:
+                covered_set = coverage_probe(population, use_api)
+            except Exception:
+                # Fail-open: probe failure ⇒ zero suppressions.
+                covered_set = set()
+            if covered_set:
+                if self.coverage_mode == "on":
+                    # Suppress covered children BEFORE cap/budget.
+                    uncovered = []
+                    for child in population:
+                        if child in covered_set:
+                            covered_count += 1
+                        else:
+                            uncovered.append(child)
+                    population = uncovered
+                elif self.coverage_mode == "shadow":
+                    # Count but don't suppress.
+                    for child in population:
+                        if child in covered_set:
+                            shadow_hits += 1
+
         cap = self.max_partitions_per_refine
         capped = population[:cap]
         # Truncation surplus is measured on the post-guard population so a
@@ -239,6 +290,9 @@ class RefineGovernor:
             with self._lock:
                 self._children_generated += generated
                 self._refused_wire_collapse += collapsed
+                # In shadow mode, refused_wire_covered stays 0 (disjoint identity F-02(1)).
+                # Instead, wire_covered_shadow_hits grows.
+                self._wire_covered_shadow_hits += shadow_hits
                 self._truncated_to_cap += truncated
                 remaining = max(0, self.max_search_tasks_per_run - self._budget_used)
                 would_admit = capped[:remaining]
@@ -275,6 +329,8 @@ class RefineGovernor:
         with self._lock:
             self._children_generated += generated
             self._refused_wire_collapse += collapsed
+            self._refused_wire_covered += covered_count
+            self._wire_covered_shadow_hits += shadow_hits
             self._truncated_to_cap += truncated
             remaining = max(0, self.max_search_tasks_per_run - self._budget_used)
             admitted = capped[:remaining]
@@ -377,11 +433,14 @@ class RefineGovernor:
             coverage = list(self._coverage)
             return {
                 "mode": self.mode,
+                "coverage_mode": self.coverage_mode,
                 "children_generated": self._children_generated,
                 "children_admitted": self._children_admitted,
                 "refused_depth": self._refused_depth,
                 "refused_budget": self._refused_budget,
                 "refused_wire_collapse": self._refused_wire_collapse,
+                "refused_wire_covered": self._refused_wire_covered,
+                "wire_covered_shadow_hits": self._wire_covered_shadow_hits,
                 "truncated_to_cap": self._truncated_to_cap,
                 "parents_refined": self._parents_refined,
                 "parents_at_depth_cap_paginated": self._parents_at_depth_cap_paginated,

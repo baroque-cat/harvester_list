@@ -416,6 +416,19 @@ refine_governor:
   # `false` restores pre-change admission byte-for-byte (tasks and log output),
   # independently of `mode` -- the rollback flip.
   drop_wire_indistinguishable: true
+  # Coverage-probe rollout flag (slice 3a.2, F-05): off | shadow | on.
+  #   off    - probe not constructed; byte-pre-change behavior (default)
+  #   shadow - probe called, wire_covered_shadow_hits counted, refused_wire_covered
+  #            stays zero, no suppression (disjoint identity preserved)
+  #   on     - covered children suppressed before cap/budget, refused_wire_covered
+  #            increments (admission identity: generated = admitted + refused_*)
+  # Rollback: flip to off and restart.
+  coverage_mode: "off"
+  # Wire-coverage TTL in hours (slice 3a.2, F-06/OPEN-10): a wire row whose
+  # last_ts is older than this is not considered covered.  Default 168 (narrow
+  # profile, ~1 week).  Wide profile: raise to ≥720 (≥ cycle length of 19 days)
+  # so the series accumulates rather than restarting the search space.
+  wire_ttl_hours: 168
 
 # Durable task-queue backend (fix-queue-persistence-under-load)
 # Selects the per-stage queue implementation. memory is the byte-identical

@@ -226,3 +226,27 @@ The system SHALL maintain a `wire_coverage` table (schema version 7, additive mi
 
 - **WHEN** the registry is disabled (`enabled=false`)
 - **THEN** `record_wire_page` does nothing, raises nothing, and no database file is created
+
+### Requirement: Wire-coverage probe (slice 3a.2, F-05)
+
+The registry SHALL expose a `probe_wire_covered` method that accepts a list of wire queries, a `use_api` flag, a `patterns_hash_value`, and a `wire_ttl_hours` value, and returns the set of query strings that are fully covered. A query is covered iff: (a) `pages_done >= pages_needed` (watermark ≥ needed; `pages_needed` NOT NULL and > 0), (b) `last_ts` is fresher than `time.time() - wire_ttl_hours * 3600`, and (c) the row's `patterns_hash` matches `patterns_hash_value`. The method SHALL use the same `fingerprint(query, use_api)` function from `search.querykey` as `record_wire_page`. IN queries SHALL be chunked to ≤ 897 wires per SELECT (C3 precedent: ≤ 900 bind params). The method SHALL be fail-open: any read exception returns an empty set and logs a WARNING (loud-once). `RegistryUnavailableError` from `check_alive()` SHALL NOT be suppressed (typed fatal, Д14). When the registry is disabled or unavailable, the method SHALL return an empty set.
+
+#### Scenario: Probe returns covered queries
+
+- **WHEN** the wire_coverage table has a row with `pages_done >= pages_needed`, fresh `last_ts`, and matching `patterns_hash`
+- **THEN** `probe_wire_covered` includes that query in the returned set
+
+#### Scenario: Probe excludes stale rows
+
+- **WHEN** a wire_coverage row has `last_ts` older than `wire_ttl_hours * 3600` seconds
+- **THEN** `probe_wire_covered` does NOT include that query
+
+#### Scenario: Probe excludes mismatched patterns
+
+- **WHEN** a wire_coverage row has a different `patterns_hash` than the caller's
+- **THEN** `probe_wire_covered` does NOT include that query
+
+#### Scenario: Probe chunks large inputs
+
+- **WHEN** more than 897 queries are probed
+- **THEN** the implementation issues multiple SELECT statements with at most 897 wire fingerprints each, and all covered queries are returned correctly

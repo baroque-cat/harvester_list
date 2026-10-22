@@ -478,9 +478,28 @@ class SearchStage(BasePipelineStage):
             queries = RefineEngine.get_instance().generate_queries(query=task.query, partitions=partitions)
             generated = len(queries)
             if governor is not None:
+                # Build coverage probe closure if coverage_mode != "off" (slice 3a.2, F-05).
+                coverage_probe = None
+                if governor.coverage_mode != "off":
+                    registry = getattr(self.resources, "registry", None)
+                    if registry is not None and registry.available:
+                        # Compute patterns_hash for this task (same as _record_wire_coverage).
+                        ph = patterns_hash(
+                            key_pattern=task.regex,
+                            address_pattern=task.address_pattern,
+                            endpoint_pattern=task.endpoint_pattern,
+                            model_pattern=task.model_pattern,
+                        )
+                        ttl = governor.wire_ttl_hours
+                        # Closure captures task-specific patterns_hash and TTL.
+                        coverage_probe = lambda qs, use_api, _ph=ph, _ttl=ttl: registry.probe_wire_covered(
+                            qs, use_api, patterns_hash_value=_ph, wire_ttl_hours=_ttl
+                        )
                 # Deterministic clamp/sort/truncate + per-run budget admission.
                 queries = governor.select_children(
-                    task.provider, task.query, queries, limit, total, use_api=task.use_api
+                    task.provider, task.query, queries, limit, total,
+                    use_api=task.use_api,
+                    coverage_probe=coverage_probe,
                 )
 
             # Add new query tasks to output

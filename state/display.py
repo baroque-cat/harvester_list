@@ -800,6 +800,8 @@ class StatusDisplayEngine:
             f"cov[min={metric_rate(metrics.get('coverage_estimate_min')):.4f}, "
             f"avg={metric_rate(metrics.get('coverage_estimate_avg')):.4f}] "
             f"fallbacks={metric_int(metrics.get('pagination_fallbacks'))} "
+            f"wcovered={metric_int(metrics.get('refused_wire_covered'))} "
+            f"wshadow={metric_int(metrics.get('wire_covered_shadow_hits'))} "
             f"(unfit-denominator)"
         )
 

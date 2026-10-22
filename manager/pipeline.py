@@ -286,12 +286,16 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
                 max_partitions_per_refine=cfg.max_partitions_per_refine,
                 max_search_tasks_per_run=cfg.max_search_tasks_per_run,
                 drop_wire_indistinguishable=cfg.drop_wire_indistinguishable,
+                coverage_mode=cfg.coverage_mode,
+                wire_ttl_hours=cfg.wire_ttl_hours,
             )
             logger.info(
                 f"Refine governor configured: mode={cfg.mode} "
                 f"depth={cfg.max_refine_depth} partitions={cfg.max_partitions_per_refine} "
                 f"budget={cfg.max_search_tasks_per_run} "
-                f"drop_wire_indistinguishable={cfg.drop_wire_indistinguishable}"
+                f"drop_wire_indistinguishable={cfg.drop_wire_indistinguishable} "
+                f"coverage_mode={cfg.coverage_mode} "
+                f"wire_ttl_hours={cfg.wire_ttl_hours}"
             )
         except Exception as e:
             logger.error(f"Failed to configure refine governor, using safe defaults (mode=on): {e}")

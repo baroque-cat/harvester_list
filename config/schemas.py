@@ -681,6 +681,15 @@ class RefineGovernorConfig:
     # ``False`` restores pre-guard admission byte-for-byte, in tasks and in log
     # output, independently of ``mode``.  Default on.
     drop_wire_indistinguishable: bool = True
+    # Coverage-probe rollout flag (slice 3a.2, F-05): off | shadow | on.
+    # off ⇒ probe not constructed (byte-pre-change); shadow ⇒ probe called,
+    # refused_wire_covered counted, but children NOT suppressed; on ⇒ active
+    # suppression.  Default off (neutrality).
+    coverage_mode: str = "off"
+    # Wire-coverage TTL in hours (slice 3a.2, F-06/OPEN-10): a wire row whose
+    # last_ts is older than this is not considered covered.  Default 168 (narrow
+    # profile); wide profile: raise to ≥720 (≥ cycle length).  Must be positive.
+    wire_ttl_hours: int = 168
 
     def __post_init__(self):
         # Mirrors ConfigValidator._validate_refine_governor_config on purpose:
@@ -713,6 +722,21 @@ class RefineGovernorConfig:
         if not isinstance(self.drop_wire_indistinguishable, bool):
             raise ValueError(
                 "refine_governor.drop_wire_indistinguishable must be a boolean"
+            )
+
+        # Coverage-probe rollout flag (slice 3a.2, F-05).
+        coverage_mode = str(self.coverage_mode).strip().lower()
+        if coverage_mode not in ("off", "shadow", "on"):
+            raise ValueError(
+                "refine_governor.coverage_mode must be one of: off, shadow, on"
+            )
+        self.coverage_mode = coverage_mode
+
+        # Wire-coverage TTL (slice 3a.2, F-06).
+        self.wire_ttl_hours = int(self.wire_ttl_hours)
+        if self.wire_ttl_hours <= 0:
+            raise ValueError(
+                "refine_governor.wire_ttl_hours must be positive"
             )
 
 

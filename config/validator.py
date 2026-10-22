@@ -603,6 +603,18 @@ class ConfigValidator:
                 "refine_governor.drop_wire_indistinguishable must be a boolean"
             )
 
+        # Coverage-probe rollout flag (slice 3a.2, F-05).
+        if governor.coverage_mode not in ("off", "shadow", "on"):
+            self.errors.append(
+                "refine_governor.coverage_mode must be one of: off, shadow, on"
+            )
+
+        # Wire-coverage TTL (slice 3a.2, F-06).
+        if int(governor.wire_ttl_hours) <= 0:
+            self.errors.append(
+                "refine_governor.wire_ttl_hours must be positive"
+            )
+
     def _validate_task_queue_config(self, config: Config) -> None:
         """Validate the durable task-queue backend configuration section.
 
