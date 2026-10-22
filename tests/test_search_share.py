@@ -1519,7 +1519,6 @@ def test_k1_f1_ledger_suppression_blocks_fallback(monkeypatch):
     # Mock RefineEngine.generate_queries on the real instance (not get_instance)
     from search.github.refine.engine import RefineEngine
     real_engine = RefineEngine.get_instance()
-    original_generate = real_engine.generate_queries
     real_engine.generate_queries = lambda query, partitions=None: [
         "/sk-0[a-zA-Z0-9]{30}/",
         "/sk-1[a-zA-Z0-9]{30}/",
@@ -1569,8 +1568,12 @@ def test_k1_f1_ledger_suppression_blocks_fallback(monkeypatch):
         assert gov.metrics.get("pagination_fallbacks", 0) == 0, \
             f"Expected pagination_fallbacks==0, got {gov.metrics.get('pagination_fallbacks', 0)}"
     finally:
-        # Restore original generate_queries
-        real_engine.generate_queries = original_generate
+        # DELETE the instance attribute instead of re-assigning the bound
+        # method: re-assignment kept an instance attr on the RefineEngine
+        # singleton that shadowed later CLASS-level monkeypatches of
+        # generate_queries (broke CP16/CP17 when test_search_share ran
+        # first — test isolation fix).
+        del real_engine.generate_queries
 
 
 # ---------------------------------------------------------------------------
@@ -1659,7 +1662,6 @@ def test_k2_f1_governor_refusal_triggers_fallback(monkeypatch):
     # Mock RefineEngine.generate_queries on the real instance (not get_instance)
     from search.github.refine.engine import RefineEngine
     real_engine = RefineEngine.get_instance()
-    original_generate = real_engine.generate_queries
     real_engine.generate_queries = lambda query, partitions=None: [
         "/sk-0[a-zA-Z0-9]{30}/",
         "/sk-1[a-zA-Z0-9]{30}/",
@@ -1695,5 +1697,9 @@ def test_k2_f1_governor_refusal_triggers_fallback(monkeypatch):
         assert gov.metrics.get("pagination_fallbacks", 0) == 1, \
             f"Expected pagination_fallbacks==1, got {gov.metrics.get('pagination_fallbacks', 0)}"
     finally:
-        # Restore original generate_queries
-        real_engine.generate_queries = original_generate
+        # DELETE the instance attribute instead of re-assigning the bound
+        # method: re-assignment kept an instance attr on the RefineEngine
+        # singleton that shadowed later CLASS-level monkeypatches of
+        # generate_queries (broke CP16/CP17 when test_search_share ran
+        # first — test isolation fix).
+        del real_engine.generate_queries
