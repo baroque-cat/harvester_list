@@ -945,6 +945,12 @@ registry:
 When `enabled: false` (the default) no registry file is created or opened and
 all write hooks are no-ops.
 
+**SQL recovery (slice 3a.3).** When `recovery.source` is `registry` or `auto`
+(with a live registry), acquisition URLs are streamed from the registry
+(freshest-first, chunked, with per-boot cap and continuation marker) instead
+of aggregated from shards. Default is `shards` (neutral until gate 3a). See
+`examples/config-full.yaml` for the full `recovery:` section.
+
 ### Migration from existing workspaces
 
 The one-time migration imports historical shards into the registry. It is

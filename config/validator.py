@@ -108,6 +108,9 @@ class ConfigValidator:
         # Validate LLM-provider refusal-classification configuration
         self._validate_provider_config(config)
 
+        # Validate acquisition-task recovery source configuration
+        self._validate_recovery_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -728,6 +731,25 @@ class ConfigValidator:
                     f"strictly less than queue.visibility_timeout_s ({config.queue.visibility_timeout_s}) "
                     f"so no worker sleeps inside a claimed durable row past its visibility window"
                 )
+
+    def _validate_recovery_config(self, config: Config) -> None:
+        """Validate the acquisition-task recovery source configuration section.
+
+        Re-checks the enum/non-negativity constraints enforced by the dataclass
+        (they can be bypassed by attribute mutation).  The dataclass messages
+        are mirrored byte-for-byte so direct construction and loader paths
+        report identically.
+        """
+        recovery = config.recovery
+
+        if recovery.source not in ("shards", "registry", "auto"):
+            self.errors.append(
+                "recovery.source must be one of: shards, registry, auto"
+            )
+        if not isinstance(recovery.per_boot_cap, int) or recovery.per_boot_cap < 0:
+            self.errors.append(
+                "recovery.per_boot_cap must be a non-negative integer"
+            )
 
     def _validate_credential_liveness_config(self, config: Config) -> None:
         """Validate the credential-liveness / bounded-wait configuration section.

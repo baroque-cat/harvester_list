@@ -238,6 +238,23 @@ registry:
   # Total disk cap per file name ≤ (keep+1)×max = 192 MiB (default 2+1).
   decision_log_keep_rotated: 2
 
+# Acquisition-task recovery source configuration (slice 3a.3, D-03.4)
+# Controls where acquisition URLs come from at startup.
+recovery:
+  # Source of acquisition URLs: shards | registry | auto
+  #   shards   — legacy shard-aggregate path (default; neutral until gate 3a)
+  #   registry — SQL streaming reader from the link registry (fail-CLOSED)
+  #   auto     — registry-primary when enabled+available, else shards when
+  #              registry is disabled; crash when registry is enabled but dead
+  #              (no shard-fallback — Д14)
+  # Rollback: set to "shards" (invariant 4).
+  source: "shards"
+  # Per-boot cap on recovered URLs (0 = unlimited).
+  # When the cap truncates the result set, a continuation marker is written
+  # to the registry meta table so the next boot continues below the cursor.
+  # Freshest-first: cap removes the OLDEST URLs, keeping the freshest.
+  per_boot_cap: 0
+
 # Registry-driven gather-skip configuration (add-gather-skip)
 skip:
   # Re-gather policy for already-researched links: off | shadow | on

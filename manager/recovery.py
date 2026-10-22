@@ -14,12 +14,15 @@ from core.models import AllRecoveredTasks, ProviderTask, RecoveredTasks, Service
 from core.types import IProvider
 from stage.base import StageUtils
 from stage.factory import TaskFactory
-from storage.registry import patterns_hash, url_hash
+from storage.registry import Registry, patterns_hash, url_hash
 from tools.logger import get_logger
 
 from .pipeline import Pipeline
 
 logger = get_logger("manager")
+
+# Meta key for the recovery continuation marker (slice 3a.3, D-03.4).
+_RECOVERY_CURSOR_META_KEY = "recovery_cursor"
 
 
 class TaskRecoveryManager:
@@ -110,7 +113,145 @@ class TaskRecoveryManager:
 
         # Recover acquisition tasks (URLs need to be converted to AcquisitionTask objects)
         if StageUtils.check(config, PipelineStage.GATHER):
-            self._recover_acquisition_tasks(name, tasks.acquisition)
+            urls, source_label = self._resolve_acquisition_urls(name, tasks.acquisition)
+            self._recover_acquisition_tasks(name, urls, source_label=source_label)
+
+    def _resolve_acquisition_urls(self, name: str, shard_urls: List[str]) -> tuple:
+        """Resolve the acquisition URL list based on the configured recovery source.
+
+        When ``recovery.source`` is ``shards`` (default), returns ``(shard_urls, "shard")``
+        unchanged (byte-identical legacy path).  When ``registry`` or ``auto``
+        with a live registry, streams URLs from the registry reader with
+        per-boot cap and continuation-marker logic.  When ``auto`` with the
+        registry legitimately disabled, falls back to shards.  When the
+        registry is enabled but dead, propagates ``RegistryUnavailableError``
+        (fail-CLOSED, Д14 — no shard-fallback).
+
+        Args:
+            name: Provider name (used for logging)
+            shard_urls: Legacy shard-aggregated URL list
+
+        Returns:
+            tuple: (List[str], str) — resolved URL list and source label
+        """
+        recovery_cfg = getattr(getattr(self.pipeline, "config", None), "recovery", None)
+        source = getattr(recovery_cfg, "source", "shards") if recovery_cfg else "shards"
+        per_boot_cap = getattr(recovery_cfg, "per_boot_cap", 0) if recovery_cfg else 0
+
+        if source == "shards":
+            return shard_urls, "shard"
+
+        # source is "registry" or "auto" — need the registry.
+        # D1 fix: Pipeline stores registry as link_registry, not registry.
+        registry = getattr(self.pipeline, "link_registry", None)
+        if registry is None:
+            # No registry attached — fall back to shards silently for auto,
+            # but crash for explicit registry mode.
+            if source == "registry":
+                from core.exceptions import RegistryUnavailableError
+                raise RegistryUnavailableError(
+                    "recovery.source=registry but no registry is attached to pipeline"
+                )
+            return shard_urls, "shard"
+
+        registry_enabled = getattr(registry, "enabled", False)
+        registry_available = getattr(registry, "available", False)
+
+        if source == "auto" and not registry_enabled:
+            # Registry legitimately disabled — shards path (neutral).
+            return shard_urls, "shard"
+
+        if source == "registry" and not registry_enabled:
+            from core.exceptions import RegistryUnavailableError
+            raise RegistryUnavailableError(
+                "recovery.source=registry but registry is not enabled"
+            )
+
+        # Registry is enabled — use the SQL reader.
+        # check_alive() will raise if the DB died.
+        registry.check_alive()
+
+        # Read continuation marker from meta (per-provider key, D3 fix).
+        meta_key = f"{_RECOVERY_CURSOR_META_KEY}:{name}"
+        cursor_ts = None
+        cursor_hash = None
+        marker_raw = registry.get_meta(meta_key)
+        if marker_raw:
+            # Composite marker format: "{ts}|{hash}" (D2 fix).
+            # Legacy format (ts-only) is supported with WARNING.
+            if "|" in marker_raw:
+                parts = marker_raw.split("|", 1)
+                try:
+                    cursor_ts = float(parts[0])
+                    cursor_hash = parts[1] if len(parts) > 1 else None
+                except (ValueError, TypeError):
+                    logger.warning(
+                        f"[recovery] unparseable composite marker for {name}: {marker_raw!r}; "
+                        f"resetting to newest"
+                    )
+                    cursor_ts = None
+                    cursor_hash = None
+            else:
+                # Legacy ts-only marker (backward compat).
+                try:
+                    cursor_ts = float(marker_raw)
+                    logger.warning(
+                        f"[recovery] legacy ts-only marker for {name}: {marker_raw!r}; "
+                        f"potential data loss at boundary; consider manual reset"
+                    )
+                except (ValueError, TypeError):
+                    logger.warning(
+                        f"[recovery] unparseable legacy marker for {name}: {marker_raw!r}; "
+                        f"resetting to newest"
+                    )
+                    cursor_ts = None
+
+        # Stream URLs from the registry with optional cap and provider filter.
+        seen_hashes: Set[str] = set()
+        result_urls: List[str] = []
+        last_ts = None
+        last_hash = None
+        total_available = 0
+        truncated = False
+
+        for url_val, uh, ts_val in registry.fetch_recoverable_urls(
+            limit=per_boot_cap if per_boot_cap > 0 else 0,
+            before_ts=cursor_ts,
+            before_hash=cursor_hash,
+            provider=name,
+        ):
+            total_available += 1
+            if uh in seen_hashes:
+                continue
+            seen_hashes.add(uh)
+            result_urls.append(url_val)
+            last_ts = ts_val
+            last_hash = uh
+
+            if per_boot_cap > 0 and len(result_urls) >= per_boot_cap:
+                truncated = True
+                break
+
+        # Handle continuation marker.
+        if truncated and last_ts is not None and last_hash is not None:
+            # Write composite cursor so next boot continues below this point (D2 fix).
+            registry.set_meta(meta_key, f"{last_ts}|{last_hash}")
+            logger.info(
+                f"[recovery_truncated] provider={name} took={len(result_urls)} "
+                f"cap={per_boot_cap} total_seen={total_available} "
+                f"cursor_ts={last_ts} cursor_hash={last_hash[:16]}..."
+            )
+        else:
+            # Full pass completed — remove the marker.
+            registry.delete_meta(meta_key)
+
+        # Publication: loud INFO with the canonical token.
+        logger.info(
+            f"recovered_from_registry={len(result_urls)} provider={name} "
+            f"total_available={total_available}"
+        )
+
+        return result_urls, "registry"
 
     def _recover_check_tasks(self, name: str, check_tasks: List[Service], invalid_keys: Set[Service]) -> None:
         """Recover check tasks for provider
@@ -148,7 +289,7 @@ class TaskRecoveryManager:
         if recovered_count > 0:
             logger.info(f"Recovered {recovered_count} check tasks for {name}")
 
-    def _recover_acquisition_tasks(self, name: str, acquisition_tasks: List[str]) -> None:
+    def _recover_acquisition_tasks(self, name: str, acquisition_tasks: List[str], source_label: str = "shard") -> None:
         """Recover acquisition tasks for provider
 
         P26: apply the same creation-time policy stack the search stage uses
@@ -166,6 +307,7 @@ class TaskRecoveryManager:
         Args:
             name: Name of the provider
             acquisition_tasks: List of URLs to acquire
+            source_label: Origin label for the log line ("shard" or "registry")
         """
         stage_instance = self.pipeline.get_stage(PipelineStage.GATHER.value)
         if not stage_instance:
@@ -249,7 +391,7 @@ class TaskRecoveryManager:
         if urls:
             logger.info(
                 f"Recovered {recovered_count} acquisition tasks for {name} "
-                f"(shard urls {len(urls)}, skip-suppressed {skip_suppressed}, "
+                f"({source_label} urls {len(urls)}, skip-suppressed {skip_suppressed}, "
                 f"share-suppressed {share_suppressed})"
             )
 

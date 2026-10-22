@@ -250,3 +250,48 @@ The registry SHALL expose a `probe_wire_covered` method that accepts a list of w
 
 - **WHEN** more than 897 queries are probed
 - **THEN** the implementation issues multiple SELECT statements with at most 897 wire fingerprints each, and all covered queries are returned correctly
+
+### Requirement: SQL recovery source (slice 3a.3, D-03.4, F-14, F-17)
+
+The registry SHALL expose a `fetch_recoverable_urls` method that streams acquisition URLs for links with `visit_status IN ('discovered', 'failed')`, ordered by `last_seen_ts DESC` (freshest-first, F-14) with a deterministic tie-breaker on `url_hash`. The method SHALL use keyset pagination with bounded RAM: each fetch retrieves at most 1000 rows (configurable chunk_size). The method SHALL support a `limit` parameter (0 = unlimited), `before_ts`/`before_hash` continuation parameters for cross-boot resumption, and an optional `provider` filter (`AND provider = ?`) preserving the legacy per-provider attribution of the shard path. Fatal database errors SHALL propagate as `RegistryUnavailableError` (fail-CLOSED, Д14); transient busy/locked errors SHALL be classified by `_is_fatal_db_error`.
+
+The pipeline SHALL support a `recovery.source` configuration key with values `shards` (default), `registry`, or `auto`. When `source=registry` or `source=auto` with an enabled+available registry, acquisition URLs SHALL be read from the registry via `fetch_recoverable_urls` instead of shard aggregation. When `source=auto` with the registry disabled, the shard path SHALL be used (neutral fallback). When the registry is enabled but dead, `RegistryUnavailableError` SHALL propagate with no shard-fallback (Д14).
+
+A per-boot cap (`recovery.per_boot_cap`, default 0 = unlimited) SHALL limit the number of URLs taken per boot. When the cap truncates the result set, a continuation marker SHALL be written to the `meta` table under the per-provider key `recovery_cursor:{provider}`, value = composite cursor `{last_seen_ts}|{url_hash}` of the last taken row. The next boot SHALL resume with the same compound keyset condition used within a boot (`last_seen_ts < ts OR (last_seen_ts = ts AND url_hash > hash)`), so rows sharing the boundary timestamp are neither lost nor duplicated. A legacy ts-only marker SHALL be honoured with a WARNING (its strict less-than resumption can lose rows at equal-ts boundaries). When the full result set is consumed without truncation, the marker SHALL be removed.
+
+The P26 filter stack (gather-skip decision → share claim) SHALL be preserved on top of registry-sourced URLs via the same `_recover_acquisition_tasks` code path. A loud INFO publication with token `recovered_from_registry=N` SHALL be emitted when URLs are sourced from the registry.
+
+#### Scenario: Freshest-first ordering
+
+- **WHEN** the registry contains links with different `last_seen_ts` values and `recovery.source=registry`
+- **THEN** URLs are returned in strict `last_seen_ts DESC` order (freshest first)
+
+#### Scenario: Cap with continuation marker
+
+- **WHEN** `recovery.per_boot_cap=K` and the registry contains N > K recoverable URLs
+- **THEN** exactly K freshest URLs are taken, a loud INFO token `[recovery_truncated]` is logged, and the `meta` table contains `recovery_cursor:{provider}={last_seen_ts}|{url_hash} of the K-th row`
+
+#### Scenario: Continuation across boots
+
+- **WHEN** a prior boot wrote a continuation marker and the next boot starts with the same config
+- **THEN** the reader resumes below the composite cursor using the compound keyset condition (rows sharing the boundary `last_seen_ts` are continued by `url_hash` ascending), with no duplicates and no losses against the prior boot, and after the full result set is consumed the marker is removed
+
+#### Scenario: Equal-timestamp boundary loses nothing
+
+- **WHEN** several rows share one `last_seen_ts` and the per-boot cap cuts through the middle of that group
+- **THEN** the next boot takes the remainder of the group via the composite-cursor tie-breaker — zero loss, zero duplication
+
+#### Scenario: Fail-closed auto mode
+
+- **WHEN** `recovery.source=auto` and the registry is enabled but the database is dead
+- **THEN** `RegistryUnavailableError` propagates and no shard-fallback occurs (crash with nonzero exit)
+
+#### Scenario: P26 stack preserved on registry source
+
+- **WHEN** `recovery.source=registry` and gather-skip/share-claim are enabled
+- **THEN** the same `_recover_acquisition_tasks` code path applies the P26 filter stack (skip decide → share claim) to registry-sourced URLs
+
+#### Scenario: Neutral default
+
+- **WHEN** `recovery.source=shards` (default) or the key is absent
+- **THEN** the shard-aggregate path is used unchanged, all existing pins survive, and no registry reader is invoked

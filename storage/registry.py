@@ -25,7 +25,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from storage.priority import (
@@ -1332,6 +1332,64 @@ class Registry:
         return covered
 
     # ------------------------------------------------------------------
+    # Meta key/value helpers (slice 3a.3: continuation marker for recovery)
+    # ------------------------------------------------------------------
+
+    def get_meta(self, key: str) -> Optional[str]:
+        """Read a value from the ``meta`` table by key (read-only, fail-open).
+
+        Returns the stored value string, or ``None`` if the key is absent or
+        the registry is disabled/unavailable.  Uses a dedicated read-only
+        connection following the house pattern of ``get_link_fetch_state``.
+        Does NOT suppress ``RegistryUnavailableError`` from ``check_alive()``.
+        """
+        if not self.enabled or not self._available:
+            return None
+        self.check_alive()
+        try:
+            uri = f"file:{self.path}?mode=ro" if not self.path.startswith("file:") else self.path
+            if not uri.startswith("file:"):
+                uri = f"file:{uri}"
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            try:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?", (key,)
+                ).fetchone()
+            finally:
+                conn.close()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Write a key/value pair to the ``meta`` table (synchronous, fail-CLOSED).
+
+        Uses the writer connection under the write lock so the write is durable
+        before returning.  Fatal DB errors propagate via ``_execute`` →
+        ``check_alive`` on the next call.
+        """
+        if not self.enabled or not self._available or self._conn is None:
+            return
+
+        def action(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+
+        self._execute(action, f"meta_set:{key}")
+
+    def delete_meta(self, key: str) -> None:
+        """Delete a key from the ``meta`` table (synchronous, fail-CLOSED)."""
+        if not self.enabled or not self._available or self._conn is None:
+            return
+
+        def action(conn: sqlite3.Connection) -> None:
+            conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+        self._execute(action, f"meta_delete:{key}")
+
+    # ------------------------------------------------------------------
     # Run journaling (low frequency, written synchronously)
     # ------------------------------------------------------------------
 
@@ -1456,6 +1514,125 @@ class Registry:
             }
         except Exception:  # pragma: no cover - defensive
             return None
+
+    def fetch_recoverable_urls(
+        self,
+        limit: int = 0,
+        before_ts: Optional[float] = None,
+        before_hash: Optional[str] = None,
+        provider: Optional[str] = None,
+        chunk_size: int = 1000,
+    ) -> Generator[Tuple[str, str, float], None, None]:
+        """Stream recoverable acquisition URLs from the registry (slice 3a.3).
+
+        Yields ``(url, url_hash, last_seen_ts)`` tuples for links whose
+        ``visit_status`` is ``'discovered'`` or ``'failed'``, ordered by
+        ``last_seen_ts DESC`` (freshest-first, F-14) with a deterministic
+        tie-breaker on ``url_hash`` so equal-timestamp rows are neither lost
+        nor duplicated across continuation boundaries.
+
+        Uses keyset pagination with bounded RAM: each fetch retrieves at most
+        ``chunk_size`` rows (default 1000, the canonical D-03.4 chunk).  The
+        caller controls ``limit`` (0 = unlimited), ``before_ts``/``before_hash``
+        (composite continuation marker from a prior boot), and ``provider``
+        (optional per-provider filter for legacy shard-path attribution, D3 fix).
+
+        When both ``before_ts`` and ``before_hash`` are provided, the reader
+        applies the full keyset condition:
+        ``(last_seen_ts < before_ts OR (last_seen_ts = before_ts AND url_hash > before_hash))``
+        This ensures zero data loss at equal-ts boundaries (D2 fix).
+
+        When ``provider`` is specified, the reader adds ``AND provider = ?``
+        to the WHERE clause (D3 fix: per-provider attribution, prevents marker
+        pollution across providers within one boot).
+
+        Fail-CLOSED: a fatal database error during reading propagates as
+        :class:`RegistryUnavailableError` (no silent swallow, no shard-fallback).
+        Transient busy/locked errors are classified by ``_is_fatal_db_error``
+        and NOT suppressed for typed fatals.
+
+        The generator never materialises the full result set in memory; each
+        chunk is fetched and yielded row-by-row.
+        """
+        if not self.enabled or not self._available:
+            return
+
+        # Let typed fatals propagate (Д14: fail-CLOSED central path).
+        self.check_alive()
+
+        _CHUNK = max(1, min(chunk_size, 1000))
+        _STATUS_FILTER = ("discovered", "failed")
+
+        uri = f"file:{self.path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+        try:
+            emitted = 0
+            cursor_ts = before_ts if before_ts is not None else float("inf")
+            cursor_hash = before_hash if before_hash is not None else ""
+
+            while True:
+                # Build WHERE clause dynamically.
+                where_parts = ["visit_status IN (?, ?)"]
+                params: List[Any] = list(_STATUS_FILTER)
+
+                if provider is not None:
+                    where_parts.append("provider = ?")
+                    params.append(provider)
+
+                if before_ts is not None and before_hash is not None:
+                    # Cross-boot continuation with composite marker (D2 fix).
+                    where_parts.append(
+                        "(last_seen_ts < ? OR (last_seen_ts = ? AND url_hash > ?))"
+                    )
+                    params.extend([cursor_ts, cursor_ts, cursor_hash])
+                elif cursor_ts != float("inf") and cursor_hash:
+                    # Within-boot keyset pagination (has both ts and hash).
+                    where_parts.append(
+                        "(last_seen_ts < ? OR (last_seen_ts = ? AND url_hash > ?))"
+                    )
+                    params.extend([cursor_ts, cursor_ts, cursor_hash])
+
+                where_clause = " AND ".join(where_parts)
+                sql = (
+                    f"SELECT url, url_hash, last_seen_ts FROM links "
+                    f"WHERE {where_clause} "
+                    f"ORDER BY last_seen_ts DESC, url_hash ASC "
+                    f"LIMIT ?"
+                )
+                params.append(_CHUNK)
+
+                try:
+                    rows = conn.execute(sql, params).fetchall()
+                except Exception as exc:
+                    if _is_fatal_db_error(exc):
+                        # Fail-CLOSED: fatal DB error propagates.
+                        raise RegistryUnavailableError(
+                            f"Registry database is dead during recovery read: {exc}"
+                        ) from exc
+                    raise  # non-DatabaseError exceptions also propagate
+
+                if not rows:
+                    break
+
+                for row in rows:
+                    url_val, uh, ts_val = row[0], row[1], row[2]
+                    yield (url_val, uh, ts_val if ts_val is not None else 0.0)
+                    emitted += 1
+                    if limit > 0 and emitted >= limit:
+                        return
+
+                # Advance cursor to last row of this chunk.
+                last_row = rows[-1]
+                cursor_ts = last_row[2] if last_row[2] is not None else 0.0
+                cursor_hash = last_row[1]
+
+                if len(rows) < _CHUNK:
+                    break
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Internals

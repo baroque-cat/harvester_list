@@ -942,6 +942,34 @@ class CredentialLivenessConfig:
 
 
 @dataclass
+class RecoveryConfig:
+    """Acquisition-task recovery source configuration (slice 3a.3, D-03.4).
+
+    ``source`` selects where acquisition URLs come from at startup:
+    - ``shards``   — legacy shard-aggregate path (default; neutral until gate 3a)
+    - ``registry`` — SQL streaming reader from the link registry (fail-CLOSED)
+    - ``auto``     — registry-primary when enabled+available, else shards when
+                     registry is legitimately disabled; crash when registry is
+                     enabled but dead (no shard-fallback — Д14)
+
+    ``per_boot_cap`` limits how many URLs are taken per boot (0 = unlimited).
+    When the cap truncates the result set, a continuation marker is written to
+    the registry ``meta`` table so the next boot continues below the cursor.
+    """
+
+    source: str = "shards"
+    per_boot_cap: int = 0
+
+    def __post_init__(self):
+        if self.source not in ("shards", "registry", "auto"):
+            raise ValueError(
+                "recovery.source must be one of: shards, registry, auto"
+            )
+        if not isinstance(self.per_boot_cap, int) or self.per_boot_cap < 0:
+            raise ValueError("recovery.per_boot_cap must be a non-negative integer")
+
+
+@dataclass
 class ApiConfig:
     """API configuration for a provider"""
     base_url: str = ""
@@ -1077,6 +1105,7 @@ class Config:
     gather: GatherConfig = field(default_factory=GatherConfig)
     credential_liveness: CredentialLivenessConfig = field(default_factory=CredentialLivenessConfig)
     provider: ProviderConfig = field(default_factory=ProviderConfig)
+    recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     ratelimits: Dict[str, RateLimitConfig] = field(default_factory=dict)
     tasks: List[TaskConfig] = field(default_factory=list)
 
@@ -1116,6 +1145,7 @@ class Config:
             "gather": self._dataclass_to_dict(self.gather),
             "credential_liveness": self._dataclass_to_dict(self.credential_liveness),
             "provider": self._dataclass_to_dict(self.provider),
+            "recovery": self._dataclass_to_dict(self.recovery),
             "ratelimits": {k: self._dataclass_to_dict(v) for k, v in self.ratelimits.items()},
             "tasks": [self._dataclass_to_dict(task) for task in self.tasks],
         }

@@ -42,6 +42,7 @@ from .schemas import (
     PrioritizationConfig,
     ProviderConfig,
     RecheckConfig,
+    RecoveryConfig,
     RefineGovernorConfig,
     RegistryConfig,
     SkipConfig,
@@ -186,6 +187,10 @@ class ConfigLoader:
         # Parse LLM-provider refusal-classification configuration
         if "provider" in data:
             config.provider = self._parse_provider_config(data["provider"])
+
+        # Parse acquisition-task recovery source configuration
+        if "recovery" in data:
+            config.recovery = self._parse_recovery_config(data["recovery"])
 
         # Parse rate limits
         if "ratelimits" in data:
@@ -617,6 +622,27 @@ class ConfigLoader:
         return ProviderConfig(
             classify_refusals=data.get("classify_refusals", True),
             max_refusal_wait_s=data.get("max_refusal_wait_s", 60.0),
+        )
+
+    def _parse_recovery_config(self, data: Dict[str, Any]) -> RecoveryConfig:
+        """Parse acquisition-task recovery source configuration section.
+
+        Unknown keys are logged as warnings (like the persistence section
+        pattern); validation is delegated to the dataclass ``__post_init__``.
+
+        Args:
+            data: Recovery configuration data
+
+        Returns:
+            RecoveryConfig: Parsed recovery configuration
+        """
+        _known = {"source", "per_boot_cap"}
+        for key in data:
+            if key not in _known:
+                logger.warning(f"recovery: ignoring unknown key {key!r}")
+        return RecoveryConfig(
+            source=data.get("source", "shards"),
+            per_boot_cap=data.get("per_boot_cap", 0),
         )
 
     # Dead adaptive coefficients removed by fix-credential-liveness (design D9).
