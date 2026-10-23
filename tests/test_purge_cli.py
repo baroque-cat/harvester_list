@@ -755,6 +755,35 @@ class TestReceiptSchema:
             assert dir_mode == 0o700, f"backup dir mode {oct(dir_mode)}"
 
 
+    def test_t9b_receipt_records_backup_dir_mode(self, tmp_path):
+        """T9b (gate 4.G S4 / F-29): receipt backup section records the
+        actual backup directory mode as an octal string ("0700")."""
+        workspace, cfg_path = _setup_full_workspace(tmp_path)
+        backup_dir = str(tmp_path / "backup_mode")
+
+        result = subprocess.run(
+            [sys.executable, os.path.join(REPO_ROOT, "main.py"),
+             "-c", cfg_path, "purge", "links", "--yes", "--backup-to", backup_dir],
+            capture_output=True, text=True, timeout=30,
+            cwd=str(tmp_path),
+        )
+        assert result.returncode == 0, f"purge failed: {result.stderr}"
+
+        receipts_dir = os.path.join(workspace, "purge_receipts")
+        receipt_files = sorted(os.listdir(receipts_dir))
+        assert len(receipt_files) == 1
+        with open(os.path.join(receipts_dir, receipt_files[0])) as f:
+            receipt = json.load(f)
+
+        assert receipt.get("backup") is not None, "backup section missing"
+        assert receipt["backup"].get("mode") == "0700", (
+            "F-29: receipt must record backup dir mode '0700', got: "
+            f"{receipt['backup'].get('mode')!r}"
+        )
+        dir_mode = stat.S_IMODE(os.stat(backup_dir).st_mode)
+        assert f"{dir_mode:04o}" == receipt["backup"]["mode"]
+
+
 # ---------------------------------------------------------------------------
 # T10: order in all profile
 # ---------------------------------------------------------------------------

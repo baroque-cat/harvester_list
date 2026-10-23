@@ -478,6 +478,13 @@ def purge(
                     fpath = os.path.join(backup_to, fname)
                     if os.path.isfile(fpath):
                         backup_info["md5s"][fname] = _md5_file(fpath)
+                # F-29 audit: record the actual backup directory mode in the
+                # receipt (canon 05 §5.4: "режим каталога записывается в
+                # квитанцию").  Octal string, e.g. "0700".
+                try:
+                    backup_info["mode"] = f"{os.stat(backup_to).st_mode & 0o777:04o}"
+                except OSError:  # pragma: no cover - defensive
+                    backup_info["mode"] = None
 
         duration_s = time.time() - started_ts
 

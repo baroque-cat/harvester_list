@@ -91,7 +91,7 @@ The `--backup-to DIR` flag SHALL create backups of deleted data before deletion:
 - Shards/snapshots: tar.gz archive
 - Queues: byte copies of all files
 
-The backup directory SHALL be created with mode 0700, and all backup artifacts SHALL have mode 0600 (F-29, explicit `os.chmod`, not umask-dependent). The receipt SHALL record the backup path and MD5 hashes of each artifact.
+The backup directory SHALL be created with mode 0700, and all backup artifacts SHALL have mode 0600 (F-29, explicit `os.chmod`, not umask-dependent). The receipt SHALL record the backup path, MD5 hashes of each artifact, and the actual backup directory mode as an octal string (e.g. `"0700"`) — canon 05 §5.4: the directory mode is part of the receipt audit trail.
 
 #### Scenario: Backup creates artifacts with correct rights
 
@@ -99,6 +99,7 @@ The backup directory SHALL be created with mode 0700, and all backup artifacts S
 - **THEN** `/tmp/backup` is created with mode 0700
 - **AND** each backup file (e.g., `links.ndjson`) has mode 0600
 - **AND** the receipt includes `backup.path` and `backup.md5s` fields
+- **AND** the receipt `backup.mode` field records the actual directory mode as an octal string (`"0700"`)
 
 ### Requirement: Atomic receipt
 
