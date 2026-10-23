@@ -4,7 +4,9 @@
 
 **4.2 ИСПОЛНЕН 2026-10-23**: срез 4.2 (purge CLI) реализован: `tools/purge.py` + subparser в `main.py`, 24 пина в `tests/test_purge_cli.py` (T1–T14, N-10, parser compatibility), suite 983→1007. Спека: `openspec/specs/purge-cli/spec.md`. README: секция «Workspace Purge».
 
-**4.3 ИСПОЛНЕН 2026-10-23**: срез 4.3 (restore CLI) реализован: `tools/restore.py` + subparser в `main.py`, 12 пинов в `tests/test_restore_cli.py` (T11-restore round-trip, interlocks, N-11, parser compatibility), suite 1007→1019. Спека: `openspec/specs/restore-cli/spec.md`. README: секция «Workspace Restore». N-11 оговорка: реестр не имеет `dedup_id`; restore очереди = byte-copy вручную (документировано).
+**4.3 ИСПОЛНЕН 2026-10-23**: срез 4.3 (restore CLI) реализован: `tools/restore.py` + subparser в `main.py`, 13 пинов в `tests/test_restore_cli.py` (T11-restore round-trip, interlocks, N-11, parser compatibility), suite 1007→1020. Спека: `openspec/specs/restore-cli/spec.md`. README: секция «Workspace Restore». N-11 оговорка: реестр не имеет `dedup_id`; restore очереди = byte-copy вручную (документировано). *(Числа исправлены по collect-only при docs-срезе волны 4: было «12 пинов/1019».)*
+
+**Гейт 4.G PASS 2026-10-23**: живые дрели НА КОПИИ гейт-воркспейса (D1 dry-run ноль-изменений; D2 apply счётчики==факт + backup NDJSON==пре-строкам + F-29 0700/0600 + receipt `backup.mode` после фикса `f8c9c7e`; D4/D4b all-purge порядок areas + N-10 sidecars + receipt files/bytes фактические после фикса `ed3420f`; D7 lock mutual exclusion обе стороны rc=1 REFUSE pid/holder) — полный статус-блок в 07 §7.5. Receipt `git_head` cwd-зависим (OBS-4G-B, косметика, кандидат волны 5+).
 
 ---
 
