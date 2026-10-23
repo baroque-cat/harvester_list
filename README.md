@@ -1040,6 +1040,48 @@ This is relevant for future restore (slice 4.3).
 
 See `openspec/specs/purge-cli/spec.md` for the full specification.
 
+### Workspace Restore
+
+The `restore` command restores registry tables from NDJSON dumps created by `purge --backup-to`.
+Minimum for registry: all tables that purge can back up (links, link_coverage, file_meta, repos,
+wire_coverage, keys, key_sources). Shards, queues, and telemetry are NOT restored by this command.
+
+```bash
+# Preview what would be restored (no changes)
+python main.py restore --from /path/to/backup --dry-run
+
+# Restore registry tables (requires --yes)
+python main.py restore --from /path/to/backup --yes
+
+# Restore to a different workspace
+python main.py restore --from /path/to/backup --workspace /path/to/workspace --yes
+```
+
+**What is restored:**
+
+- Registry tables: links, link_coverage, file_meta, repos, wire_coverage, keys, key_sources
+- Records are inserted by column names from JSON keys (robust to column order)
+- If `registry.sqlite` does not exist, it is created via standard bootstrap (schema version 8)
+
+**What is NOT restored (manual):**
+
+- Shards/snapshots: manually untar the `shards_snapshots.tar.gz` from backup
+- Queues: manually byte-copy `.sqlite` files back to `<workspace>/queue_state/`
+- Telemetry: manually untar `telemetry.tar.gz` from backup
+
+**Interlocks (fail-CLOSED):**
+
+- **Lock symmetry**: restore acquires the run-lock (`holder="restore"`); refuses if pipeline/purge is live
+- **WAL freshness**: refuses if WAL files are < 120s old (conservative)
+- **Non-empty target**: refuses if any table PRESENT IN THE BACKUP has rows (restore is NOT a merge tool); tables absent from the backup are untouched, so a single-profile purge can be undone
+- **Corrupted NDJSON**: refuses if any NDJSON file has invalid JSON (no partial insert)
+- **Partial backup**: restores present tables, skips absent with counter (idempotent)
+
+**N-11 caveat**: Registry tables do NOT have a `dedup_id` column. Queue restore is manual byte-copy;
+legacy `bulk_insert` rows with `dedup_id=''` remain invisible to both dedup layers (documented, not fixed).
+
+See `openspec/specs/restore-cli/spec.md` for the full specification.
+
 ### Date extraction (free freshness metadata)
 
 While the registry is enabled, the harvester also fills the reserved
@@ -2344,7 +2386,7 @@ present in an operator config they are ignored with a one-time WARNING per key.
 
 ## Run Lock (Mutual Exclusion)
 
-The pipeline writes a lock file at `<workspace>/.harvester.lock` on startup (atomically, mode 0600) and removes it on graceful shutdown. The lock contains `{"pid": <int>, "boot_ts": <float>, "holder": "pipeline"|"purge"}` and provides mutual exclusion between the pipeline and destructive commands (purge, future restore).
+The pipeline writes a lock file at `<workspace>/.harvester.lock` on startup (atomically, mode 0600) and removes it on graceful shutdown. The lock contains `{"pid": <int>, "boot_ts": <float>, "holder": "pipeline"|"purge"|"restore"}` and provides mutual exclusion between the pipeline and destructive commands (purge, restore).
 
 - **Live lock** (pid is alive): `main.py` refuses to start (exit≠0, loud message with pid/holder).
 - **Stale lock** (pid is dead): automatically taken over with a loud INFO log message.

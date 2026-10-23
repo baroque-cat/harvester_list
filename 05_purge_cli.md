@@ -4,6 +4,8 @@
 
 **4.2 ИСПОЛНЕН 2026-10-23**: срез 4.2 (purge CLI) реализован: `tools/purge.py` + subparser в `main.py`, 24 пина в `tests/test_purge_cli.py` (T1–T14, N-10, parser compatibility), suite 983→1007. Спека: `openspec/specs/purge-cli/spec.md`. README: секция «Workspace Purge».
 
+**4.3 ИСПОЛНЕН 2026-10-23**: срез 4.3 (restore CLI) реализован: `tools/restore.py` + subparser в `main.py`, 12 пинов в `tests/test_restore_cli.py` (T11-restore round-trip, interlocks, N-11, parser compatibility), suite 1007→1019. Спека: `openspec/specs/restore-cli/spec.md`. README: секция «Workspace Restore». N-11 оговорка: реестр не имеет `dedup_id`; restore очереди = byte-copy вручную (документировано).
+
 ---
 
 ## 5.1 Форма команды

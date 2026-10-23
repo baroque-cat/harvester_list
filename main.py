@@ -489,6 +489,14 @@ Examples:
     purge_parser.add_argument("--yes", action="store_true", help="Confirm purge (required without --dry-run)")
     purge_parser.add_argument("--force", action="store_true", help="Force purge even if pre-conditions are not met")
 
+    # Restore subparser (slice 4.3, wave 4): restore registry from NDJSON dumps
+    restore_parser = subparsers.add_parser("restore", help="Restore registry from backup")
+    restore_parser.add_argument("--from", dest="from_dir", required=True,
+                                help="Backup directory containing NDJSON dumps")
+    restore_parser.add_argument("--workspace", help="Workspace directory (overrides config)")
+    restore_parser.add_argument("--dry-run", action="store_true", help="Enumerate what would be restored, make no changes")
+    restore_parser.add_argument("--yes", action="store_true", help="Confirm restore (required without --dry-run)")
+
     args = parser.parse_args()
 
     # Handle purge command (slice 4.2) — before config validation, lock check, etc.
@@ -524,6 +532,40 @@ Examples:
             dry_run=args.dry_run,
             backup_to=args.backup_to,
             force=args.force,
+        )
+        sys.exit(exit_code)
+
+    # Handle restore command (slice 4.3) — before config validation, lock check, etc.
+    if args.command == "restore":
+        # Require --yes or --dry-run
+        if not args.yes and not args.dry_run:
+            print("Error: restore requires --yes (to confirm) or --dry-run (to preview)", file=sys.stderr)
+            sys.exit(1)
+
+        # Resolve workspace
+        if args.workspace:
+            ws = args.workspace
+        else:
+            # Read workspace from config YAML (YAML-only parse, no credentials needed)
+            try:
+                import yaml as _yaml
+                with open(args.config, "r", encoding="utf-8") as _f:
+                    _raw = _yaml.safe_load(_f) or {}
+                ws = (_raw.get("global") or {}).get("workspace", "./data")
+            except Exception as exc:
+                print(f"Error: failed to read workspace from config: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+        # Initialize logging
+        init_logging(args.log_level)
+
+        # Execute restore
+        from tools.restore import restore as restore_fn
+        exit_code = restore_fn(
+            from_dir=args.from_dir,
+            workspace=ws,
+            config_path=args.config,
+            dry_run=args.dry_run,
         )
         sys.exit(exit_code)
 
