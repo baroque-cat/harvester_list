@@ -1082,6 +1082,41 @@ legacy `bulk_insert` rows with `dedup_id=''` remain invisible to both dedup laye
 
 See `openspec/specs/restore-cli/spec.md` for the full specification.
 
+### Workspace Maintenance (VACUUM)
+
+The `maintain --vacuum` command manually VACUUMs `registry.sqlite` and all
+`queue_state/*.sqlite` databases, returning high-water pages to the filesystem
+after queue drain. This is essential in wide mode where queue databases can
+accumulate 25–35 GB of dead pages (DELETE does not shrink files).
+
+```bash
+# Preview targets and sizes (no changes)
+python main.py maintain --vacuum --dry-run
+
+# VACUUM registry and queue databases (pipeline must be stopped)
+python main.py maintain --vacuum
+
+# VACUUM a specific workspace
+python main.py maintain --vacuum --workspace /path/to/workspace
+```
+
+**Purpose:** After draining queues (profile `queues`), the `.sqlite` files retain
+their high-water size because SQLite DELETE does not return pages to the
+filesystem. VACUUM rebuilds the database file, reclaiming unused space.
+
+**When to use:** Manual procedure on a **stopped pipeline**. Recommended after
+large queue drains or periodically for registry compaction.
+
+**Interlocks (fail-CLOSED):**
+
+- **Lock symmetry**: maintain acquires the run-lock (`holder="maintain"`); refuses if pipeline is live
+- **WAL freshness**: refuses if WAL files are < 120s old (conservative)
+- **Non-destructive**: VACUUM preserves all data; `user_version` and row counts are verified
+- **Coverage**: both `registry.sqlite` and ALL `queue_state/*.sqlite` are vacuumed
+- **N-10 sidecars**: -wal/-shm files are NOT deleted (normal for WAL-mode DB)
+
+See `openspec/specs/maintenance-cli/spec.md` for the full specification.
+
 ### Date extraction (free freshness metadata)
 
 While the registry is enabled, the harvester also fills the reserved
@@ -2386,7 +2421,7 @@ present in an operator config they are ignored with a one-time WARNING per key.
 
 ## Run Lock (Mutual Exclusion)
 
-The pipeline writes a lock file at `<workspace>/.harvester.lock` on startup (atomically, mode 0600) and removes it on graceful shutdown. The lock contains `{"pid": <int>, "boot_ts": <float>, "holder": "pipeline"|"purge"|"restore"}` and provides mutual exclusion between the pipeline and destructive commands (purge, restore).
+The pipeline writes a lock file at `<workspace>/.harvester.lock` on startup (atomically, mode 0600) and removes it on graceful shutdown. The lock contains `{"pid": <int>, "boot_ts": <float>, "holder": "pipeline"|"purge"|"restore"|"maintain"}` and provides mutual exclusion between the pipeline and destructive commands (purge, restore, maintain).
 
 - **Live lock** (pid is alive): `main.py` refuses to start (exit≠0, loud message with pid/holder).
 - **Stale lock** (pid is dead): automatically taken over with a loud INFO log message.

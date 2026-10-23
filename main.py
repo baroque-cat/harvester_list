@@ -497,6 +497,14 @@ Examples:
     restore_parser.add_argument("--dry-run", action="store_true", help="Enumerate what would be restored, make no changes")
     restore_parser.add_argument("--yes", action="store_true", help="Confirm restore (required without --dry-run)")
 
+    # Maintain subparser (slice 4.4, wave 4): VACUUM registry + queue databases
+    maintain_parser = subparsers.add_parser("maintain", help="Maintenance operations (VACUUM)")
+    maintain_parser.add_argument("--vacuum", action="store_true",
+                                 help="VACUUM registry.sqlite and queue_state/*.sqlite")
+    maintain_parser.add_argument("--workspace", help="Workspace directory (overrides config)")
+    maintain_parser.add_argument("--dry-run", action="store_true",
+                                 help="List targets with sizes, make no changes")
+
     args = parser.parse_args()
 
     # Handle purge command (slice 4.2) — before config validation, lock check, etc.
@@ -565,6 +573,39 @@ Examples:
             from_dir=args.from_dir,
             workspace=ws,
             config_path=args.config,
+            dry_run=args.dry_run,
+        )
+        sys.exit(exit_code)
+
+    # Handle maintain command (slice 4.4) — before config validation, lock check, etc.
+    if args.command == "maintain":
+        # Require --vacuum
+        if not args.vacuum:
+            print("Error: maintain requires --vacuum", file=sys.stderr)
+            print("Available options: --vacuum (VACUUM registry and queue databases)", file=sys.stderr)
+            sys.exit(1)
+
+        # Resolve workspace
+        if args.workspace:
+            ws = args.workspace
+        else:
+            # Read workspace from config YAML (YAML-only parse, no credentials needed)
+            try:
+                import yaml as _yaml
+                with open(args.config, "r", encoding="utf-8") as _f:
+                    _raw = _yaml.safe_load(_f) or {}
+                ws = (_raw.get("global") or {}).get("workspace", "./data")
+            except Exception as exc:
+                print(f"Error: failed to read workspace from config: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+        # Initialize logging
+        init_logging(args.log_level)
+
+        # Execute vacuum
+        from tools.maintain import vacuum as vacuum_fn
+        exit_code = vacuum_fn(
+            workspace=ws,
             dry_run=args.dry_run,
         )
         sys.exit(exit_code)
