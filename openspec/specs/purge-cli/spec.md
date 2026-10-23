@@ -36,6 +36,7 @@ The purge command SHALL support six profiles: `all`, `links`, `keys`, `queues`, 
 - **WHEN** `purge all` is executed
 - **THEN** deletion proceeds in order: queues → shards → telemetry → registry
 - **AND** the registry.sqlite file and its -wal/-shm sidecars are deleted last (N-10)
+- **AND** the receipt's registry area counts every unlinked file in `files_deleted` and reports the actual on-disk bytes in `bytes_freed` (the row estimate is not additive with a deleted database file — gate 4.G S2 fidelity)
 
 ### Requirement: Fail-CLOSED interlocks
 

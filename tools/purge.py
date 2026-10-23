@@ -730,14 +730,31 @@ def _purge_all(
             logger.info(f"purge [dry-run]: would delete {total_rows} rows from registry")
         else:
             rows_deleted, bytes_freed = _delete_registry_tables(workspace, all_tables)
-            areas.append({"area": "registry", "rows_deleted": rows_deleted, "files_deleted": 0, "bytes_freed": bytes_freed})
-            logger.info(f"purge: deleted {rows_deleted} rows from registry")
 
-            # Also delete the registry.sqlite file and sidecars (N-10)
+            # Also delete the registry.sqlite file and sidecars (N-10).
+            # Receipt fidelity (gate 4.G S2): count every unlinked file; when
+            # the DB file itself is deleted its on-disk size is the
+            # authoritative bytes_freed (adding it to the row estimate would
+            # double-count the same bytes).
+            reg_files = 0
+            reg_file_bytes = 0
             for suffix in ["", "-wal", "-shm"]:
                 fpath = db_path + suffix
                 if os.path.exists(fpath):
+                    try:
+                        reg_file_bytes += os.path.getsize(fpath)
+                    except OSError:
+                        pass
                     os.unlink(fpath)
+                    reg_files += 1
+            if reg_files:
+                bytes_freed = reg_file_bytes
+            areas.append({"area": "registry", "rows_deleted": rows_deleted,
+                          "files_deleted": reg_files, "bytes_freed": bytes_freed})
+            logger.info(
+                f"purge: deleted {rows_deleted} rows from registry "
+                f"({reg_files} file(s), {bytes_freed} bytes)"
+            )
     else:
         areas.append({"area": "registry", "rows_deleted": 0, "files_deleted": 0, "bytes_freed": 0})
 

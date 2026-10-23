@@ -948,6 +948,88 @@ class TestSidecarDeletion:
         remaining = os.listdir(qs_dir) if os.path.exists(qs_dir) else []
         assert len(remaining) == 0, f"sidecars remain: {remaining}"
 
+    def test_all_registry_files_counted_in_receipt(self, tmp_path):
+        """S2/gate-4G finding: all-profile unlinks registry.sqlite + -wal/-shm
+        (N-10), so the receipt MUST count them in files_deleted and report the
+        actual on-disk bytes (row estimate would double-count a deleted file)."""
+        workspace, cfg_path = _setup_full_workspace(tmp_path)
+        reg = os.path.join(workspace, "registry.sqlite")
+        assert os.path.exists(reg), "fixture must create registry.sqlite"
+
+        # Ensure both sidecars exist with non-trivial size and old mtime
+        # (WAL-freshness interlock).
+        old_time = time.time() - 200
+        for suffix in ("-wal", "-shm"):
+            p = reg + suffix
+            with open(p, "w") as f:
+                f.write("x" * 32)
+            os.utime(p, (old_time, old_time))
+        if os.path.exists(reg):
+            os.utime(reg, (old_time, old_time))
+        reg_size_before = os.path.getsize(reg)
+
+        result = subprocess.run(
+            [sys.executable, os.path.join(REPO_ROOT, "main.py"),
+             "-c", cfg_path, "purge", "all", "--yes"],
+            capture_output=True, text=True, timeout=60,
+            cwd=str(tmp_path),
+        )
+        assert result.returncode == 0, f"purge all failed: {result.stderr}"
+
+        receipts_dir = os.path.join(workspace, "purge_receipts")
+        latest = sorted(os.listdir(receipts_dir))[-1]
+        with open(os.path.join(receipts_dir, latest)) as f:
+            receipt = json.load(f)
+        area = next(a for a in receipt["areas"] if a["area"] == "registry")
+
+        # All three paths MUST be gone afterwards (N-10). Note: SQLite itself
+        # auto-removes a well-formed -wal/-shm on last-connection close inside
+        # _delete_registry_tables, so the unlink loop may legitimately count
+        # 1..3 files; the receipt must reflect the ACTUAL unlink count (>=1)
+        # and real on-disk bytes (gate 4.G S2; live D4 census proved removal).
+        for suffix in ("", "-wal", "-shm"):
+            assert not os.path.exists(reg + suffix), f"{reg}{suffix} remains"
+        assert area["files_deleted"] >= 1, (
+            f"registry db unlink must be counted in files_deleted, "
+            f"got {area['files_deleted']}"
+        )
+        assert area["bytes_freed"] >= reg_size_before, (
+            f"bytes_freed must reflect actual file bytes "
+            f"(db was {reg_size_before}), got {area['bytes_freed']}"
+        )
+
+    def test_purge_all_counts_forced_sidecars(self, tmp_path, monkeypatch):
+        """Deterministic unit pin for the crash-leftover case: when -wal/-shm
+        persist to the unlink loop (SQLite did not auto-clean them), all three
+        files are counted in files_deleted and their real bytes in bytes_freed.
+
+        _delete_registry_tables is stubbed because ANY sqlite connect/close
+        cycle removes foreign sidecars as a side effect — this pin isolates
+        the receipt-accounting logic of the N-10 unlink loop (gate 4.G S2)."""
+        from tools.purge import _purge_all
+
+        monkeypatch.setattr(
+            "tools.purge._delete_registry_tables", lambda ws, tables: (0, 0)
+        )
+        workspace = str(tmp_path)
+        reg = os.path.join(workspace, "registry.sqlite")
+        for suffix, payload in (("", "y" * 64), ("-wal", "x" * 32), ("-shm", "z" * 16)):
+            with open(reg + suffix, "w") as f:
+                f.write(payload)
+
+        warnings: list = []
+        areas = _purge_all(workspace, False, None, None, warnings, False)
+        area = next(a for a in areas if a["area"] == "registry")
+
+        assert area["files_deleted"] == 3, (
+            f"db + wal + shm must all be counted, got {area['files_deleted']}"
+        )
+        assert area["bytes_freed"] >= 64 + 32 + 16, (
+            f"bytes_freed must sum real file sizes, got {area['bytes_freed']}"
+        )
+        for suffix in ("", "-wal", "-shm"):
+            assert not os.path.exists(reg + suffix)
+
 
 # ---------------------------------------------------------------------------
 # Parser compatibility: existing forms byte-identical
