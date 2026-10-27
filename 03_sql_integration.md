@@ -60,7 +60,7 @@ Check-task/invalid-keys восстановление остаётся шард-b
 
 ## 3b. Search-side share ledger (вариант A — принят сообщением оператора 2026-10-20)
 
-### D-03.6 Модуль `manager/search_share.py` — зеркало `gather_share.py` (R17, 40 пинов + живой гейт как шаблон) — ИСПОЛНЕН срез 3b.1 (suite 891→931, 2026-10-22; финальный коммит `6a1516d`, 40 пинов + k1/k2 F1×ledger)
+### D-03.6 Модуль `manager/search_share.py` — зеркало `gather_share.py` (R17, 40 пинов + живой гейт как шаблон) — ИСПОЛНЕН срез 3b.1 (suite 891→931, 2026-10-22; финальный коммит `6a1516d`, 40 пинов + k1/k2 F1×ledger). **Наблюдение 5.G (OBS-5G-A, 2026-10-28):** run-scoped леджер ⇒ backlog-задачи, пересекающие границу boot, fan-out только на владельца-создателя (take()-miss ⇒ [task.provider]); компенсируется R17 и ре-discovery; кандидат волны 6: take()-miss ⇒ resolver(ph)-fallback
 
 Ключ `(wire_fp, page)` — без провайдера (ответ = f(wire, page, transport); паттерны применяются ниже, на gather, где R17 уже шарит). API: `claim/take/abandon/to_stats/close`, `threading.Lock`, cap с fail-open + loud-once, три режима `search.share_fetch: off|shadow|on` (дефолт **off**), run-scoped in-RAM; потеря при рестарте компенсируется частично слоем 3a (завершённые wire persisted), внутрипробежные дубли дёшевы (агрегация + корзина платит повторно — приемлемый fail-open).
 
