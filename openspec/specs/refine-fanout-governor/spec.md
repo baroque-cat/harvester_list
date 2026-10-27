@@ -43,6 +43,8 @@ The partition count passed to the query generator SHALL be clamped to `max_parti
 ### Requirement: Per-run search-task budget with loud deterministic admission
 A per-process-run budget SHALL limit the number of admitted refined children (`max_search_tasks_per_run`). Root tasks from configured conditions and pagination tasks SHALL be exempt. Within each refine batch, children SHALL be admitted in deterministic sorted order until the budget is exhausted; every refused child SHALL increment the budget-refusal counter, and all refusals for a single parent SHALL be represented in exactly ONE aggregated warning line per parent (stable token `budget_refusal:`, fields: provider, parent query, refused count, first/last refused child in sorted order, reason). Per-child warning lines are FORBIDDEN (volume scales with clamp: 46 656 children = 46 k lines per starving root; measured incident 56 048 lines). No refusal SHALL be silent in the sense that every refusal is counted and represented in the aggregated line. The budget SHALL reset with each new process run.
 
+When `n_providers > 1` (proportional per-provider budget, F2), the budget SHALL be divided fairly among providers: each provider receives a fair share of `ceil(budget / n_providers)`. A provider SHALL NOT exceed its fair share until all providers have been observed (Phase 1: fairness enforcement). Once all providers have called at least once (Phase 2: work-conservation), the remaining budget SHALL be distributed FCFS (first-come-first-served), allowing providers who haven't saturated to consume overflow. When `n_providers = 1` (default), the behavior SHALL be byte-identical to the pre-change FCFS implementation (neutral rollback). The per-provider admitted counts SHALL be tracked under the existing lock and exposed via the metrics property for fairness observability.
+
 #### Scenario: Budget exhaustion refuses loudly and deterministically
 - **WHEN** admitting a batch of children would exceed the remaining budget
 - **THEN** the highest-sorted children beyond the remaining budget are refused, each refusal increments the refusal counter, exactly one aggregated warning line is emitted per parent batch (naming provider, parent query, refused count, first and last refused child in sorted order, and reason), and the admitted set is identical for identical inputs
@@ -54,6 +56,18 @@ A per-process-run budget SHALL limit the number of admitted refined children (`m
 #### Scenario: Fresh process resets the budget
 - **WHEN** a new governor instance is constructed (process restart)
 - **THEN** the remaining budget equals the configured maximum again
+
+#### Scenario: Proportional fairness with symmetric demand (F2)
+- **WHEN** `n_providers = 2`, budget = 100, and providers A and B both submit large batches (100+ candidates each) with A calling first
+- **THEN** A receives at most 50 (fair share = ceil(100/2)), B receives at most 50, and the difference between A and B is within ±10% (fairness pin from 07_verification.md:128)
+
+#### Scenario: Work-conservation with asymmetric demand (F2)
+- **WHEN** `n_providers = 2`, budget = 100, A wants 100+, B wants 20 and finishes early
+- **THEN** A receives 50 (fair share) initially, B receives 20, and A receives 30 more from the overflow pool (Phase 2 FCFS after all providers seen), totaling A=80, B=20, budget fully consumed (100)
+
+#### Scenario: n_providers=1 is byte-identical to pre-change (F2)
+- **WHEN** `n_providers = 1` (default)
+- **THEN** the governor behaves identically to the pre-F2 implementation: fair_share = budget, Phase 2 starts immediately after the first provider call, and the admission logic is FCFS with no per-provider tracking overhead
 
 ### Requirement: Tri-mode rollout flag
 The governor SHALL operate in one of three modes configured via `refine_governor.mode`: `off` (behavior byte-equivalent to the pre-change system, counters inert), `shadow` (all children enqueued exactly as in `off`, while every clamp/depth/budget/wire-collapse decision is computed, counted and logged as a would-be refusal), and `on` (decisions enforced). The default SHALL be `on`; switching modes SHALL require only a configuration change. Invalid modes or non-positive caps SHALL fail configuration validation loudly. The wire-collapse guard SHALL be additionally controlled by its own boolean `refine_governor.drop_wire_indistinguishable` (default true), orthogonal to `mode`: it SHALL have no effect in `off`, and in `shadow`/`on` disabling it SHALL restore the admission behaviour that predates the guard. A non-boolean value for that key SHALL fail configuration validation loudly.

@@ -292,6 +292,11 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
         from search.refine_governor import RefineGovernor
 
         cfg = config.refine_governor
+        # F2: count enabled tasks with search stage for proportional budget.
+        n_providers = sum(
+            1 for task in config.tasks
+            if task.enabled and task.stages.search
+        )
         try:
             governor = RefineGovernor(
                 mode=cfg.mode,
@@ -301,6 +306,7 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
                 drop_wire_indistinguishable=cfg.drop_wire_indistinguishable,
                 coverage_mode=cfg.coverage_mode,
                 wire_ttl_hours=cfg.wire_ttl_hours,
+                n_providers=max(1, n_providers),
             )
             logger.info(
                 f"Refine governor configured: mode={cfg.mode} "
@@ -308,7 +314,8 @@ class Pipeline(IPipelineStats, StageRegistryMixin, LifecycleManager):
                 f"budget={cfg.max_search_tasks_per_run} "
                 f"drop_wire_indistinguishable={cfg.drop_wire_indistinguishable} "
                 f"coverage_mode={cfg.coverage_mode} "
-                f"wire_ttl_hours={cfg.wire_ttl_hours}"
+                f"wire_ttl_hours={cfg.wire_ttl_hours} "
+                f"n_providers={n_providers}"
             )
         except Exception as e:
             logger.error(f"Failed to configure refine governor, using safe defaults (mode=on): {e}")

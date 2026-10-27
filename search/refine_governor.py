@@ -76,6 +76,7 @@ class RefineGovernor:
         drop_wire_indistinguishable: bool = True,
         coverage_mode: str = "off",
         wire_ttl_hours: int = 168,
+        n_providers: int = 1,
     ) -> None:
         normalized = str(mode).strip().lower()
         if normalized not in _VALID_MODES:
@@ -102,6 +103,9 @@ class RefineGovernor:
         wire_ttl = int(wire_ttl_hours)
         if wire_ttl <= 0:
             raise ValueError("refine_governor.wire_ttl_hours must be positive")
+        n_prov = int(n_providers)
+        if n_prov <= 0:
+            raise ValueError("refine_governor.n_providers must be positive")
 
         self.mode = normalized
         self.max_refine_depth = depth
@@ -110,6 +114,7 @@ class RefineGovernor:
         self.drop_wire_indistinguishable = drop_wire_indistinguishable
         self.coverage_mode = coverage_mode_normalized
         self.wire_ttl_hours = wire_ttl
+        self.n_providers = n_prov
 
         self._lock = threading.Lock()
         self._children_generated = 0
@@ -126,6 +131,8 @@ class RefineGovernor:
         self._budget_used = 0
         self._distinct_wire_admitted = 0
         self._coverage: List[float] = []
+        # F2: per-provider admitted counts for proportional budget fairness.
+        self._provider_admitted: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Depth gate
@@ -294,13 +301,16 @@ class RefineGovernor:
                 # Instead, wire_covered_shadow_hits grows.
                 self._wire_covered_shadow_hits += shadow_hits
                 self._truncated_to_cap += truncated
-                remaining = max(0, self.max_search_tasks_per_run - self._budget_used)
-                would_admit = capped[:remaining]
+                # F2: per-provider admission limit (fairness).
+                limit = self._admission_limit(provider)
+                would_admit = capped[:limit]
                 would_refuse = capped[len(would_admit):]
                 self._refused_budget += len(would_refuse)
                 # Track the would-be "on" trajectory so subsequent batches
                 # measure the same budget drain enforcement would cause.
                 self._budget_used += len(would_admit)
+                # F2: track per-provider would-be admitted for fairness.
+                self._provider_admitted[provider] = self._provider_admitted.get(provider, 0) + len(would_admit)
                 # ``distinct_wire_admitted`` is an observation, not a decision:
                 # shadow records the wires enforcement would admit (design D8).
                 # It is a per-parent distinct count summed over the run, so under
@@ -332,12 +342,15 @@ class RefineGovernor:
             self._refused_wire_covered += covered_count
             self._wire_covered_shadow_hits += shadow_hits
             self._truncated_to_cap += truncated
-            remaining = max(0, self.max_search_tasks_per_run - self._budget_used)
-            admitted = capped[:remaining]
+            # F2: per-provider admission limit (fairness).
+            limit = self._admission_limit(provider)
+            admitted = capped[:limit]
             refused = capped[len(admitted):]
             self._budget_used += len(admitted)
             self._children_admitted += len(admitted)
             self._refused_budget += len(refused)
+            # F2: track per-provider admitted for fairness.
+            self._provider_admitted[provider] = self._provider_admitted.get(provider, 0) + len(admitted)
             self._distinct_wire_admitted += len(
                 {fingerprint(q, use_api) for q in admitted}
             )
@@ -361,6 +374,43 @@ class RefineGovernor:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+    def _fair_share(self) -> int:
+        """Per-provider fair share: ceil(budget / n_providers)."""
+        budget = self.max_search_tasks_per_run
+        n = self.n_providers
+        return (budget + n - 1) // n  # ceil division
+
+    def _admission_limit(self, provider: str) -> int:
+        """Compute the max children this provider can admit in this call.
+
+        Two-phase mechanism (F2):
+        - Phase 1 (not all providers seen): each provider capped at fair_share.
+        - Phase 2 (all providers seen): provider under fair_share gets fair_share
+          room; provider at/above fair_share gets FCFS (global_remaining).
+
+        n_providers=1 ⇒ fair_share=budget ⇒ Phase 2 immediately after first
+        call ⇒ byte-identical to pre-change FCFS behavior.
+        """
+        if self.n_providers <= 1:
+            # Neutral: byte-pre-change behavior.
+            return max(0, self.max_search_tasks_per_run - self._budget_used)
+
+        fair_share = self._fair_share()
+        global_remaining = max(0, self.max_search_tasks_per_run - self._budget_used)
+        provider_used = self._provider_admitted.get(provider, 0)
+        all_seen = len(self._provider_admitted) >= self.n_providers
+
+        if not all_seen:
+            # Phase 1: cap at fair_share to prevent monopolization.
+            return min(global_remaining, max(0, fair_share - provider_used))
+        
+        # Phase 2: all providers seen.
+        if provider_used < fair_share:
+            # Still under fair_share: get fair_share room.
+            return min(global_remaining, fair_share - provider_used)
+        # At/above fair_share: FCFS (overflow).
+        return global_remaining
+
     def _record_coverage(self, admitted: List[str], transport_limit: int, total: int) -> float:
         limit = int(transport_limit) if transport_limit else 0
         estimate = min(1.0, len(admitted) * limit / max(int(total), 1))
@@ -431,6 +481,7 @@ class RefineGovernor:
         """Thread-safe snapshot for ``PipelineStatus.refine_metrics``."""
         with self._lock:
             coverage = list(self._coverage)
+            provider_admitted = dict(self._provider_admitted)
             return {
                 "mode": self.mode,
                 "coverage_mode": self.coverage_mode,
@@ -449,4 +500,7 @@ class RefineGovernor:
                 "distinct_wire_admitted": self._distinct_wire_admitted,
                 "coverage_estimate_min": min(coverage) if coverage else 1.0,
                 "coverage_estimate_avg": (sum(coverage) / len(coverage)) if coverage else 1.0,
+                # F2: per-provider fairness observability (additive, no render token).
+                "n_providers": self.n_providers,
+                "provider_admitted": provider_admitted,
             }
