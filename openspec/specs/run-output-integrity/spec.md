@@ -40,6 +40,14 @@ unredacted.
 - **THEN** every one of them redacts it, so that adding a renderer without redaction is a test
   failure rather than a silent gap
 
+#### Scenario: ROI-L3 the shared dictionary carries the contextual user_session cookie pattern
+- **WHEN** the shared redaction dictionary is enumerated and a rendered line carries
+  `user_session=<value>` in any contextual form — a Cookie header, a URL query parameter, or a
+  JSON-escaped string
+- **THEN** the session value is masked in every form while text without the `user_session=` key
+  name is left byte-unchanged, so a full-account web cookie cannot reach any sink that shares the
+  dictionary (L3-rest, wave 6 slice 6.0)
+
 ### Requirement: Redaction is attached where records actually pass, and secrets are not emitted
 
 A redaction mechanism SHALL be attached at a point the run's records actually traverse. A filter

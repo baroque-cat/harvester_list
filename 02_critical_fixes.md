@@ -121,7 +121,7 @@
 
 ## 2.6 Коррекции прежних записей (чтобы волны не гонялись за призраками)
 
-1. **P14/II.18-L3 УСТАРЕЛ ЧАСТИЧНО:** `tools/patterns.py:11-21` уже покрывает `AIza/sk-/sk-proj-/anthropic/gsk_/stab_/ghp_{36}/github_pat_/gho_{36}` (проверено лично). Реальный остаток L3 = только `user_session=` контекстный паттерн + пин словаря (П-H остаток, волна 6).
+1. **P14/II.18-L3 УСТАРЕЛ ЧАСТИЧНО:** `tools/patterns.py:11-21` уже покрывает `AIza/sk-/sk-proj-/anthropic/gsk_/stab_/ghp_{36}/github_pat_/gho_{36}` (проверено лично). Реальный остаток L3 = только `user_session=` контекстный паттерн + пин словаря (П-H остаток, волна 6) — **ИСПОЛНЕН срез 6.0 (2026-11-03)**: контекстный паттерн `user_session=[A-Za-z0-9_%\-.]{16,}` добавлен в словарь tools/patterns.py (единый редиректор всех пяти Formatter через _redact_line и квитанций purge/restore/maintain), пины P1–P5 tests/test_l3_user_session_redaction.py + сценарий ROI-L3 спеки run-output-integrity.
 2. **C9 ОПРОВЕРГНУТ лично:** консоль маскируется (все пять Formatter-подклассов fail-closed, `_redact_line` в `format()`); `provider/client.py` НЕ СУЩЕСТВУЕТ; печати заголовков в `provider/*.py` нет. Субагентская галлюцинация, снята до отчёта.
 3. **П-K переформулирован:** `get_total_num` мёртв; живой дефект = `estimate_web_total` default-20 (П-K′).
 4. **Drain gather:** 345–690k fetch/сутки (корзина 4.0/8, адаптив 0.1×–2×), не «~740k» однозначно.

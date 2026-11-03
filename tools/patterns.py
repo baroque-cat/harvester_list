@@ -18,6 +18,12 @@ API_KEY_PATTERNS = [
     r"\bghp_[A-Za-z0-9]{36}",  # GitHub personal access tokens (classic)
     r"\bgithub_pat_[A-Za-z0-9_]{20,}",  # GitHub fine-grained PATs
     r"\bgho_[A-Za-z0-9]{36}",  # GitHub OAuth tokens
+    # GitHub web session cookie, contextual on the key name (L3-rest, wave 6
+    # slice 6.0; canon 02 §2.4 note 1).  Sessions are full-account cookies
+    # consumed as ``Cookie: user_session={session}``; every sink shares this
+    # dictionary (five log formatters via _redact_line, purge/restore/maintain
+    # receipts via redact_api_keys_in_text), so one pattern closes them all.
+    r"user_session=[A-Za-z0-9_%\-.]{16,}",
 ]
 
 # Query parsing patterns
