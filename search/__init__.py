@@ -21,10 +21,12 @@ from .client import (
     search_github_web,
     search_web_with_count,
 )
+from core.exceptions import EstimateUnavailable
 
 __all__ = [
     "chat",
     "collect",
+    "EstimateUnavailable",
     "estimate_web_total",
     "extract",
     "get_github_client",

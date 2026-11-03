@@ -51,6 +51,10 @@ _DEAD_SESSION_STATS: Dict[str, int] = {"detected": 0}
 _WEB_PARSE_WARNING_SHOWN = False
 _WEB_PARSE_STATS: Dict[str, int] = {"web_pages_parsed_zero": 0, "web_pages_parsed_nonzero": 0}
 
+# Estimate-unavailable monitor (slice 6.4 П-K′)
+_ESTIMATE_UNAVAILABLE_STATS: Dict[str, int] = {"estimate_unavailable": 0}
+_ESTIMATE_UNAVAILABLE_WARNING_SHOWN = False
+
 # Repeated-ambiguous pool-cool (slice 6.3 П-G)
 # Threshold: 3 ambiguous refusals per (service, credential) per session triggers pool-cool.
 # Justification: single ambiguous = fail-open (transient); 3 in a row on the same credential
@@ -109,6 +113,31 @@ def reset_web_parse_stats() -> None:
     _WEB_PARSE_STATS["web_pages_parsed_zero"] = 0
     _WEB_PARSE_STATS["web_pages_parsed_nonzero"] = 0
     _WEB_PARSE_WARNING_SHOWN = False
+
+
+def _estimate_unavailable_warning(query: str) -> None:
+    """Count an unavailable estimate and warn once (loud-once pattern, slice 6.4 П-K′)."""
+    global _ESTIMATE_UNAVAILABLE_WARNING_SHOWN
+    _ESTIMATE_UNAVAILABLE_STATS["estimate_unavailable"] += 1
+    bump_credential_metric("estimate_unavailable")
+    if not _ESTIMATE_UNAVAILABLE_WARNING_SHOWN:
+        _ESTIMATE_UNAVAILABLE_WARNING_SHOWN = True
+        logger.warning(
+            f"[estimate] web total estimate unavailable for query: {query} — "
+            "stage will paginate-anyway (pages 2..WEB_MAX_PAGES) instead of refining"
+        )
+
+
+def get_estimate_unavailable_stats() -> Dict[str, int]:
+    """Expose estimate-unavailable counters (tests / observability)."""
+    return dict(_ESTIMATE_UNAVAILABLE_STATS)
+
+
+def reset_estimate_unavailable_stats() -> None:
+    """Reset estimate-unavailable counters (tests / fresh runs)."""
+    global _ESTIMATE_UNAVAILABLE_WARNING_SHOWN
+    _ESTIMATE_UNAVAILABLE_STATS["estimate_unavailable"] = 0
+    _ESTIMATE_UNAVAILABLE_WARNING_SHOWN = False
 
 
 def _ambiguous_warning(session: str) -> None:
@@ -344,7 +373,7 @@ def request(method: str, url: str, timeout: float = 10, **kwargs: Any) -> reques
     return response
 
 
-from constant.search import API_RESULTS_PER_PAGE, WEB_RESULTS_PER_PAGE
+from constant.search import API_RESULTS_PER_PAGE, WEB_LIMIT, WEB_RESULTS_PER_PAGE
 from constant.system import (
     CHAT_RETRY_INTERVAL,
     DEFAULT_HEADERS,
@@ -361,7 +390,7 @@ from constant.system import (
     SERVICE_TYPE_GITHUB_WEB,
 )
 from core.enums import ErrorReason
-from core.exceptions import NetworkError, RateLimitDeferral, TransientFetchError, ValidationError
+from core.exceptions import EstimateUnavailable, NetworkError, RateLimitDeferral, TransientFetchError, ValidationError
 from core.models import RateLimitConfig
 from core.types import IAuthProvider
 from tools.coordinator import get_user_agent
@@ -2934,7 +2963,15 @@ def search_web_with_count(
 
     # Get total count (only for first page to avoid redundant calls)
     if page == 1:
-        total = estimate_web_total(query, session, content)
+        try:
+            total = estimate_web_total(query, session, content)
+        except EstimateUnavailable:
+            # Slice 6.4 П-K′: estimate unavailable — return WEB_LIMIT as a
+            # sentinel that triggers paginate-anyway (total > per_page) but not
+            # refine (total > limit is False when total == WEB_LIMIT).  This
+            # prevents the silent collapse to page-1-only that occurred when
+            # estimate_web_total returned WEB_RESULTS_PER_PAGE (20).
+            total = WEB_LIMIT
     else:
         # For non-first pages, we don't need total count, use 0 as placeholder
         total = 0
@@ -3072,6 +3109,12 @@ def estimate_web_total(query: str, session: str, content: Optional[str] = None) 
     """
     Get total count for web search using GitHub's blackbird_count API.
     Performs a single search and then queries the count API.
+
+    Raises :class:`EstimateUnavailable` (slice 6.4 П-K′) when every available
+    signal fails — never returns a small numeric fallback that would silently
+    collapse the stage's pagination/refine decisions to page-1-only.
+    ``GithubCredentialLimited`` propagates through without being collapsed
+    (composition with slice 6.1 dead-session detection).
     """
     if isblank(session) or isblank(query):
         return 0
@@ -3088,9 +3131,9 @@ def estimate_web_total(query: str, session: str, content: Optional[str] = None) 
 
         content = trim(content)
         if not content:
-            logger.warning(f"[search] initial search failed for query: {message}, using conservative estimate")
-            # Conservative estimate
-            return WEB_RESULTS_PER_PAGE
+            logger.warning(f"[search] initial search failed for query: {message}, estimate unavailable")
+            _estimate_unavailable_warning(message)
+            raise EstimateUnavailable(f"initial search blank for query: {message}")
 
         # Check if query is already encoded to avoid double encoding
         if "%" in query and any(c in query for c in ["%2F", "%5B", "%5D", "%7B", "%7D"]):
@@ -3129,16 +3172,23 @@ def estimate_web_total(query: str, session: str, content: Optional[str] = None) 
 
     except GithubCredentialLimited:
         raise
+    except EstimateUnavailable:
+        raise
     except Exception as e:
-        logger.error(f"[search] estimation failed for query: {message}, error: {e}, using conservative estimate")
-        # Conservative estimate
-        return WEB_RESULTS_PER_PAGE
+        logger.error(f"[search] estimation failed for query: {message}, error: {e}, estimate unavailable")
+        _estimate_unavailable_warning(message)
+        raise EstimateUnavailable(f"estimation failed for query: {message}: {e}") from e
 
 
 def extract_count_from_page(content: str, query: str) -> int:
-    """Extract result count from GitHub search page content."""
+    """Extract result count from GitHub search page content.
+
+    Raises :class:`EstimateUnavailable` (slice 6.4 П-K′) when the count cannot
+    be extracted — never returns a small numeric fallback.
+    """
     if isblank(content):
-        return WEB_RESULTS_PER_PAGE
+        _estimate_unavailable_warning(query)
+        raise EstimateUnavailable(f"blank content for query: {query}")
 
     try:
         message = urllib.parse.unquote_plus(query)
@@ -3159,13 +3209,17 @@ def extract_count_from_page(content: str, query: str) -> int:
                 logger.info(f"[search] extracted {count} results from page for query: {message}")
                 return count
 
-        # If no count found, use conservative estimate
+        # If no count found, raise unavailable
         logger.warning(f"[search] could not extract count from page for query: {message}")
-        return WEB_RESULTS_PER_PAGE
+        _estimate_unavailable_warning(message)
+        raise EstimateUnavailable(f"could not extract count from page for query: {message}")
 
+    except EstimateUnavailable:
+        raise
     except Exception as e:
         logger.error(f"[search] failed to extract count from page: {e}")
-        return WEB_RESULTS_PER_PAGE
+        _estimate_unavailable_warning(query)
+        raise EstimateUnavailable(f"failed to extract count from page: {e}") from e
 
 
 def search_code(

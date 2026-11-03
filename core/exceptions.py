@@ -161,3 +161,20 @@ class LockHeldError(RuntimeError):
     (purge, future restore).  Stale locks (dead pid) are taken over loudly
     by ``acquire_lock`` and do NOT raise this exception (slice 4.1, wave 4).
     """
+
+
+class EstimateUnavailable(RuntimeError):
+    """The web total-result estimate could not be obtained.
+
+    Raised by ``search.client.estimate_web_total`` when every available signal
+    (blackbird count API, HTML page extraction) failed — transport exception,
+    blank payload, unparseable response.  Callers MUST distinguish this from a
+    legitimate small total (e.g. 20): a numeric fallback would silently
+    collapse the stage's pagination/refine decisions to page-1-only (П-K′,
+    slice 6.4).  The stage responds with paginate-anyway (pages 2..WEB_MAX_PAGES)
+    rather than refining, because the true total is unknown.
+
+    ``GithubCredentialLimited`` propagates THROUGH this path without being
+    collapsed into this sentinel (composition with slice 6.1 dead-session
+    detection).
+    """
