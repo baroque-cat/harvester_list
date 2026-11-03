@@ -1119,6 +1119,36 @@ large queue drains or periodically for registry compaction.
 
 See `openspec/specs/maintenance-cli/spec.md` for the full specification.
 
+### Transport flips (use_api / gather.transport)
+
+Flipping `use_api` (api↔web) or `gather.transport` while pending queue rows
+exist requires care because the durable dedup identity now includes the
+transport segment (slice 6.5, 2026-11-04).
+
+**Before flipping `use_api`:**
+
+1. **Drain the search queue** — let pending rows complete naturally, OR
+2. **Purge queues** — `python main.py purge queues --yes` (profile `queues`
+   from the purge documentation). **⚠️ Warning:** this erases the ENTIRE
+   backlog (search + gather + check + inspect), not just search. Recovery is
+   from registry/shards.
+
+**Transition window (F-19):** old pending rows have ids WITHOUT the new
+transport segment. After the flip, one drain cycle may produce duplicate
+twins (same provider/query/page/regex, different transport) — both are
+accepted because their dedup_ids now differ. The window self-heals as old
+rows drain; the flip-drill gate of wave 6 measures the exact duration.
+
+**Gather analog:** the gather-share key `(url_hash, patterns_hash, transport)`
+already contains transport (manager/gather_share.py:42/:123). After flipping
+`gather.transport`, pre-flip entries do not find `take()` — fan-out for those
+URLs is lost until re-discovery (self-healing). The window is measured in the
+flip-drill gate; gather-share code is NOT changed in this slice.
+
+**Pins:** `tests/test_flip_hygiene.py` (FH1–FH6) verify the transport segment
+is part of search identity, same-transport twins still collapse, and other
+stages are unaffected.
+
 ### Date extraction (free freshness metadata)
 
 While the registry is enabled, the harvester also fills the reserved

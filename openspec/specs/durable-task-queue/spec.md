@@ -129,3 +129,7 @@ If the durable store cannot be opened or bootstrapped at stage construction, the
 #### Scenario: S23 defer-circulating tasks hit the natural ceiling
 - **WHEN** a task is deferred repeatedly (defer_count increments) and its creation time exceeds `max_age_hours`
 - **THEN** the task is purged at startup (defer-circulating tasks are not exempt from the age gate), preserving the natural ceiling that prevents infinite circulation of rate-limited tasks
+
+#### Scenario: S24 transport is part of search task identity
+- **WHEN** two search tasks with identical (provider, query, page, regex) but different `use_api` (one True, one False) are enqueued
+- **THEN** both tasks are retained with distinct dedup_ids (the transport segment `api`/`web` is part of the identity), and same-transport duplicates are still suppressed as before

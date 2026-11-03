@@ -113,8 +113,9 @@ class SearchStage(BasePipelineStage):
     def _generate_id(self, task: ProviderTask) -> str:
         """Generate unique task identifier for deduplication"""
         search_task = task if isinstance(task, SearchTask) else SearchTask()
+        transport = "api" if getattr(search_task, "use_api", False) else "web"
         return (
-            f"{PipelineStage.SEARCH.value}:{task.provider}:{search_task.query}:{search_task.page}:{search_task.regex}"
+            f"{PipelineStage.SEARCH.value}:{task.provider}:{search_task.query}:{search_task.page}:{search_task.regex}:{transport}"
         )
 
     def _validate_task_type(self, task: ProviderTask) -> bool:
