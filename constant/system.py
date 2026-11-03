@@ -48,6 +48,11 @@ GITHUB_API_RATE_LIMIT_BACKOFF: int = 60  # 1 minute
 GITHUB_CREDENTIAL_COOLDOWN_MIN: int = 60
 GITHUB_CREDENTIAL_COOLDOWN_MAX: int = 900
 GITHUB_CREDENTIAL_COOLDOWN_FACTOR: float = 2.0
+# Expired/dead web session cooldown: 4 hours (14400s). Rationale: S13 ladder
+# maxes at 900s (15min) for transient rate limits; a dead session (sign-in page)
+# is permanent evidence of expiry, not a transient refusal, so it gets a much
+# longer bench to avoid hot-spinning on a known-bad credential.
+GITHUB_EXPIRED_SESSION_COOLDOWN_S: int = 14400
 GITHUB_WEB_COUNT_DELAY_MAX: float = 2.0  # Random delay up to 2 seconds
 CHAT_RETRY_INTERVAL: int = 1
 

@@ -105,6 +105,36 @@ Content-based rate-limit detection SHALL match only verifiable GitHub markers: `
 - **WHEN** the web search surface returns its exact `Search failed. Please try again later.` sentence
 - **THEN** it is still classified as rate-limited exactly as before this change
 
+### Requirement: Content-based session-expiry detection
+When a web search response contains the exact sign-in page marker (`<title>Sign in to GitHub · GitHub</title>`), the session SHALL be classified as expired/dead: the credential SHALL be benched with a long cooldown (4 hours, far exceeding the transient rate-limit ladder max of 15 minutes), a typed `GithubCredentialLimited` exception SHALL be raised with reason `expired_session` (so the existing stage rotation catch rotates to the next session), the false-success accounting path (mark_success, early_release, adaptive-basket acceleration) SHALL be suppressed via a content-failure predicate evaluated BEFORE success reporting, the detection SHALL be counted in a `dead_sessions_detected` metric, and exactly one loud WARNING SHALL be emitted per detection episode (loud-once pattern, masked credential). The credential selector's existing `is_cooling` check ensures the benched session is not re-selected. Healthy content (non-sign-in) SHALL follow the byte-previous success path unchanged.
+
+#### Scenario: Sign-in page benches session and rotates
+- **WHEN** a web search response contains the exact sign-in title marker
+- **THEN** the session is benched for 4 hours (skip_clamp=True, bypassing the 15-min transient max), `GithubCredentialLimited` is raised with reason `expired_session`, the stage rotation catch selects the next session, `mark_success` is NOT called, the adaptive basket does NOT accelerate, the `dead_sessions_detected` counter increments, and one loud WARNING is logged (masked credential)
+
+#### Scenario: Healthy content preserves byte-previous behavior
+- **WHEN** a web search response does NOT contain the sign-in marker
+- **THEN** the content is returned normally, `mark_success` is called if the session was cooling, the adaptive basket adjusts on success as before, and no dead-session counter increments
+
+#### Scenario: Benched session is not re-selected
+- **WHEN** a session has been benched for expired-session cooldown
+- **THEN** the credential selector's `is_cooling` check excludes it from selection until the cooldown expires, preventing hot-spin loops on known-bad sessions
+
+### Requirement: Web-parse tripwire monitor
+Web-parse result counting SHALL track zero-result vs nonzero-result parses separately (`web_pages_parsed_zero`, `web_pages_parsed_nonzero`), with exactly one loud WARNING emitted on the first zero-result parse (loud-once pattern, indicating possible markup drift). Blank content (TransientFetchError path) SHALL NOT be counted as a zero-result parse (semantics preserved: blank = failure-empty, not zero-result). Counters SHALL be accessible via `get_web_parse_stats()` for tests and gates.
+
+#### Scenario: Non-blank content without links counts zero
+- **WHEN** non-blank web content is parsed and yields zero blob links
+- **THEN** `web_pages_parsed_zero` increments, one loud WARNING is emitted (first time only), and `web_pages_parsed_nonzero` is unchanged
+
+#### Scenario: Content with links counts nonzero
+- **WHEN** web content is parsed and yields one or more blob links
+- **THEN** `web_pages_parsed_nonzero` increments and no zero-parse WARNING is emitted
+
+#### Scenario: Blank content does not count
+- **WHEN** web content is blank (TransientFetchError path)
+- **THEN** neither counter increments (blank = failure-empty, not zero-result)
+
 ### Requirement: Honest adaptive-rate configuration
 Rate-limit configuration SHALL expose only keys that influence behavior. The dead coefficients (`backoff_factor`, `recovery_factor`, `max_rate_multiplier`, `min_rate_multiplier`) SHALL be removed from the schema, validator, and documentation; when present in an operator's config file they SHALL be ignored with exactly one loud WARNING per key per load (graceful acceptance period: live configs must not crash), and SHALL have no effect. Documentation and example configs SHALL describe the real adaptive model (per-bucket rate halved after consecutive failures with a floor, recovered stepwise after consecutive successes with a cap).
 

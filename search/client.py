@@ -43,6 +43,62 @@ _RELATIVE_TIME_RE = re.compile(r'<relative-time[^>]*\bdatetime\s*=\s*"([^"]+)"',
 _DATE_WARNING_COUNTS: Dict[str, int] = {}
 _DATE_WARNING_KINDS: set = set()
 
+# Dead-session detection loud-once (slice 6.1 П-B)
+_DEAD_SESSION_WARNING_SHOWN = False
+_DEAD_SESSION_STATS: Dict[str, int] = {"detected": 0}
+
+# Web-parse tripwire monitor (slice 6.2 П-J)
+_WEB_PARSE_WARNING_SHOWN = False
+_WEB_PARSE_STATS: Dict[str, int] = {"web_pages_parsed_zero": 0, "web_pages_parsed_nonzero": 0}
+
+
+def _dead_session_warning(session: str) -> None:
+    """Count a dead-session detection and warn once (loud-once pattern)."""
+    global _DEAD_SESSION_WARNING_SHOWN
+    _DEAD_SESSION_STATS["detected"] += 1
+    bump_credential_metric("dead_sessions_detected")
+    if not _DEAD_SESSION_WARNING_SHOWN:
+        _DEAD_SESSION_WARNING_SHOWN = True
+        logger.warning(
+            f"[dead-session] web session {mask_credential(session)} returned sign-in page "
+            "(expired); credential benched for long cooldown, rotation will pick next session"
+        )
+
+
+def get_dead_session_stats() -> Dict[str, int]:
+    """Expose dead-session detection counters."""
+    return dict(_DEAD_SESSION_STATS)
+
+
+def reset_dead_session_stats() -> None:
+    """Reset dead-session counters (tests / fresh runs)."""
+    global _DEAD_SESSION_WARNING_SHOWN
+    _DEAD_SESSION_STATS["detected"] = 0
+    _DEAD_SESSION_WARNING_SHOWN = False
+
+
+def _web_parse_warning() -> None:
+    """Warn once on zero-result parse despite HTTP success (loud-once pattern)."""
+    global _WEB_PARSE_WARNING_SHOWN
+    if not _WEB_PARSE_WARNING_SHOWN:
+        _WEB_PARSE_WARNING_SHOWN = True
+        logger.warning(
+            "[web-parse] page parsed zero results despite HTTP success — possible markup drift"
+        )
+
+
+def get_web_parse_stats() -> Dict[str, int]:
+    """Expose web-parse tripwire counters."""
+    return dict(_WEB_PARSE_STATS)
+
+
+def reset_web_parse_stats() -> None:
+    """Reset web-parse counters (tests / fresh runs)."""
+    global _WEB_PARSE_WARNING_SHOWN
+    _WEB_PARSE_STATS["web_pages_parsed_zero"] = 0
+    _WEB_PARSE_STATS["web_pages_parsed_nonzero"] = 0
+    _WEB_PARSE_WARNING_SHOWN = False
+
 
 def _date_warning(kind: str, message: str = "") -> None:
     """Count a fail-open date-parsing issue and warn once per kind."""
@@ -223,6 +279,7 @@ from constant.system import (
     GITHUB_API_INTERVAL,
     GITHUB_API_RATE_LIMIT_BACKOFF,
     GITHUB_API_TIMEOUT,
+    GITHUB_EXPIRED_SESSION_COOLDOWN_S,
     GITHUB_WEB_COUNT_DELAY_MAX,
     NO_RETRY_ERROR_CODES,
     SERVICE_TYPE_GITHUB_API,
@@ -399,9 +456,13 @@ class GitHubClient:
         interval: float = 0,
         timeout: float = 10,
         credential: Optional[str] = None,
+        content_failure_predicate: Optional[Callable[[str], bool]] = None,
     ) -> str:
         """Make rate-limited HTTP GET request to GitHub"""
-        content, _ = self.get_with_headers(url, headers, params, retries, interval, timeout, credential)
+        content, _ = self.get_with_headers(
+            url, headers, params, retries, interval, timeout, credential,
+            content_failure_predicate=content_failure_predicate,
+        )
         return content
 
     def get_with_headers(
@@ -413,8 +474,16 @@ class GitHubClient:
         interval: float = 0,
         timeout: float = 10,
         credential: Optional[str] = None,
+        content_failure_predicate: Optional[Callable[[str], bool]] = None,
     ) -> Tuple[str, Dict[str, str]]:
-        """Make rate-limited HTTP GET request to GitHub and return headers"""
+        """Make rate-limited HTTP GET request to GitHub and return headers
+
+        ``content_failure_predicate`` (slice 6.1 П-B): an optional callable that
+        returns True if the content indicates a failure despite non-empty payload
+        (e.g., sign-in page for an expired session). When provided, success is
+        computed as ``bool(content) and not predicate(content)`` BEFORE _report
+        and mark_success, suppressing false-success accounting.
+        """
         service = self._service(url)
 
         # Apply rate limiting
@@ -423,7 +492,14 @@ class GitHubClient:
             return "", {}
 
         content, response_headers = self._http_get(url, headers, params, retries, interval, timeout)
+        # Success computation with content_failure_predicate (slice 6.1 П-B)
         success = bool(content)
+        if success and content_failure_predicate is not None:
+            try:
+                if content_failure_predicate(content):
+                    success = False
+            except Exception:
+                pass  # Predicate failure is non-fatal; preserve original success
 
         # Report result for adaptive adjustment
         self._report(service, success, credential)
@@ -2594,14 +2670,36 @@ def search_github_web(query: str, session: str, page: int) -> str:
         "Cookie": f"user_session={session}",
     }
 
+    # Content-failure predicate for dead-session detection (slice 6.1 П-B).
+    # When the content is a sign-in page, it indicates an expired session.
+    # The predicate suppresses false-success accounting in get_with_headers.
+    def _is_sign_in_page(content: str) -> bool:
+        return bool(re.search(r"<title>Sign in to GitHub · GitHub</title>", content, flags=re.I))
+
     client = get_github_client()
-    content = client.get(url=url, headers=headers, credential=session)
-    if re.search(r"<title>Sign in to GitHub · GitHub</title>", content, flags=re.I):
-        logger.error(
-            f"[GithubCrawl] Session has expired: {mask_credential(session)}, "
-            "please provide a valid session and try again"
+    content = client.get(
+        url=url, headers=headers, credential=session,
+        content_failure_predicate=_is_sign_in_page,
+    )
+    if _is_sign_in_page(content):
+        # Dead session detected: bench with long cooldown + typed raise (slice 6.1 П-B).
+        # The credential is marked limited with an explicit long wait to avoid
+        # hot-spinning on a known-bad session. The rotation catch in
+        # stage/definition.py:549-553 will pick the next session.
+        _dead_session_warning(session)
+        wait = github_credential_state.mark_limited(
+            service=SERVICE_TYPE_GITHUB_WEB,
+            credential=session,
+            wait=float(GITHUB_EXPIRED_SESSION_COOLDOWN_S),
+            kind="primary",
+            skip_clamp=True,  # Expired session gets longer bench than transient limits
         )
-        return ""
+        raise GithubCredentialLimited(
+            service=SERVICE_TYPE_GITHUB_WEB,
+            credential=session,
+            wait=wait,
+            reason="expired_session",
+        )
 
     return content
 
@@ -2707,6 +2805,14 @@ def search_web_with_count(
         results = list(links)
     except Exception:
         results = []
+
+    # Web-parse tripwire monitor (slice 6.2 П-J): count zero vs nonzero parses.
+    # Blank content (TransientFetchError above) does NOT reach here.
+    if results:
+        _WEB_PARSE_STATS["web_pages_parsed_nonzero"] += 1
+    else:
+        _WEB_PARSE_STATS["web_pages_parsed_zero"] += 1
+        _web_parse_warning()
 
     # Call extract callback if provided
     if callback and isinstance(callback, Callable) and results:
@@ -3022,6 +3128,14 @@ def _search_code_impl(
             links.add(f"https://github.com{uri}")
 
         results = list(links)
+
+        # Web-parse tripwire monitor (slice 6.2 П-J): count zero vs nonzero parses.
+        # Blank content (TransientFetchError above) does NOT reach here.
+        if results:
+            _WEB_PARSE_STATS["web_pages_parsed_nonzero"] += 1
+        else:
+            _WEB_PARSE_STATS["web_pages_parsed_zero"] += 1
+            _web_parse_warning()
 
         # Call extract callback if provided
         if callback and isinstance(callback, Callable) and results:

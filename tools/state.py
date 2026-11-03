@@ -86,6 +86,7 @@ _credential_metrics: Dict[str, int] = {
     "early_releases": 0,
     "emergency_trips": 0,
     "blocking_mode_active": 0,
+    "dead_sessions_detected": 0,
 }
 
 
@@ -153,13 +154,18 @@ class GithubCredentialState:
         self._lock = threading.Lock()
 
     def mark_limited(
-        self, service: str, credential: str, wait: Optional[float] = None, kind: str = "primary"
+        self, service: str, credential: str, wait: Optional[float] = None, kind: str = "primary",
+        skip_clamp: bool = False,
     ) -> float:
         """Mark a credential as cooling down and return the selected wait.
 
         ``kind`` records whether the limit is a token-scoped primary quota event
         (``primary``) or a subject-scoped secondary/abuse limit (``secondary``);
         the escalation schedule is identical for both (design D5).
+
+        ``skip_clamp`` (slice 6.1 П-B): when True, the wait is NOT clamped to
+        GITHUB_CREDENTIAL_COOLDOWN_MAX. Used for expired/dead sessions which get
+        a longer bench (GITHUB_EXPIRED_SESSION_COOLDOWN_S) than transient rate limits.
         """
         if not service or not credential:
             return 0.0
@@ -171,7 +177,8 @@ class GithubCredentialState:
             item = self._items.get(key, Cooldown())
             if wait is None or wait <= 0:
                 wait = self._next_backoff(item)
-            wait = self._clamp(wait)
+            if not skip_clamp:
+                wait = self._clamp(wait)
             item.failures += 1
             item.last_wait = wait
             item.kind = kind

@@ -587,6 +587,7 @@ instead of being mangled into a zero-result wire query.
 - **Fault Tolerance**: Comprehensive error handling, retry mechanisms, and recovery
 - **State Persistence**: Queue state recovery and graceful shutdown capabilities
 - **Security**: Credential management, API key redaction, and secure storage
+- **Session Liveness**: Dead-session detection (expired web sessions benched with long cooldown, typed rotation) + web-parse tripwire monitor for markup drift
 - **Monitoring**: Real-time analytics, alerting, and performance visualization
 
 ## System Requirements
