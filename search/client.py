@@ -51,6 +51,17 @@ _DEAD_SESSION_STATS: Dict[str, int] = {"detected": 0}
 _WEB_PARSE_WARNING_SHOWN = False
 _WEB_PARSE_STATS: Dict[str, int] = {"web_pages_parsed_zero": 0, "web_pages_parsed_nonzero": 0}
 
+# Repeated-ambiguous pool-cool (slice 6.3 П-G)
+# Threshold: 3 ambiguous refusals per (service, credential) per session triggers pool-cool.
+# Justification: single ambiguous = fail-open (transient); 3 in a row on the same credential
+# without intervening success indicates persistent unclassified pressure, warranting the
+# same brake as a confirmed secondary limit (pool-cool). Invariant 4: rollback = set
+# AMBIGUOUS_POOL_COOL_THRESHOLD to a very large number.
+AMBIGUOUS_POOL_COOL_THRESHOLD = 3
+_AMBIGUOUS_COUNTS: Dict[Tuple[str, str], int] = {}  # (service, credential) -> count
+_AMBIGUOUS_COUNTS_LOCK = threading.Lock()
+_AMBIGUOUS_WARNING_SHOWN = False
+
 
 def _dead_session_warning(session: str) -> None:
     """Count a dead-session detection and warn once (loud-once pattern)."""
@@ -98,6 +109,52 @@ def reset_web_parse_stats() -> None:
     _WEB_PARSE_STATS["web_pages_parsed_zero"] = 0
     _WEB_PARSE_STATS["web_pages_parsed_nonzero"] = 0
     _WEB_PARSE_WARNING_SHOWN = False
+
+
+def _ambiguous_warning(session: str) -> None:
+    """Warn once on repeated-ambiguous pool-cool (loud-once pattern, slice 6.3 П-G)."""
+    global _AMBIGUOUS_WARNING_SHOWN
+    bump_credential_metric("ambiguous_pool_cools")
+    if not _AMBIGUOUS_WARNING_SHOWN:
+        _AMBIGUOUS_WARNING_SHOWN = True
+        logger.warning(
+            f"[ambiguous-pool-cool] web session {mask_credential(session)} hit "
+            f"{AMBIGUOUS_POOL_COOL_THRESHOLD} unclassified refusals without intervening "
+            f"success; cooling pool (same as secondary limit)"
+        )
+
+
+def get_ambiguous_stats() -> Dict[str, Any]:
+    """Expose ambiguous-refusal counters (tests / observability)."""
+    with _AMBIGUOUS_COUNTS_LOCK:
+        return {
+            "counts": dict(_AMBIGUOUS_COUNTS),
+            "threshold": AMBIGUOUS_POOL_COOL_THRESHOLD,
+            "warning_shown": _AMBIGUOUS_WARNING_SHOWN,
+        }
+
+
+def reset_ambiguous_stats() -> None:
+    """Reset ambiguous-refusal counters (tests / fresh runs)."""
+    global _AMBIGUOUS_WARNING_SHOWN
+    with _AMBIGUOUS_COUNTS_LOCK:
+        _AMBIGUOUS_COUNTS.clear()
+    _AMBIGUOUS_WARNING_SHOWN = False
+
+
+def _clear_ambiguous_count(service: str, credential: Optional[str]) -> None:
+    """Clear the repeated-ambiguous streak for (service, credential) on success.
+
+    The pool-cool escalation counts refusals *without intervening success*
+    (spec credential-liveness); a successful request therefore resets the
+    streak so that sporadic ambiguous refusals spread over a long run never
+    add up to a false-positive pool-cool (slice 6.3 П-G remediation).
+    """
+    if not service or not credential:
+        return
+    key = (service, credential)
+    with _AMBIGUOUS_COUNTS_LOCK:
+        _AMBIGUOUS_COUNTS.pop(key, None)
 
 
 def _date_warning(kind: str, message: str = "") -> None:
@@ -233,6 +290,22 @@ def http_error_message(error: requests.exceptions.HTTPError) -> str:
         message = ""
 
     return message or response.reason or str(error)
+
+
+def http_error_full_text(error: requests.exceptions.HTTPError) -> str:
+    """Extract the FULL response text from an HTTPError (slice 6.3 П-G).
+
+    Unlike ``http_error_message`` (which truncates to 300 chars for logging),
+    this returns the complete body so classifiers can find markers at any
+    position.  Returns empty string on any extraction failure.
+    """
+    response = getattr(error, "response", None)
+    if response is None:
+        return ""
+    try:
+        return response.text or ""
+    except Exception:
+        return ""
 
 
 def set_proxy(proxy: Optional[str]) -> None:
@@ -515,6 +588,7 @@ class GitHubClient:
 
         if service and credential and success:
             github_credential_state.mark_success(service, credential)
+            _clear_ambiguous_count(service, credential)
 
         return content, response_headers
 
@@ -562,6 +636,7 @@ class GitHubClient:
 
         if service and credential and ok:
             github_credential_state.mark_success(service, credential)
+            _clear_ambiguous_count(service, credential)
 
         return status, content, response_headers
 
@@ -608,6 +683,7 @@ class GitHubClient:
 
         if service and credential and ok:
             github_credential_state.mark_success(service, credential)
+            _clear_ambiguous_count(service, credential)
 
         return status, content, response_headers
 
@@ -641,13 +717,14 @@ class GitHubClient:
                 raise
             except requests.exceptions.HTTPError as e:
                 code = http_error_status(e)
-                reason = http_error_message(e)
+                reason = http_error_message(e)  # truncated for logging
+                full_text = http_error_full_text(e)  # full content for classifier (П-G)
                 response_headers = dict(e.response.headers) if e.response is not None else {}
-                if self._is_http_rate_limited(code, reason):
+                if self._is_http_rate_limited(code, full_text):
                     service = self._service(url)
                     credential = self._credential_from_headers(headers or {}, service)
                     if service and credential:
-                        self.mark_credential_limited(service, credential, response_headers, reason, reason)
+                        self.mark_credential_limited(service, credential, response_headers, full_text, reason)
 
                 if code == 429 or code >= 500:
                     last_error = ConnectionError(f"HTTP {code} error: {reason}")
@@ -703,13 +780,14 @@ class GitHubClient:
                 raise
             except requests.exceptions.HTTPError as e:
                 code = http_error_status(e)
-                reason = http_error_message(e)
+                reason = http_error_message(e)  # truncated for logging
+                full_text = http_error_full_text(e)  # full content for classifier (П-G)
                 response_headers = dict(e.response.headers) if e.response is not None else {}
-                if self._is_http_rate_limited(code, reason):
+                if self._is_http_rate_limited(code, full_text):
                     service = self._service(url)
                     credential = self._credential_from_headers(headers or {}, service)
                     if service and credential:
-                        self.mark_credential_limited(service, credential, response_headers, reason, reason)
+                        self.mark_credential_limited(service, credential, response_headers, full_text, reason)
 
                 if code == 429 or code >= 500:
                     last_error = ConnectionError(f"HTTP {code} error: {reason}")
@@ -750,15 +828,47 @@ class GitHubClient:
         exhaustion cools ONLY the credential in use until the indicated reset,
         and an ambiguous refusal (no usable header, no marker) cools nothing and
         returns so the caller routes it to the transient-failure path.
+
+        Repeated ambiguous (slice 6.3 П-G): N ambiguous refusals on the same
+        (service, credential) without intervening success trigger pool-cool
+        (same as secondary).  Threshold is ``AMBIGUOUS_POOL_COOL_THRESHOLD``.
         """
         kind = self._classify_credential_limit(headers, content, reason)
 
         if kind == "ambiguous":
+            # Track repeated ambiguous refusals (slice 6.3 П-G)
+            key = (service, credential)
+            with _AMBIGUOUS_COUNTS_LOCK:
+                _AMBIGUOUS_COUNTS[key] = _AMBIGUOUS_COUNTS.get(key, 0) + 1
+                count = _AMBIGUOUS_COUNTS[key]
+            if count >= AMBIGUOUS_POOL_COOL_THRESHOLD:
+                # Threshold reached: escalate to pool-cool (same as secondary)
+                _ambiguous_warning(credential)
+                wait = self._extract_wait(headers, content)
+                pool = self._service_pool(service)
+                if credential:
+                    pool = sorted(set(pool) | {credential})
+                applied = wait
+                for item in pool:
+                    applied = github_credential_state.mark_limited(service, item, wait, kind="secondary")
+                applied = applied or 0.0
+                with _AMBIGUOUS_COUNTS_LOCK:
+                    _AMBIGUOUS_COUNTS.pop(key, None)  # reset after escalation
+                raise GithubCredentialLimited(
+                    service=service, credential=credential, wait=applied,
+                    reason=f"repeated ambiguous refusals ({count}x): {reason}",
+                )
             logger.warning(
                 f"[GithubCrawl] GitHub refusal without usable limit headers or secondary marker "
-                f"on {service}: treating as a transient failure, no credential cooled"
+                f"on {service}: treating as a transient failure, no credential cooled "
+                f"(ambiguous count {count}/{AMBIGUOUS_POOL_COOL_THRESHOLD})"
             )
             return
+
+        # Non-ambiguous: reset the counter for this (service, credential)
+        key = (service, credential)
+        with _AMBIGUOUS_COUNTS_LOCK:
+            _AMBIGUOUS_COUNTS.pop(key, None)
 
         if kind == "secondary":
             wait = self._extract_wait(headers, content)
@@ -872,13 +982,14 @@ class GitHubClient:
                 raise
             except requests.exceptions.HTTPError as e:
                 code = http_error_status(e)
-                reason = http_error_message(e)
+                reason = http_error_message(e)  # truncated for logging
+                full_text = http_error_full_text(e)  # full content for classifier (П-G)
                 response_headers = dict(e.response.headers) if e.response is not None else {}
-                if self._is_http_rate_limited(code, reason):
+                if self._is_http_rate_limited(code, full_text):
                     service = self._service(url)
                     credential = self._credential_from_headers(headers or {}, service)
                     if service and credential:
-                        self.mark_credential_limited(service, credential, response_headers, reason, reason)
+                        self.mark_credential_limited(service, credential, response_headers, full_text, reason)
 
                 if code == 429 or code >= 500:
                     last_error = ConnectionError(f"HTTP {code} error: {reason}")

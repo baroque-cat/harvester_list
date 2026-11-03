@@ -105,6 +105,25 @@ Content-based rate-limit detection SHALL match only verifiable GitHub markers: `
 - **WHEN** the web search surface returns its exact `Search failed. Please try again later.` sentence
 - **THEN** it is still classified as rate-limited exactly as before this change
 
+### Requirement: Untruncated classifier input and repeated-ambiguous pool-cool
+The credential-limit classifier SHALL receive the FULL response content (not truncated to 300 characters) so that abuse/secondary markers at any position in the body are detected. A 403 carrying an abuse marker (`abuse detection`, `secondary rate limit`) anywhere in the full body SHALL be classified as a secondary limit with whole-pool cooling, NOT as an authentication failure or transient error. When the same (service, credential) pair accumulates `AMBIGUOUS_POOL_COOL_THRESHOLD` (default 3) ambiguous refusals without intervening success, the system SHALL escalate to pool-cool (same as secondary limit), emit one loud WARNING (loud-once pattern), increment the `ambiguous_pool_cools` metric, and raise `GithubCredentialLimited`. The threshold is a rollback invariant (set to a very large number to disable). Single ambiguous refusals remain fail-open (no cooling). The sign-in content predicate (slice 6.1) SHALL NOT be intercepted by the new taxonomy.
+
+#### Scenario: Deep abuse marker triggers secondary classification
+- **WHEN** a 403 response carries an abuse marker (e.g., `abuse detection`) at position >300 characters from the start of the body
+- **THEN** the classifier receives the full content, detects the marker, classifies as secondary, applies pool-cool, and raises `GithubCredentialLimited`
+
+#### Scenario: Classifier receives full content
+- **WHEN** a 403 response is classified
+- **THEN** the content passed to `_classify_credential_limit` has length equal to the full response body (not truncated)
+
+#### Scenario: Repeated ambiguous escalates to pool-cool
+- **WHEN** the same (service, credential) pair receives N ambiguous refusals (N = `AMBIGUOUS_POOL_COOL_THRESHOLD`) without intervening success
+- **THEN** the Nth refusal triggers pool-cool (same as secondary), one loud WARNING is emitted, `ambiguous_pool_cools` increments, and `GithubCredentialLimited` is raised
+
+#### Scenario: Single ambiguous remains fail-open
+- **WHEN** a single ambiguous refusal occurs (no markers, no headers)
+- **THEN** no credential is cooled, the ambiguous counter increments, and the refusal is handled as a transient failure
+
 ### Requirement: Content-based session-expiry detection
 When a web search response contains the exact sign-in page marker (`<title>Sign in to GitHub · GitHub</title>`), the session SHALL be classified as expired/dead: the credential SHALL be benched with a long cooldown (4 hours, far exceeding the transient rate-limit ladder max of 15 minutes), a typed `GithubCredentialLimited` exception SHALL be raised with reason `expired_session` (so the existing stage rotation catch rotates to the next session), the false-success accounting path (mark_success, early_release, adaptive-basket acceleration) SHALL be suppressed via a content-failure predicate evaluated BEFORE success reporting, the detection SHALL be counted in a `dead_sessions_detected` metric, and exactly one loud WARNING SHALL be emitted per detection episode (loud-once pattern, masked credential). The credential selector's existing `is_cooling` check ensures the benched session is not re-selected. Healthy content (non-sign-in) SHALL follow the byte-previous success path unchanged.
 
