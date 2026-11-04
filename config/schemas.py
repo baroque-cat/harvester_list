@@ -1065,6 +1065,66 @@ class StorageConfig:
 
 
 @dataclass
+class ErrorRuleConfig:
+    """Single declarative error-parsing rule configuration.
+
+    Mirrors provider.error_rules.ErrorRule but holds raw (uncompiled) values
+    so the schema layer stays JSON-friendly.  Validation of regex, map_to
+    vocabulary, pattern length and status_code range is the validator's job.
+    """
+
+    status_code: int = 0
+    error_path: str = "$"
+    match_pattern: str = ""
+    map_to: str = ""
+    priority: int = 0
+    description: str = ""
+
+    def __post_init__(self):
+        if not isinstance(self.status_code, int) or self.status_code < 0:
+            raise ValueError("error_rule.status_code must be a non-negative integer")
+        if not isinstance(self.priority, int):
+            raise ValueError("error_rule.priority must be an integer")
+        if not isinstance(self.error_path, str):
+            raise ValueError("error_rule.error_path must be a string")
+        if not isinstance(self.match_pattern, str):
+            raise ValueError("error_rule.match_pattern must be a string")
+        if not isinstance(self.map_to, str):
+            raise ValueError("error_rule.map_to must be a string")
+        if not isinstance(self.description, str):
+            raise ValueError("error_rule.description must be a string")
+
+
+@dataclass
+class ErrorParsingConfig:
+    """Declarative error-parsing configuration for a task.
+
+    ``enabled`` defaults to True so that a present-but-empty block still
+    activates rule evaluation; absence of the entire block (None in
+    TaskConfig.error_parsing) is the inert state.
+    """
+
+    enabled: bool = True
+    rules: List[ErrorRuleConfig] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ValueError("error_parsing.enabled must be a boolean")
+        if not isinstance(self.rules, list):
+            raise ValueError("error_parsing.rules must be a list")
+        # Coerce raw dicts from YAML into ErrorRuleConfig instances.
+        coerced = []
+        for item in self.rules:
+            if isinstance(item, dict):
+                coerced.append(ErrorRuleConfig(**item))
+            elif isinstance(item, ErrorRuleConfig):
+                coerced.append(item)
+            else:
+                raise ValueError(f"error_parsing.rules item must be a dict or ErrorRuleConfig, got {type(item).__name__}")
+        self.rules = coerced
+
+
+@dataclass
 class TaskConfig:
     """Configuration for a single provider task"""
 
@@ -1079,6 +1139,7 @@ class TaskConfig:
     patterns: Patterns = field(default_factory=Patterns)
     conditions: List[Condition] = field(default_factory=list)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
+    error_parsing: Optional[ErrorParsingConfig] = None
 
 
 @dataclass

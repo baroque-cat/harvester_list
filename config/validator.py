@@ -114,6 +114,9 @@ class ConfigValidator:
         # Validate acquisition-task recovery source configuration
         self._validate_recovery_config(config)
 
+        # Validate declarative error-parsing rules per task
+        self._validate_error_parsing_config(config)
+
         # Validate rate limits
         self._validate_rate_limits(config)
 
@@ -788,6 +791,71 @@ class ConfigValidator:
             self.errors.append(
                 "recovery.per_boot_cap must be a non-negative integer"
             )
+
+    def _validate_error_parsing_config(self, config: Config) -> None:
+        """Validate declarative error-parsing rules per task.
+
+        Checks: map_to vocabulary (must be a valid ErrorReason value), regex
+        compilability, pattern length cap, rules-per-task cap, status_code
+        non-negative integer, enabled is boolean.
+        """
+        import re as _re
+
+        from core.enums import ErrorReason
+
+        from provider.error_rules import MAX_PATTERN_LEN, MAX_RULES_PER_TASK
+
+        valid_reasons = {e.value for e in ErrorReason}
+
+        for task in config.tasks:
+            ep = task.error_parsing
+            if ep is None:
+                continue
+
+            if not isinstance(ep.enabled, bool):
+                self.errors.append(
+                    f"task {task.name!r}: error_parsing.enabled must be a boolean"
+                )
+
+            if len(ep.rules) > MAX_RULES_PER_TASK:
+                self.errors.append(
+                    f"task {task.name!r}: error_parsing.rules count ({len(ep.rules)}) "
+                    f"exceeds maximum ({MAX_RULES_PER_TASK})"
+                )
+
+            for i, rule in enumerate(ep.rules):
+                rule_id = rule.description or f"rule#{i}"
+
+                # map_to must be a valid ErrorReason value.
+                if rule.map_to not in valid_reasons:
+                    self.errors.append(
+                        f"task {task.name!r}, error rule {rule_id!r}: "
+                        f"map_to {rule.map_to!r} is not a valid ErrorReason value"
+                    )
+
+                # Regex must compile.
+                try:
+                    _re.compile(rule.match_pattern)
+                except _re.error as e:
+                    self.errors.append(
+                        f"task {task.name!r}, error rule {rule_id!r}: "
+                        f"invalid regex: {e}"
+                    )
+
+                # Pattern length cap.
+                if len(rule.match_pattern) > MAX_PATTERN_LEN:
+                    self.errors.append(
+                        f"task {task.name!r}, error rule {rule_id!r}: "
+                        f"match_pattern length ({len(rule.match_pattern)}) "
+                        f"exceeds maximum ({MAX_PATTERN_LEN})"
+                    )
+
+                # status_code must be non-negative integer.
+                if not isinstance(rule.status_code, int) or rule.status_code < 0:
+                    self.errors.append(
+                        f"task {task.name!r}, error rule {rule_id!r}: "
+                        f"status_code must be a non-negative integer"
+                    )
 
     def _validate_credential_liveness_config(self, config: Config) -> None:
         """Validate the credential-liveness / bounded-wait configuration section.

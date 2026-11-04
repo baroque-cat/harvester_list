@@ -32,6 +32,7 @@ from .schemas import (
     DisplayContextConfig,
     EarlyStopConfig,
     EnrichmentConfig,
+    ErrorParsingConfig,
     FileDatingConfig,
     GatherConfig,
     GlobalConfig,
@@ -52,6 +53,7 @@ from .schemas import (
     TaskConfig,
     TaskQueueConfig,
     WorkerManagerConfig,
+    ErrorRuleConfig,
 )
 from .validator import ConfigValidator
 from tools.logger import get_logger
@@ -781,6 +783,38 @@ class ConfigLoader:
             plan=storage_data.get("plan", ""),
         )
 
+        # Parse error_parsing (declarative error-parsing rules).
+        error_parsing = None
+        error_parsing_data = data.get("error_parsing")
+        if error_parsing_data is not None and isinstance(error_parsing_data, dict):
+            rules_data = error_parsing_data.get("rules", [])
+            rules = []
+            known_rule_keys = {"status_code", "error_path", "match_pattern", "map_to", "priority", "description"}
+            for rule_item in rules_data:
+                if not isinstance(rule_item, dict):
+                    continue
+                # Warn about unknown keys (precedent: recovery join_timeout_s).
+                for key in rule_item:
+                    if key not in known_rule_keys:
+                        logger.warning(
+                            f"ignoring unknown key {key!r} in error_parsing rule "
+                            f"{rule_item.get('description', '<unnamed>')!r}"
+                        )
+                rules.append(
+                    ErrorRuleConfig(
+                        status_code=rule_item.get("status_code", 0),
+                        error_path=rule_item.get("error_path", "$"),
+                        match_pattern=rule_item.get("match_pattern", ""),
+                        map_to=rule_item.get("map_to", ""),
+                        priority=rule_item.get("priority", 0),
+                        description=rule_item.get("description", ""),
+                    )
+                )
+            error_parsing = ErrorParsingConfig(
+                enabled=error_parsing_data.get("enabled", True),
+                rules=rules,
+            )
+
         return TaskConfig(
             name=data.get("name", ""),
             enabled=data.get("enabled", True),
@@ -793,6 +827,7 @@ class ConfigLoader:
             patterns=patterns,
             conditions=conditions,
             rate_limit=rate_limit,
+            error_parsing=error_parsing,
         )
 
     def _create_default_config(self) -> None:
