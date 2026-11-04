@@ -590,6 +590,7 @@ instead of being mangled into a zero-result wire query.
 - **Session Liveness**: Dead-session detection (expired web sessions benched with long cooldown, typed rotation) + web-parse tripwire monitor for markup drift
 - **Refusal Taxonomy (HTML)**: classifier sees the FULL response body (abuse markers detected at any depth, not just the first 300 chars); repeated ambiguous refusals *without intervening success* escalate to a pool-wide cool-down (`AMBIGUOUS_POOL_COOL_THRESHOLD`, rollback = raise it); a single ambiguous refusal stays fail-open
 - **Pattern Resolution Contract**: extraction patterns for fan-out beneficiaries resolve condition-level (from search task fields) when task-level patterns are empty (combat config default); recovery and runtime writers share the same patterns_hash domain, ensuring cross-seam consistency
+- **Declarative Error Parsing**: per-task rule sets map specific provider error codes/messages to ErrorReason values via regex (e.g., qwen 400-Arrearage → NO_QUOTA instead of terminal INVALID); priority-first-match, both dashscope body forms supported, byte-neutral when unconfigured
 - **Monitoring**: Real-time analytics, alerting, and performance visualization
 
 ## System Requirements

@@ -104,7 +104,7 @@
 
 ## Декларативный движок error_parsing (2026-11-04, Q1-Q3)
 
-**Статус:** Q1 (движок + схемы + валидатор, 29 пинов), Q2 (wiring base.py + manager/task.py, 16 пинов), Q2b (DEF-3 транзиентные→wait_check, 11 пинов) готовы. Suite 1107→1136→1152→1163. Q3 (пресет examples/config-full.yaml + спека + README) — в процессе.
+**Статус:** Q1 (движок + схемы + валидатор, 29 пинов), Q2 (wiring base.py + manager/task.py, 16 пинов), Q2b (DEF-3 транзиентные→wait_check, 11 пинов), Q3 (пресет examples/config-full.yaml + спека + README, 8 пинов) готовы. Suite 1107→1136→1152→1163→1171.
 
 ## Обслуживание индекса
 

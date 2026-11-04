@@ -226,3 +226,55 @@ restores the pre-capability surface, counters included.
   transient refusal
 - **THEN** every refusal counter stays at zero, the legacy exception types and messages are used, and
   the retry behaviour is unchanged
+
+### Requirement: Declarative error-parsing rules
+
+A task MAY declare a set of error-parsing rules that map specific provider HTTP
+status code + response body patterns to ErrorReason values.  The rules SHALL be
+evaluated BEFORE the existing `_judge` method, and the first matching rule
+(sorted by priority DESC, ties stable by config order) SHALL determine the
+CheckResult.  If no rule matches, the system SHALL fall through to `_judge`
+unchanged (byte-neutral).  The rules engine SHALL parse the JSON body ONCE,
+walk dot-paths (<=5 segments, dict-only indexing), apply regex matching (no
+forced flags; inline `(?i)` allowed), and fail open (return None) on any
+internal exception with a loud-once WARNING.  Absence of the `error_parsing`
+block, `enabled: false`, or an empty rules list SHALL be byte-neutral (no
+rules evaluated, `_judge` runs as before).  The validator SHALL reject:
+invalid `map_to` values (not in ErrorReason vocabulary), non-compilable regex,
+pattern length > 512, rules count > 64, negative `status_code`, non-boolean
+`enabled`.  Families that override `check()` (anthropic/azure/bedrock/doubao/
+gemini/gooeyai/qianfan/stabilityai/vertex) do NOT invoke the rules hook; they
+opt in separately.
+
+#### Scenario: PRT-S29 — priority-first-match selects the highest-priority rule
+- **WHEN** two rules match the same response but have different priorities
+- **THEN** the rule with the higher priority determines the CheckResult, and the
+  lower-priority rule is not applied
+
+#### Scenario: PRT-S30 — both dashscope body forms are supported
+- **WHEN** a response body uses compatible-mode format (`{"error": {"code": "..."}}`)
+  or native format (`{"code": "..."}`)
+- **THEN** the appropriate dot-path (`error.code` or `code`) resolves the value
+  and the rule matches
+
+#### Scenario: PRT-S31 — fallback neutrality when no rules match
+- **WHEN** rules are configured but none match the response
+- **THEN** the existing `_judge` method runs unchanged and produces the same
+  CheckResult as if no rules were configured
+
+#### Scenario: PRT-S32 — fail-open on internal exception
+- **WHEN** the rules engine encounters an internal exception (e.g., malformed
+  JSON, unexpected data type)
+- **THEN** it returns None (no rule applied), emits a loud-once WARNING with no
+  secrets or body content in the log, and `_judge` runs as fallback
+
+#### Scenario: PRT-S33 — disabled is byte-neutral
+- **WHEN** `error_parsing` is absent, `enabled: false`, or rules list is empty
+- **THEN** no rules are evaluated, `_apply_error_rules` returns None immediately,
+  and `_judge` produces the identical CheckResult as the pre-rules codebase
+
+#### Scenario: PRT-S34 — DEF-3 transient errors route to wait-check
+- **WHEN** a check result carries NETWORK_ERROR, TIMEOUT, or SERVER_ERROR
+- **THEN** the check-stage worker routes the key to the WAIT_CHECK basket
+  (recheck-eligible cycle) instead of the INVALID terminal basket, and the
+  `_result_status` method returns "wait_check" for those reasons

@@ -730,3 +730,165 @@ tasks:
     storage:
       directory: ""
       plan: ""
+    # Declarative error-parsing rules (optional, per-task).
+    #
+    # Purpose: map specific provider error codes/messages to ErrorReason values
+    # via regex rules, so that e.g. "400 + error.code=Arrearage" becomes
+    # NO_QUOTA (recheck-eligible) instead of INVALID (terminal).
+    #
+    # Format:
+    #   error_parsing:
+    #     enabled: true  # set false to disable all rules (byte-neutral rollback)
+    #     rules:
+    #       - status_code: 400       # HTTP status to match; 0 = any status
+    #         error_path: "error.code"  # dot-path into JSON body; "$" = raw body
+    #         match_pattern: "Arrearage"  # regex (inline (?i) allowed)
+    #         map_to: "no_quota"     # must be a valid ErrorReason value
+    #         priority: 100          # higher wins; ties preserve config order
+    #         description: "..."     # human-readable (used in diagnostics)
+    #
+    # Evaluation: JSON-parse body ONCE, walk dot-paths (<=5 segments, dict-only),
+    # regex-match, sort by priority DESC, FIRST match wins.  No match → fall
+    # through to existing _judge (byte-neutral).  Any exception → fail open.
+    #
+    # Limitations: families that override check() (anthropic/azure/bedrock/doubao/
+    # gemini/gooeyai/qianfan/stabilityai/vertex) do NOT invoke the rules hook;
+    # they opt in separately.  Only openai_like (and base) are covered.
+    #
+    # Qwen/DashScope preset (17 rules, priorities 0-100):
+    # Rules 1-9 are operator-mandated (verbatim); rules 10-17 are derived from
+    # error.md (Alibaba Model Studio docs) with specific-before-general ordering.
+    #
+    # | # | status | path         | pattern                          | map_to       | pri | rationale |
+    # |---|--------|--------------|----------------------------------|--------------|-----|-----------|
+    # | 1 | 400    | error.code   | Arrearage                        | no_quota     | 100 | overdue balance, compatible-mode |
+    # | 2 | 400    | error.code   | InvalidApiKey                    | invalid_key  |  90 | bad key, compatible-mode |
+    # | 3 | 400    | error.message| Access denied                    | no_access    |  80 | region/permission, compatible-mode |
+    # | 4 | 400    | code         | Arrearage                        | no_quota     |  95 | overdue balance, native-mode |
+    # | 5 | 400    | code         | InvalidApiKey                    | invalid_key  |  85 | bad key, native-mode |
+    # | 6 | 400    | code         | APIConnectionError               | network_error|  75 | connection failure |
+    # | 7 | 400    | message      | Access denied                    | no_access    |  65 | region/permission, native-mode |
+    # | 8 | 400    | $            | .*                               | bad_request  |   0 | generic 400 fallback |
+    # | 9 | 429    | $            | .*                               | rate_limited |   0 | generic 429 fallback |
+    # |10 | 400    | error.code   | (?i)Throttling\.AllocationQuota  | rate_limited |  88 | token-rate limit, compatible |
+    # |11 | 400    | code         | (?i)Throttling\.AllocationQuota  | rate_limited |  86 | token-rate limit, native |
+    # |12 | 400/403| $            | (?i)AccessDenied\.Unpurchased    | no_quota     |  84 | service not activated |
+    # |13 | 401    | $            | (?i)InvalidApiKey\|invalid_api_key| invalid_key |  92 | 401 auth failure |
+    # |14 | 403    | $            | (?i)AccessDenied\|access_denied  | no_access    |  70 | 403 access denied |
+    # |15 | 400    | error.message| (?i)only support stream mode\|does not support http call | no_model | 58 | model-layer error, auth passed |
+    # |16 | 400    | $            | (?i)DataInspectionFailed\|data_inspection_failed | no_model | 56 | content moderation, auth passed |
+    # |17 | 400    | $            | (?i)Contain\.Forbidden\.Label\.Error | no_model |  54 | forbidden label, auth passed |
+    # |18 | 400    | code         | ^InvalidParameter                | no_model     |  20 | param error, auth passed (low pri) |
+    #
+    # To disable: set enabled: false (all rules ignored, byte-neutral).
+    error_parsing:
+      enabled: true
+      rules:
+        - status_code: 400
+          error_path: "error.code"
+          match_pattern: "Arrearage"
+          map_to: "no_quota"
+          priority: 100
+          description: "qwen: Arrearage (overdue balance), compatible-mode"
+        - status_code: 400
+          error_path: "error.code"
+          match_pattern: "InvalidApiKey"
+          map_to: "invalid_key"
+          priority: 90
+          description: "qwen: InvalidApiKey, compatible-mode"
+        - status_code: 400
+          error_path: "error.message"
+          match_pattern: "Access denied"
+          map_to: "no_access"
+          priority: 80
+          description: "qwen: Access denied (region/permission), compatible-mode"
+        - status_code: 400
+          error_path: "code"
+          match_pattern: "Arrearage"
+          map_to: "no_quota"
+          priority: 95
+          description: "qwen: Arrearage (overdue balance), native-mode"
+        - status_code: 400
+          error_path: "code"
+          match_pattern: "InvalidApiKey"
+          map_to: "invalid_key"
+          priority: 85
+          description: "qwen: InvalidApiKey, native-mode"
+        - status_code: 400
+          error_path: "code"
+          match_pattern: "APIConnectionError"
+          map_to: "network_error"
+          priority: 75
+          description: "qwen: APIConnectionError (connection failure)"
+        - status_code: 400
+          error_path: "message"
+          match_pattern: "Access denied"
+          map_to: "no_access"
+          priority: 65
+          description: "qwen: Access denied (region/permission), native-mode"
+        - status_code: 400
+          error_path: "$"
+          match_pattern: ".*"
+          map_to: "bad_request"
+          priority: 0
+          description: "qwen: generic 400 fallback"
+        - status_code: 429
+          error_path: "$"
+          match_pattern: ".*"
+          map_to: "rate_limited"
+          priority: 0
+          description: "qwen: generic 429 fallback"
+        - status_code: 400
+          error_path: "error.code"
+          match_pattern: "(?i)Throttling\\.AllocationQuota"
+          map_to: "rate_limited"
+          priority: 88
+          description: "qwen: Throttling.AllocationQuota (token-rate limit), compatible"
+        - status_code: 400
+          error_path: "code"
+          match_pattern: "(?i)Throttling\\.AllocationQuota"
+          map_to: "rate_limited"
+          priority: 86
+          description: "qwen: Throttling.AllocationQuota (token-rate limit), native"
+        - status_code: 0
+          error_path: "$"
+          match_pattern: "(?i)AccessDenied\\.Unpurchased"
+          map_to: "no_quota"
+          priority: 84
+          description: "qwen: AccessDenied.Unpurchased (service not activated), any status"
+        - status_code: 401
+          error_path: "$"
+          match_pattern: "(?i)InvalidApiKey|invalid_api_key"
+          map_to: "invalid_key"
+          priority: 92
+          description: "qwen: 401 InvalidApiKey/invalid_api_key (auth failure)"
+        - status_code: 403
+          error_path: "$"
+          match_pattern: "(?i)AccessDenied|access_denied"
+          map_to: "no_access"
+          priority: 70
+          description: "qwen: 403 AccessDenied/access_denied (permission denied)"
+        - status_code: 400
+          error_path: "error.message"
+          match_pattern: "(?i)only support stream mode|does not support http call"
+          map_to: "no_model"
+          priority: 58
+          description: "qwen: model requires stream mode (auth passed, model-layer error)"
+        - status_code: 400
+          error_path: "$"
+          match_pattern: "(?i)DataInspectionFailed|data_inspection_failed"
+          map_to: "no_model"
+          priority: 56
+          description: "qwen: DataInspectionFailed (content moderation, auth passed)"
+        - status_code: 400
+          error_path: "$"
+          match_pattern: "(?i)Contain\\.Forbidden\\.Label\\.Error"
+          map_to: "no_model"
+          priority: 54
+          description: "qwen: Contain.Forbidden.Label.Error (forbidden label, auth passed)"
+        - status_code: 400
+          error_path: "code"
+          match_pattern: "^InvalidParameter"
+          map_to: "no_model"
+          priority: 20
+          description: "qwen: InvalidParameter.* (param error, auth passed; low priority)"
