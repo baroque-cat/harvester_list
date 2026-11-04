@@ -118,6 +118,36 @@ class SearchStage(BasePipelineStage):
             f"{PipelineStage.SEARCH.value}:{task.provider}:{search_task.query}:{search_task.page}:{search_task.regex}:{transport}"
         )
 
+    @staticmethod
+    def _resolve_fanout_patterns(B_task_config: Any, task: SearchTask) -> Patterns:
+        """DEF-2 (variant A′, operator directive 2026-11-04): resolve
+        extraction patterns for a fan-out beneficiary.
+
+        If the task-level ``B_task_config.patterns.key_pattern`` is non-empty
+        (intent D-03.7: "B may carry its own patterns"), use it directly.
+        Otherwise fallback to the condition-level fields carried by the
+        SearchTask (task.regex / address_pattern / endpoint_pattern /
+        model_pattern) — the same source manager/task.py:511-521 seeds from
+        conditions[].patterns.  In the combat config TaskConfig.patterns is
+        an empty Patterns() default_factory, so the fallback is the
+        productive path.
+        """
+        tc_patterns = getattr(B_task_config, "patterns", None)
+        if tc_patterns is not None and tc_patterns.key_pattern:
+            return Patterns(
+                key_pattern=tc_patterns.key_pattern,
+                address_pattern=tc_patterns.address_pattern,
+                endpoint_pattern=tc_patterns.endpoint_pattern,
+                model_pattern=tc_patterns.model_pattern,
+            )
+        # Fallback: condition-level patterns from the search task.
+        return Patterns(
+            key_pattern=task.regex,
+            address_pattern=task.address_pattern,
+            endpoint_pattern=task.endpoint_pattern,
+            model_pattern=task.model_pattern,
+        )
+
     def _validate_task_type(self, task: ProviderTask) -> bool:
         """Validate that task is a SearchTask."""
         return isinstance(task, SearchTask)
@@ -254,12 +284,9 @@ class SearchStage(BasePipelineStage):
                     if B_task_config is None:
                         B_task_config = self.resources.task_configs.get(task.provider)
                     
-                    B_patterns = Patterns(
-                        key_pattern=B_task_config.patterns.key_pattern,
-                        address_pattern=B_task_config.patterns.address_pattern,
-                        endpoint_pattern=B_task_config.patterns.endpoint_pattern,
-                        model_pattern=B_task_config.patterns.model_pattern,
-                    )
+                    # DEF-2: resolve patterns — task-level if non-empty, else
+                    # condition-level fallback from the search task fields.
+                    B_patterns = self._resolve_fanout_patterns(B_task_config, task)
                     
                     # (a) Per-B gather-skip: use B's provider name and B's patterns
                     skip_map = self._gather_skip_map_for(B, results, B_patterns)
@@ -339,12 +366,9 @@ class SearchStage(BasePipelineStage):
                         B_task_config = self.resources.task_configs.get(B)
                         if B_task_config is None:
                             B_task_config = self.resources.task_configs.get(task.provider)
-                        B_patterns = Patterns(
-                            key_pattern=B_task_config.patterns.key_pattern,
-                            address_pattern=B_task_config.patterns.address_pattern,
-                            endpoint_pattern=B_task_config.patterns.endpoint_pattern,
-                            model_pattern=B_task_config.patterns.model_pattern,
-                        )
+                        # DEF-2: resolve patterns — task-level if non-empty, else
+                        # condition-level fallback from the search task fields.
+                        B_patterns = self._resolve_fanout_patterns(B_task_config, task)
                         try:
                             ph_B = patterns_hash(
                                 key_pattern=B_patterns.key_pattern,

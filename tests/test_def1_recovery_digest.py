@@ -1,4 +1,4 @@
-"""DEF-1 — recovery reader must use the task-level patterns_hash domain.
+"""DEF-1 — recovery reader must use the same patterns_hash domain as writers.
 
 Defect (found live at gate 4.G, 2026-10-23; chronic since R7): two
 patterns_hash domains coexist.  Durable WRITERS (_record_gathered /
@@ -11,10 +11,16 @@ key_pattern ⇒ H_cfg domain).  H_cfg != H_empty ⇒ covered=∅ ⇒
 skip-suppressed=0 at EVERY restart (measured live: W1/W2 arms, gate 4.G;
 full backlog re-enqueue, fetch mitigated only by etag 304s).
 
-Fix (variant A, operator directive 2026-10-27): resolve patterns ONCE in
-_recover_acquisition_tasks from ``pipeline.task_configs[name].patterns``
-with a defensive fallback to ``provider.get_patterns()`` (legacy/harness
-behaviour byte-identical).  The single resolution point feeds all three
+DEF-2 update (operator directive 2026-11-04): the fan-out now resolves
+condition-level patterns when task-level is empty (the combat-shape
+default).  Both domains are unified: recovery AND runtime writers now
+use H_cfg (condition-level) when task-level patterns are empty.  The
+tests below verify the unified domain (H_cfg), not the old H_empty.
+
+Fix (variant A, operator directive 2026-10-27; variant A′ 2026-11-04):
+resolve patterns from ``pipeline.task_configs[name].patterns`` when
+key_pattern is non-empty; fallback to ``provider.get_patterns()``
+(condition-level).  The single resolution point feeds all three
 consumers: skip digest, share-claim key, and create_acquisition_task
 pattern fields (so recovered tasks write coverage in the SAME domain as
 runtime-created ones).
@@ -215,8 +221,9 @@ def capture():
 
 # ---------------------------------------------------------------------------
 # D1a: cross-restart skip suppression — reader must hit the WRITER domain.
-# Coverage rows were written under the task-level digest (empty patterns);
-# recovery with combat-shaped task_configs must suppress them.
+# DEF-2 update: both recovery and runtime writers now use the condition-level
+# domain (H_cfg) when task-level patterns are empty (the combat shape).
+# Coverage rows are seeded under COND_DIGEST; recovery must suppress them.
 # ---------------------------------------------------------------------------
 def test_d1a_recovery_suppresses_task_domain_coverage(tmp_path, registry, capture):
     stage = FakeStage()
@@ -226,13 +233,13 @@ def test_d1a_recovery_suppresses_task_domain_coverage(tmp_path, registry, captur
     )
     urls = [_url(0), _url(1)]
     for u in urls:
-        _seed(registry, u, digest=TASK_DIGEST)
+        _seed(registry, u, digest=COND_DIGEST)
 
     _mgr(pipeline)._recover_acquisition_tasks(PROV_A, urls)
 
     assert stage.tasks == [], (
-        "DEF-1: coverage written under the task-level digest must suppress "
-        f"re-enqueue at restart, got enqueued: {stage.urls}"
+        "DEF-1/DEF-2: coverage written under the unified condition-level "
+        f"digest must suppress re-enqueue at restart, got enqueued: {stage.urls}"
     )
     lines = [l for l in capture.lines() if "Recovered" in l and PROV_A in l]
     assert lines and "skip-suppressed 2" in lines[0], (
@@ -261,7 +268,9 @@ def test_d1b_fallback_provider_domain_when_no_task_configs(tmp_path, registry, c
 
 # ---------------------------------------------------------------------------
 # D1c: share-claim key alignment — recovery's claim must suppress the
-# runtime twin claim keyed by the task-level digest (single boot, R17).
+# runtime twin claim keyed by the unified condition-level digest (single
+# boot, R17).  DEF-2 update: both recovery and runtime fan-out now use
+# COND_DIGEST when task-level patterns are empty.
 # ---------------------------------------------------------------------------
 def test_d1c_share_claim_key_aligned_with_runtime_domain(tmp_path, registry):
     stage = FakeStage()
@@ -274,18 +283,20 @@ def test_d1c_share_claim_key_aligned_with_runtime_domain(tmp_path, registry):
     _mgr(pipeline)._recover_acquisition_tasks(PROV_A, urls)
     assert stage.urls == urls, "owner (first claimant) must enqueue its own task"
 
-    # Runtime twin: search-side fan-out claims under the TASK-level digest
-    # (B_patterns from task_configs) for another beneficiary provider.
-    twin_suppressed = ledger.claim(url_hash(urls[0]), TASK_DIGEST, "raw", PROV_B)
+    # Runtime twin: search-side fan-out claims under the unified condition-level
+    # digest (DEF-2: B_patterns resolved from condition when task-level empty).
+    twin_suppressed = ledger.claim(url_hash(urls[0]), COND_DIGEST, "raw", PROV_B)
     assert twin_suppressed is True, (
-        "DEF-1: recovery claim must share the runtime ledger key domain; "
-        "twin claim was NOT suppressed (foreign digest claimed a different key)"
+        "DEF-1/DEF-2: recovery claim must share the unified condition-level "
+        "ledger key domain; twin claim was NOT suppressed "
+        "(foreign digest claimed a different key)"
     )
 
 
 # ---------------------------------------------------------------------------
 # D1d: creation-domain alignment — recovered AcquisitionTasks carry the
-# task-config patterns (same as runtime fan-out), so their downstream
+# unified condition-level patterns (DEF-2: when task-level is empty,
+# fallback to provider.get_patterns()), so their downstream
 # _digest_for/_record_gathered writes land in the SAME domain.
 # ---------------------------------------------------------------------------
 def test_d1d_recovered_task_carries_task_config_patterns(tmp_path, registry):
@@ -297,10 +308,11 @@ def test_d1d_recovered_task_carries_task_config_patterns(tmp_path, registry):
 
     assert len(stage.tasks) == 1
     task = stage.tasks[0]
-    assert task.key_pattern == TASK_PATTERNS.key_pattern, (
-        "DEF-1: recovered task must carry task-config patterns "
-        f"(empty in combat), got key_pattern={task.key_pattern!r}"
+    # DEF-2 update: task-level is empty ⇒ condition-level patterns used.
+    assert task.key_pattern == COND_PATTERNS.key_pattern, (
+        "DEF-1/DEF-2: recovered task must carry condition-level patterns "
+        f"(task-level empty in combat), got key_pattern={task.key_pattern!r}"
     )
-    assert task.address_pattern == TASK_PATTERNS.address_pattern
-    assert task.endpoint_pattern == TASK_PATTERNS.endpoint_pattern
-    assert task.model_pattern == TASK_PATTERNS.model_pattern
+    assert task.address_pattern == COND_PATTERNS.address_pattern
+    assert task.endpoint_pattern == COND_PATTERNS.endpoint_pattern
+    assert task.model_pattern == COND_PATTERNS.model_pattern

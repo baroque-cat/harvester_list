@@ -318,14 +318,21 @@ class TaskRecoveryManager:
             logger.warning(f"Provider not found: {name}")
             return
 
-        # DEF-1 fix (variant A, operator directive 2026-10-27): prefer the
-        # TASK-LEVEL patterns domain — the same source the runtime fan-out
-        # uses to build AcquisitionTasks (resources.task_configs[B].patterns
-        # in stage/definition.py) and therefore the domain every durable
-        # writer keys on (_digest_for → _record_gathered/link_coverage,
-        # _record_shared_coverage).  Reading condition-level patterns here
-        # (provider.get_patterns()) produced a foreign digest ⇒ covered=∅ ⇒
-        # skip-suppressed=0 at EVERY restart (measured live, gate 4.G W1/W2).
+        # DEF-1 fix (variant A, operator directive 2026-10-27) + DEF-2
+        # (variant A′, operator directive 2026-11-04): prefer the TASK-LEVEL
+        # patterns domain when non-empty; when task-level key_pattern is
+        # empty (combat config: TaskConfig.patterns is Patterns() default),
+        # fallback to condition-level patterns via provider.get_patterns().
+        #
+        # Domains are now unified: runtime writers (fan-out in
+        # stage/definition.py _resolve_fanout_patterns) and recovery both
+        # resolve condition-level patterns when task-level is empty, so
+        # patterns_hash digests agree (H_cfg, same as wire_coverage).
+        # Pre-DEF-2 the empty Patterns object was truthy (not None) ⇒ the
+        # old ``is not None`` guard never reached provider.get_patterns() ⇒
+        # AcquisitionTask.key_pattern='' ⇒ zero extraction (operator log
+        # 2026-11-04: Valid=0, key_sources=0 at 53 764 files / 1.06 GB).
+        #
         # This single resolution feeds all three consumers below: skip
         # digest, share-claim key, and create_acquisition_task fields (so
         # recovered tasks WRITE coverage in the same domain too).
@@ -333,7 +340,7 @@ class TaskRecoveryManager:
         # pipeline exposes no task_configs for this provider.
         task_cfgs = getattr(self.pipeline, "task_configs", None) or {}
         cfg_patterns = getattr(task_cfgs.get(name), "patterns", None)
-        patterns = cfg_patterns if cfg_patterns is not None else provider.get_patterns()
+        patterns = cfg_patterns if (cfg_patterns is not None and cfg_patterns.key_pattern) else provider.get_patterns()
         urls = [url for url in (acquisition_tasks or []) if url]
 
         # P26: resolve the policy stack once per provider (fail-open to inert).

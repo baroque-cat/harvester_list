@@ -157,6 +157,27 @@ When all refine children are suppressed by the ledger (share_suppressed > 0), th
 - **WHEN** refine generates 10 children, all 10 are dropped by the governor (not suppressed by ledger), and total > per_page
 - **THEN** the F1 pagination fallback fires (enqueued == 0 and share_suppressed == 0)
 
+### Requirement: Pattern resolution contract (DEF-2)
+
+When creating acquisition tasks for a beneficiary B, the fan-out SHALL resolve extraction patterns as follows: if B's task-level `TaskConfig.patterns.key_pattern` is non-empty, use the task-level patterns (intent D-03.7: "B may carry its own patterns"). Otherwise, fallback to the condition-level patterns carried by the SearchTask (`task.regex`, `task.address_pattern`, `task.endpoint_pattern`, `task.model_pattern`). This ensures that in the combat config (where `TaskConfig.patterns` is an empty `Patterns()` default), acquisition tasks carry real extraction patterns from the conditions that seeded the search.
+
+The same resolution contract applies to early-stop observe (patterns_hash for non-owner beneficiaries) and to recovery (`manager/recovery.py`): when task-level `key_pattern` is empty, fallback to `provider.get_patterns()` (condition-level). All three sites (fan-out, observe, recovery) resolve the same domain, ensuring patterns_hash consistency across runtime writers and recovery readers.
+
+#### Scenario: Acquisition tasks inherit condition-level extraction patterns when task-level patterns are empty
+
+- **WHEN** a beneficiary B has `TaskConfig.patterns = Patterns()` (empty, combat shape) and the search task carries `regex="sk-[a-zA-Z0-9]{32}"` from condition-level patterns
+- **THEN** the AcquisitionTask created for B has `key_pattern="sk-[a-zA-Z0-9]{32}"` (resolved from the search task's condition-level fields)
+
+#### Scenario: Task-level non-empty patterns take precedence
+
+- **WHEN** a beneficiary B has `TaskConfig.patterns.key_pattern = "override-[a-z]{16}"` (non-empty)
+- **THEN** the AcquisitionTask created for B uses `key_pattern="override-[a-z]{16}"` (task-level override wins)
+
+#### Scenario: Recovery and runtime writers share the same patterns domain
+
+- **WHEN** recovery resolves patterns for a provider with empty task-level patterns
+- **THEN** the patterns_hash used for skip/share decisions equals the condition-level hash (same domain as runtime fan-out writers after DEF-2 fix)
+
 ## Non-Goals
 
 - **Persistence.** The ledger is deliberately not persisted. Restart recovery is handled by skip.skip_known.
