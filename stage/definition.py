@@ -1446,6 +1446,9 @@ class CheckStage(BasePipelineStage):
                     ErrorReason.RATE_LIMITED,
                     ErrorReason.NO_MODEL,
                     ErrorReason.NO_ACCESS,
+                    ErrorReason.NETWORK_ERROR,
+                    ErrorReason.TIMEOUT,
+                    ErrorReason.SERVER_ERROR,
                 ]:
                     output.add_result(task.provider, ResultType.WAIT_CHECK.value, [task.service])
 
@@ -1546,7 +1549,14 @@ class CheckStage(BasePipelineStage):
             return ResultType.VALID.value
         if result.reason == ErrorReason.NO_QUOTA:
             return ResultType.NO_QUOTA.value
-        if result.reason in (ErrorReason.RATE_LIMITED, ErrorReason.NO_MODEL, ErrorReason.NO_ACCESS):
+        if result.reason in (
+            ErrorReason.RATE_LIMITED,
+            ErrorReason.NO_MODEL,
+            ErrorReason.NO_ACCESS,
+            ErrorReason.NETWORK_ERROR,
+            ErrorReason.TIMEOUT,
+            ErrorReason.SERVER_ERROR,
+        ):
             return ResultType.WAIT_CHECK.value
         return ResultType.INVALID.value
 
