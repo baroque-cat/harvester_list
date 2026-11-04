@@ -210,6 +210,41 @@ class AIBaseProvider(IProvider):
     def _get_timeout(self, default: int) -> int:
         return self.extras.get("timeout", max(default, 0))
 
+    def _apply_error_rules(self, code: int, message: str) -> Optional[CheckResult]:
+        """Apply declarative error-parsing rules to a provider response.
+
+        Returns a CheckResult if a rule matches, or None if no rules are
+        configured or no rule matches (byte-neutral fallback to _judge).
+        """
+        from tools.patterns import redact_api_keys_in_text
+
+        rule_set = self.extras.get("error_rules") if isinstance(self.extras, dict) else None
+        if rule_set is None:
+            return None
+
+        # Import here to avoid circular imports at module level.
+        from provider.error_rules import evaluate
+
+        map_to = evaluate(rule_set, code, message)
+        if map_to is None:
+            return None
+
+        # Resolve map_to string to ErrorReason enum.
+        try:
+            reason = ErrorReason(map_to)
+        except ValueError:
+            # map_to not a valid ErrorReason — fail open (shouldn't happen
+            # after validator, but defensive).
+            return None
+
+        # Build message: masked + truncated body fragment (never raw body).
+        from tools.utils import trim as _trim
+        redacted = redact_api_keys_in_text(_trim(message))
+        # Truncate to 200 chars for the CheckResult message.
+        truncated = redacted[:200] if len(redacted) > 200 else redacted
+
+        return CheckResult.fail(reason, message=truncated, status_code=code)
+
     def check(self, token: str, address: str = "", endpoint: str = "", model: str = "") -> CheckResult:
         """Check if token is valid."""
         url, regex = trim(address), r"^https?://([\w\-_]+\.[\w\-_]+)+"
@@ -233,6 +268,12 @@ class AIBaseProvider(IProvider):
             retries=self._get_retries(default=2),
             timeout=self._get_timeout(default=10),
         )
+
+        # Declarative error-parsing rules hook (byte-neutral when no rules).
+        ruled = self._apply_error_rules(code, message)
+        if ruled is not None:
+            return ruled
+
         return self._judge(code=code, message=message)
 
     def inspect(self, token: str, address: str = "", endpoint: str = "") -> List[str]:

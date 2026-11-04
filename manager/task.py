@@ -218,6 +218,24 @@ class ProviderFactory:
         if type(api_config.retries) == int and api_config.retries > 0:
             kwargs["retries"] = api_config.retries
 
+        # Declarative error-parsing rules: compile once at provider creation.
+        ep = task_config.error_parsing
+        if ep is not None and ep.enabled and ep.rules:
+            from provider.error_rules import compile_rules
+            kwargs["error_rules"] = compile_rules(
+                [
+                    {
+                        "status_code": r.status_code,
+                        "error_path": r.error_path,
+                        "match_pattern": r.match_pattern,
+                        "map_to": r.map_to,
+                        "priority": r.priority,
+                        "description": r.description,
+                    }
+                    for r in ep.rules
+                ]
+            )
+
         return ProviderRegistry.create(provider_type, conditions=conditions, **kwargs)
 
 
